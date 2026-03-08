@@ -1,0 +1,50 @@
+# Environment & secrets
+.env
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+develop-eggs/
+.installed.cfg
+lib/
+lib64/
+
+# Virtual environments
+venv/
+env/
+.venv/
+.env/
+
+# Output directories (generated files)
+output/data/
+output/logs/
+output/charts/
+# Keep reports directory but ignore generated files
+output/reports/*.pdf
+output/reports/*.txt
+
+# IDE & editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Claude internal
+.claude/
