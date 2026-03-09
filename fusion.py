@@ -87,15 +87,21 @@ def borda_fusion(model_results: List[Dict], top_n: int = 10) -> List[Dict]:
                     f"[{model_name}] {pick['reasoning']}"
                 )
 
-    # 计算均分
+    # 统计实际参与模型数（有有效推荐的模型）
+    num_models = len([m for m in model_results if len(m.get("picks", [])) > 0])
+    num_models = max(num_models, 1)  # 防除零
+
+    # 计算均分 + 归一化 Borda 分
     for data in stock_data.values():
         n = data["score_count"]
         data["avg_score"] = round(data["total_score"] / n, 1) if n > 0 else 0.0
+        data["model_count"] = len(data["recommended_by"])
+        data["normalized_borda"] = round(data["borda_score"] / num_models, 2)
 
-    # 按 Borda 分排序（同分时用 avg_score 做二级排序）
+    # 多级排序：归一化Borda → 推荐模型数 → 平均分 → 股票代码（确定性兜底）
     sorted_stocks = sorted(
         stock_data.values(),
-        key=lambda x: (x["borda_score"], x["avg_score"]),
+        key=lambda x: (x["normalized_borda"], x["model_count"], x["avg_score"], x["code"]),
         reverse=True,
     )
 
@@ -107,8 +113,9 @@ def borda_fusion(model_results: List[Dict], top_n: int = 10) -> List[Dict]:
             "name": stock["name"],
             "sector": stock["sector"],
             "borda_score": stock["borda_score"],
+            "normalized_borda": stock["normalized_borda"],
             "avg_score": stock["avg_score"],
-            "model_count": len(stock["recommended_by"]),
+            "model_count": stock["model_count"],
             "recommended_by": stock["recommended_by"],
             "all_reasonings": stock["all_reasonings"][:3],
         })

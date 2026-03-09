@@ -473,7 +473,7 @@ class LLMClient:
         summarize_fn: Callable[[Dict[str, str]], str],
         max_models: Optional[int] = None,
         rounds: int = 1,
-        temperature: float = 0.35,
+        temperature: float = 0.15,
         max_tokens: int = 4096,
         verbose: bool = True,
     ) -> Dict[str, Any]:

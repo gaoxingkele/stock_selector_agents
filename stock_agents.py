@@ -100,7 +100,7 @@ _PICK_FORMAT = """\
   "sector_view": "对本板块的整体看法（100字以内）"
 }
 ```
-picks 数量：每个板块选 1-3 只，总数不超过 5 只。
+picks 数量：每个板块选 2-5 只，总数不超过 10 只。
 stars 含义：5=极强 4=强 3=中等 2=弱 1=极弱"""
 
 
@@ -209,8 +209,8 @@ class BaseAgent:
                 )
             )
 
-        # 只保留得票≥1 的 top-5
-        picks = picks[:5]
+        # 只保留得票≥1 的 top-10
+        picks = picks[:10]
 
         return ExpertResult(
             expert_id=self.EXPERT_ID,
@@ -281,7 +281,7 @@ class BaseAgent:
         return ExpertResult(
             expert_id=self.EXPERT_ID,
             expert_name=self.EXPERT_NAME,
-            picks=picks[:5],
+            picks=picks[:10],
             reasoning=f"{self.EXPERT_NAME}完成Session分析，共选出{len(picks)}只股票",
             debate_log={"session_response": resp or ""},
         )
@@ -1301,7 +1301,7 @@ class TechnicalExpert(BaseAgent):
         return ExpertResult(
             expert_id=self.EXPERT_ID,
             expert_name=self.EXPERT_NAME,
-            picks=picks[:5],
+            picks=picks[:10],
             reasoning=f"{self.EXPERT_NAME}完成Session分析，共选出{len(picks)}只股票",
             debate_log={"session_response": resp or ""},
         )
@@ -1414,7 +1414,7 @@ class CapitalFlowExpert(BaseAgent):
         return ExpertResult(
             expert_id=self.EXPERT_ID,
             expert_name=self.EXPERT_NAME,
-            picks=picks[:5],
+            picks=picks[:10],
             reasoning=f"{self.EXPERT_NAME}完成Session分析，共选出{len(picks)}只股票",
             debate_log={"session_response": resp or ""},
         )
@@ -1702,7 +1702,7 @@ class SectorOutperformer(BaseAgent):
         return ExpertResult(
             expert_id=self.EXPERT_ID,
             expert_name=self.EXPERT_NAME,
-            picks=picks[:5],
+            picks=picks[:10],
             reasoning=f"{self.EXPERT_NAME}完成Session分析，共选出{len(picks)}只股票",
             debate_log={"session_response": resp or ""},
         )
@@ -2293,8 +2293,7 @@ class ModelTask:
   ]
 }
 ```
-picks 数量：恰好20支，按信心度从高到低排名。\
-如候选股票不足20支，则选出全部候选股票（但尽量不少于10支）。"""
+picks 数量：选出10-20支，按信心度从高到低排名。如候选池不足10支，则全部列出。"""
 
     def __init__(
         self,
@@ -2395,27 +2394,34 @@ picks 数量：恰好20支，按信心度从高到低排名。\
         self.logger.log("debate_start", model=self.provider_name)
         debate_resp = session.say(self.INTRA_MODEL_DEBATE_PROMPT)
 
-        picks: List[Dict] = []
-        if debate_resp:
-            parsed = LLMClient.parse_json(debate_resp)
-            if parsed and "picks" in parsed:
-                for pick in parsed["picks"]:
-                    if not isinstance(pick, dict):
-                        continue
-                    code = str(pick.get("code", "")).strip()
-                    if not code:
-                        continue
-                    picks.append({
-                        "rank": int(pick.get("rank", 99)),
-                        "code": code,
-                        "name": str(pick.get("name", "")),
-                        "sector": str(pick.get("sector", "")),
-                        "score": float(pick.get("score", 70)),
-                        "reasoning": str(pick.get("reasoning", ""))[:300],
-                        "recommended_by_experts": pick.get("recommended_by_experts", []),
-                    })
+        picks = self._parse_debate_picks(debate_resp)
 
-        picks = sorted(picks, key=lambda x: x["rank"])[:20]
+        # 重试一次：解析失败或 picks 不足 5 支
+        if len(picks) < 5:
+            self.logger.log(
+                "debate_retry",
+                model=self.provider_name,
+                detail={"reason": f"首次解析仅得到{len(picks)}支，重试"},
+            )
+            retry_resp = session.say(
+                "请重新输出JSON。只需返回 {\"picks\": [...]} 格式，"
+                "picks每项含code/name/sector/score/rank/reasoning字段。选10-20支。"
+            )
+            retry_picks = self._parse_debate_picks(retry_resp)
+            if len(retry_picks) > len(picks):
+                picks = retry_picks
+                debate_resp = retry_resp
+
+        # 降级兜底：从专家结果聚合
+        if len(picks) < 5:
+            self.logger.log(
+                "debate_fallback",
+                model=self.provider_name,
+                detail={"reason": f"辩论解析仍仅{len(picks)}支，降级聚合专家推荐"},
+            )
+            fallback = self._fallback_from_experts(expert_logs)
+            if len(fallback) > len(picks):
+                picks = fallback
 
         self.logger.log(
             "debate_done",
@@ -2434,3 +2440,81 @@ picks 数量：恰好20支，按信心度从高到低排名。\
             "expert_logs": expert_logs,
             "debate_log": debate_resp or "",
         }
+
+    @staticmethod
+    def _parse_debate_picks(resp: Optional[str]) -> List[Dict]:
+        """解析辩论结果，带类型验证和安全转换"""
+        if not resp:
+            return []
+        parsed = LLMClient.parse_json(resp)
+        if not parsed or "picks" not in parsed:
+            return []
+        raw_picks = parsed["picks"]
+        if not isinstance(raw_picks, list):
+            return []
+        picks: List[Dict] = []
+        for pick in raw_picks:
+            if not isinstance(pick, dict):
+                continue
+            code = str(pick.get("code", "")).strip()
+            if not code:
+                continue
+            try:
+                rank = int(pick.get("rank", 99))
+            except (ValueError, TypeError):
+                rank = 99
+            try:
+                score = float(pick.get("score", 70))
+            except (ValueError, TypeError):
+                score = 70.0
+            picks.append({
+                "rank": rank,
+                "code": code,
+                "name": str(pick.get("name", "")),
+                "sector": str(pick.get("sector", "")),
+                "score": score,
+                "reasoning": str(pick.get("reasoning", ""))[:300],
+                "recommended_by_experts": pick.get("recommended_by_experts", []),
+            })
+        return sorted(picks, key=lambda x: x["rank"])[:20]
+
+    @staticmethod
+    def _fallback_from_experts(expert_logs: Dict[str, Dict]) -> List[Dict]:
+        """辩论失败时从专家结果聚合，按出现次数和平均分排序"""
+        pool: Dict[str, Dict] = {}
+        for expert_id, log in expert_logs.items():
+            for p in log.get("picks", []):
+                code = str(p.get("code", "")).strip()
+                if not code:
+                    continue
+                if code not in pool:
+                    pool[code] = {
+                        "code": code,
+                        "name": p.get("name", ""),
+                        "sector": "",
+                        "count": 0,
+                        "total_score": 0.0,
+                        "experts": [],
+                    }
+                pool[code]["count"] += 1
+                pool[code]["total_score"] += float(p.get("score", 70))
+                pool[code]["experts"].append(expert_id)
+                if p.get("name") and not pool[code]["name"]:
+                    pool[code]["name"] = p["name"]
+        sorted_pool = sorted(
+            pool.values(),
+            key=lambda x: (x["count"], x["total_score"] / max(x["count"], 1)),
+            reverse=True,
+        )
+        return [
+            {
+                "rank": i + 1,
+                "code": s["code"],
+                "name": s["name"],
+                "sector": s["sector"],
+                "score": round(s["total_score"] / max(s["count"], 1), 1),
+                "reasoning": f"由{s['count']}位专家({','.join(s['experts'])})共同推荐",
+                "recommended_by_experts": s["experts"],
+            }
+            for i, s in enumerate(sorted_pool[:20])
+        ]
