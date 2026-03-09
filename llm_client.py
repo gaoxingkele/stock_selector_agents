@@ -172,7 +172,23 @@ class ConversationSession:
             )
             return self.say(enriched)
 
-        # 无任何视觉能力，忽略图片
+        # 无任何视觉能力：回落到 grok 视觉模型获取图表描述
+        grok_prov = self._client.config.providers.get("grok")
+        if grok_prov and (grok_prov.supports_vision or grok_prov.vision_model):
+            desc_parts: List[str] = []
+            for img_path in image_paths:
+                desc = self._client.call_with_image(
+                    provider_name="grok",
+                    image_path=img_path,
+                    question="请详细描述这张K线图表，包括趋势方向、关键价格区间、均线状态和重要技术信号。",
+                )
+                if desc:
+                    desc_parts.append(f"[图表分析（Grok视觉）]\n{desc}")
+            if desc_parts:
+                enriched = content + "\n\n" + "\n\n".join(desc_parts)
+                return self.say(enriched)
+
+        # grok 也不可用，忽略图片
         return self.say(content)
 
 
@@ -195,7 +211,7 @@ class LLMClient:
             # 仅对需要代理的提供商（国际服务）应用 LLM_PROXY
             use_proxy = getattr(prov, "use_proxy", True)
             http_client = (
-                httpx.Client(proxies=self.proxy, timeout=120.0)
+                httpx.Client(proxy=self.proxy, timeout=120.0)
                 if (self.proxy and use_proxy)
                 else httpx.Client(timeout=120.0)
             )

@@ -108,7 +108,7 @@ def load_config() -> Config:
             "name": "kimi",
             "key_env": "KIMI_API_KEY",
             "model_env": "KIMI_MODEL",
-            "default_model": "kimi-k2-turbo-preview",
+            "default_model": "kimi-k2.5",
             "base_url": "https://api.moonshot.cn/v1",
             "use_proxy": False,
         },

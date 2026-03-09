@@ -111,7 +111,7 @@ R风控审查（硬性排除 + 软性过滤 + 仓位建议）
 | **Grok** (xAI) | grok-4-1-fast-reasoning | ✅ 原生视觉（主模型即支持） |
 | **GLM** (智谱) | glm-4.7 | ✅ 视觉模型 glm-4v-plus |
 | **DeepSeek** | deepseek-reasoner | ❌ 官方API暂不支持图片 |
-| **Kimi** (月之暗面) | kimi-k2-turbo-preview | ✅ 视觉模型 moonshot-v1-8k-vision-preview |
+| **Kimi** (月之暗面) | kimi-k2.5 | ✅ 原生多模态（主模型即支持） |
 | **Gemini** (Google) | gemini-3.1-pro-preview | — |
 | **Perplexity** | sonar-pro | ✅ 原生视觉 |
 | **Doubao** (火山引擎) | doubao-seed-2-0-pro-260215 | ✅ 同模型支持视觉 |
