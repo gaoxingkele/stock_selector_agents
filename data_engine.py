@@ -1063,8 +1063,7 @@ class DataEngine:
         def _fetch_kline_with_sem(code: str, period: str, n_bars: int):
             """先尝试 TDX（不占信号量），TDX失败再用远程 API（占信号量）"""
             df = self._tdx_kline(code, period, n_bars)
-            min_bars = 20 if period == "daily" else (10 if period == "weekly" else 6)
-            if df is not None and len(df) >= min_bars:
+            if df is not None and len(df) > 0:
                 return df
             # TDX 未命中，走远程（AKShare → Tushare）
             with _api_sem:
@@ -1078,18 +1077,19 @@ class DataEngine:
 
             pkg: Dict = {"code": code, "sector": sector, "realtime": rt_info}
 
-            # ── 日线（必须，不足则跳过此股）──────────────────────────
+            # ── 日线（有多少拿多少，新股K线少也保留）───────────────
             df_d = _fetch_kline_with_sem(code, "daily", 120)
-            if df_d is None or len(df_d) < 20:
+            if df_d is None or len(df_d) == 0:
                 with _cnt_lock:
                     _skip[0] += 1
                     n = _done[0] + _skip[0]
                 print(
-                    f"  [{n:3d}/{total}] {code} {name:<6} ✗ 日线不足，跳过",
+                    f"  [{n:3d}/{total}] {code} {name:<6} ✗ 无日线数据，跳过",
                     flush=True,
                 )
                 return
             pkg["daily"] = compute_indicators(df_d)
+            pkg["daily_bars"] = len(df_d)  # 记录实际K线根数，供画像参考
 
             # ── K线图表（用于E4视觉分析）────────────────────────────
             _chart_dir = os.path.join(_BASE_DIR, "output", "charts")
@@ -1097,14 +1097,14 @@ class DataEngine:
             if cp:
                 pkg["chart_path"] = cp
 
-            # ── 周线 ─────────────────────────────────────────────────
+            # ── 周线（有多少拿多少）─────────────────────────────────
             df_w = _fetch_kline_with_sem(code, "weekly", 52)
-            if df_w is not None and len(df_w) >= 10:
+            if df_w is not None and len(df_w) > 0:
                 pkg["weekly"] = compute_indicators(df_w)
 
-            # ── 月线 ─────────────────────────────────────────────────
+            # ── 月线（有多少拿多少）─────────────────────────────────
             df_m = _fetch_kline_with_sem(code, "monthly", 24)
-            if df_m is not None and len(df_m) >= 6:
+            if df_m is not None and len(df_m) > 0:
                 pkg["monthly"] = compute_indicators(df_m)
 
             # ── 资金流向 + 财务（远程 API，受信号量控速）────────────
@@ -1157,10 +1157,11 @@ class DataEngine:
             perf = {}
             for c in codes_in_sector:
                 df_d = packages[c].get("daily")
-                if df_d is not None and len(df_d) >= 21:
+                if df_d is not None and len(df_d) >= 2:
                     try:
                         cl = df_d["close"]
-                        perf[c] = (float(cl.iloc[-1]) - float(cl.iloc[-21])) / max(float(cl.iloc[-21]), 0.01) * 100
+                        n_back = min(20, len(cl) - 1)
+                        perf[c] = (float(cl.iloc[-1]) - float(cl.iloc[-(n_back+1)])) / max(float(cl.iloc[-(n_back+1)]), 0.01) * 100
                     except Exception:
                         perf[c] = 0.0
                 else:
@@ -1202,13 +1203,14 @@ class DataEngine:
         cap = rt.get("总市值", "N/A")
         price = rt.get("最新价", rt.get("当前价", "N/A"))
 
-        # 近20日涨幅（唯一保留的 K 线计算结果）
+        # 近N日涨幅（有多少K线算多少，新股可能不足20日）
         d20 = "N/A"
         df_d = pkg.get("daily")
-        if df_d is not None and len(df_d) >= 21:
+        if df_d is not None and len(df_d) >= 2:
             try:
                 c = df_d["close"]
-                d20 = f"{(float(c.iloc[-1]) - float(c.iloc[-21])) / max(float(c.iloc[-21]), 0.01) * 100:+.1f}%"
+                n_back = min(20, len(c) - 1)
+                d20 = f"{(float(c.iloc[-1]) - float(c.iloc[-(n_back+1)])) / max(float(c.iloc[-(n_back+1)]), 0.01) * 100:+.1f}%({n_back}日)"
             except Exception:
                 pass
 
@@ -1330,7 +1332,7 @@ class DataEngine:
 
         # ── 日线详情 ──────────────────────────────────────────
         df_d: Optional[pd.DataFrame] = pkg.get("daily")
-        if df_d is not None and len(df_d) >= 20:
+        if df_d is not None and len(df_d) >= 2:
             lines.append("\n【日线详情（近60日）】")
             c = df_d["close"]
             cur = float(c.iloc[-1])

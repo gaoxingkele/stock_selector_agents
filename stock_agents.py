@@ -1583,10 +1583,11 @@ class SectorOutperformer(BaseAgent):
             for code, pkg in stocks:
                 df_d = pkg.get("daily")
                 d20_val = 0.0
-                if df_d is not None and len(df_d) >= 21:
+                if df_d is not None and len(df_d) >= 2:
                     try:
                         c = df_d["close"]
-                        d20_val = (float(c.iloc[-1]) - float(c.iloc[-21])) / max(float(c.iloc[-21]), 0.01) * 100
+                        n_back = min(20, len(c) - 1)
+                        d20_val = (float(c.iloc[-1]) - float(c.iloc[-(n_back+1)])) / max(float(c.iloc[-(n_back+1)]), 0.01) * 100
                         d20_list.append(d20_val)
                         v5 = float(df_d["volume"].tail(5).mean())
                         v20 = float(df_d["volume"].tail(20).mean())
@@ -2095,11 +2096,12 @@ class RiskController:
 
             d60_gain = "N/A"
             df_d = pkg.get("daily")
-            if df_d is not None and len(df_d) >= 60:
+            if df_d is not None and len(df_d) >= 2:
                 try:
-                    old = float(df_d["close"].iloc[-(61)])
+                    n_back = min(60, len(df_d) - 1)
+                    old = float(df_d["close"].iloc[-(n_back+1)])
                     new = float(df_d["close"].iloc[-1])
-                    d60_gain = f"{(new-old)/old*100:.1f}%"
+                    d60_gain = f"{(new-old)/old*100:.1f}%({n_back}日)"
                 except Exception:
                     pass
 
