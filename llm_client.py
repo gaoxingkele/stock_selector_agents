@@ -199,7 +199,6 @@ class LLMClient:
         self.config = config
         self.proxy = config.llm_proxy
         self._clients: Dict[str, OpenAI] = {}
-        self._proxy_clients: Dict[str, OpenAI] = {}  # 国外LLM代理备用客户端
 
     # ------------------------------------------------------------------ #
     #  内部工具                                                            #
@@ -208,13 +207,16 @@ class LLMClient:
     def _get_client(self, provider_name: str) -> OpenAI:
         """
         懒初始化 OpenAI 客户端。
-        国内LLM: trust_env=False 避免走系统代理
-        国外LLM: 优先直连（trust_env=False），代理客户端单独存储
+        国外LLM (use_proxy=True): 走代理
+        国内LLM (use_proxy=False): 直连，trust_env=False 屏蔽系统代理
         """
         if provider_name not in self._clients:
             prov: ProviderConfig = self.config.providers[provider_name]
-            # 所有提供商的主客户端都直连（trust_env=False 不走系统代理）
-            http_client = httpx.Client(timeout=120.0, trust_env=False)
+            use_proxy = getattr(prov, "use_proxy", True)
+            if use_proxy and self.proxy:
+                http_client = httpx.Client(proxy=self.proxy, timeout=120.0)
+            else:
+                http_client = httpx.Client(timeout=120.0, trust_env=False)
             self._clients[provider_name] = OpenAI(
                 api_key=prov.api_key,
                 base_url=prov.base_url,
@@ -222,32 +224,16 @@ class LLMClient:
                 timeout=120.0,
                 max_retries=0,
             )
-            # 国外LLM: 额外准备代理客户端作为备用
-            if getattr(prov, "use_proxy", True) and self.proxy:
-                proxy_http = httpx.Client(proxy=self.proxy, timeout=120.0)
-                self._proxy_clients[provider_name] = OpenAI(
-                    api_key=prov.api_key,
-                    base_url=prov.base_url,
-                    http_client=proxy_http,
-                    timeout=120.0,
-                    max_retries=0,
-                )
         return self._clients[provider_name]
-
-    def _get_proxy_client(self, provider_name: str) -> Optional[OpenAI]:
-        """获取代理备用客户端（仅国外LLM有）"""
-        self._get_client(provider_name)  # 确保已初始化
-        return self._proxy_clients.get(provider_name)
 
     def _close(self):
         """关闭所有 HTTP 客户端"""
-        for client in list(self._clients.values()) + list(self._proxy_clients.values()):
+        for client in self._clients.values():
             try:
                 client.close()
             except Exception:
                 pass
         self._clients.clear()
-        self._proxy_clients.clear()
 
     # ------------------------------------------------------------------ #
     #  单模型调用                                                          #
@@ -272,78 +258,6 @@ class LLMClient:
             "last_user_snippet": last_user[-200:] if last_user else "",
         }
 
-    def _do_call(
-        self,
-        client: OpenAI,
-        provider_name: str,
-        prov: ProviderConfig,
-        messages: List[Dict],
-        temperature: float,
-        max_tokens: int,
-        stats: Dict,
-        via_proxy: bool = False,
-    ) -> Optional[str]:
-        """执行单次 LLM 调用（直连或代理），成功返回文本，失败返回 None"""
-        proxy_tag = "(代理)" if via_proxy else ""
-        model_short = prov.model[:40]
-        print(
-            f"  [{provider_name}]{proxy_tag} ▶ {model_short}"
-            f" ({stats['msgs']}条/{stats['chars']}字)...",
-            end="", flush=True,
-        )
-        t_call = time.time()
-        log_entry: Dict = {
-            "ts": datetime.now().isoformat(),
-            "provider": provider_name,
-            "model": prov.model,
-            "via_proxy": via_proxy,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "input_msgs": stats["msgs"],
-            "input_chars": stats["chars"],
-            "last_user_snippet": stats["last_user_snippet"],
-        }
-        try:
-            kwargs: Dict[str, Any] = {
-                "model": prov.model,
-                "messages": messages,
-                "max_tokens": max_tokens,
-            }
-            if provider_name != "perplexity":
-                kwargs["temperature"] = temperature
-
-            resp = client.chat.completions.create(**kwargs)
-            content = resp.choices[0].message.content
-            elapsed = round(time.time() - t_call, 2)
-            _len = len(content.strip()) if content else 0
-
-            usage = getattr(resp, "usage", None)
-            if usage:
-                log_entry["prompt_tokens"]     = getattr(usage, "prompt_tokens", None)
-                log_entry["completion_tokens"] = getattr(usage, "completion_tokens", None)
-                log_entry["total_tokens"]      = getattr(usage, "total_tokens", None)
-
-            log_entry.update({"status": "ok", "elapsed": elapsed, "output_chars": _len})
-            _llm_call_logger.write(log_entry)
-            print(f" ✓ {elapsed:.1f}s {_len}字")
-            return content.strip() if content else None
-
-        except Exception as exc:
-            elapsed = round(time.time() - t_call, 2)
-            err_str = str(exc)
-            log_entry.update({"status": "fail", "elapsed": elapsed, "error": err_str[:300]})
-            _llm_call_logger.write(log_entry)
-
-            tag = ""
-            if "429" in err_str:
-                tag = "（限流）"
-            elif "timed out" in err_str.lower() or "timeout" in err_str.lower():
-                tag = "（超时）"
-            elif err_str.lstrip().startswith("<"):
-                tag = "（HTML错误页）"
-            print(f" ✗ {elapsed:.1f}s{tag}: {err_str[:100]}")
-            return None
-
     def call(
         self,
         provider_name: str,
@@ -354,8 +268,8 @@ class LLMClient:
     ) -> Optional[str]:
         """
         调用指定 LLM 提供商，返回响应文本。
-        国外LLM: 优先直连，失败后走代理。
-        国内LLM: 仅直连（trust_env=False，不走系统代理）。
+        国外LLM (use_proxy=True): 走代理
+        国内LLM (use_proxy=False): 直连，trust_env=False 屏蔽系统代理
         429/超时/HTML错误不重试。
         """
         if provider_name not in self.config.providers:
@@ -364,24 +278,84 @@ class LLMClient:
 
         prov: ProviderConfig = self.config.providers[provider_name]
         client = self._get_client(provider_name)
-        proxy_client = self._get_proxy_client(provider_name)
         stats = self._input_stats(messages)
 
-        # 直连尝试
-        result = self._do_call(client, provider_name, prov, messages,
-                               temperature, max_tokens, stats, via_proxy=False)
-        if result:
-            return result
+        for attempt in range(max_retries + 1):
+            attempt_tag = f"(重试{attempt})" if attempt > 0 else ""
+            model_short = prov.model[:40]
+            print(
+                f"  [{provider_name}]{attempt_tag} ▶ {model_short}"
+                f" ({stats['msgs']}条/{stats['chars']}字)...",
+                end="", flush=True,
+            )
+            t_call = time.time()
+            log_entry: Dict = {
+                "ts": datetime.now().isoformat(),
+                "provider": provider_name,
+                "model": prov.model,
+                "attempt": attempt,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "input_msgs": stats["msgs"],
+                "input_chars": stats["chars"],
+                "last_user_snippet": stats["last_user_snippet"],
+            }
+            try:
+                kwargs: Dict[str, Any] = {
+                    "model": prov.model,
+                    "messages": messages,
+                    "max_tokens": max_tokens,
+                }
+                if provider_name != "perplexity":
+                    kwargs["temperature"] = temperature
 
-        # 国外LLM直连失败 → 走代理重试
-        if proxy_client:
-            print(f"  [{provider_name}] 直连失败，切换代理重试...", flush=True)
-            result = self._do_call(proxy_client, provider_name, prov, messages,
-                                   temperature, max_tokens, stats, via_proxy=True)
-            if result:
-                return result
+                resp = client.chat.completions.create(**kwargs)
+                content = resp.choices[0].message.content
+                elapsed = round(time.time() - t_call, 2)
+                _len = len(content.strip()) if content else 0
 
-        return None
+                usage = getattr(resp, "usage", None)
+                if usage:
+                    log_entry["prompt_tokens"]     = getattr(usage, "prompt_tokens", None)
+                    log_entry["completion_tokens"] = getattr(usage, "completion_tokens", None)
+                    log_entry["total_tokens"]      = getattr(usage, "total_tokens", None)
+
+                log_entry.update({"status": "ok", "elapsed": elapsed, "output_chars": _len})
+                _llm_call_logger.write(log_entry)
+                print(f" ✓ {elapsed:.1f}s {_len}字")
+                return content.strip() if content else None
+
+            except Exception as exc:
+                elapsed = round(time.time() - t_call, 2)
+                err_str = str(exc)
+                log_entry.update({
+                    "status": "fail",
+                    "elapsed": elapsed,
+                    "error": err_str[:300],
+                })
+                _llm_call_logger.write(log_entry)
+
+                # 429限流/超时/HTML错误页：重试无意义，立即放弃
+                no_retry = (
+                    "429" in err_str
+                    or "timed out" in err_str.lower()
+                    or "timeout" in err_str.lower()
+                    or err_str.lstrip().startswith("<")
+                )
+                if no_retry or attempt >= max_retries:
+                    tag = ""
+                    if "429" in err_str:
+                        tag = "（限流，跳过重试）"
+                    elif "timed out" in err_str.lower() or "timeout" in err_str.lower():
+                        tag = "（超时，跳过重试）"
+                    elif err_str.lstrip().startswith("<"):
+                        tag = "（HTML错误页，跳过重试）"
+                    print(f" ✗ {elapsed:.1f}s 失败{tag}: {err_str[:120]}")
+                    return None
+
+                wait = 2 ** attempt
+                print(f" ✗ {elapsed:.1f}s ({err_str[:80]}), 等待{wait}s重试")
+                time.sleep(wait)
 
     def call_primary(
         self,
