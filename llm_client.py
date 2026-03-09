@@ -213,7 +213,7 @@ class LLMClient:
             http_client = (
                 httpx.Client(proxy=self.proxy, timeout=120.0)
                 if (self.proxy and use_proxy)
-                else httpx.Client(timeout=120.0)
+                else httpx.Client(timeout=120.0, trust_env=False)
             )
             self._clients[provider_name] = OpenAI(
                 api_key=prov.api_key,
@@ -335,13 +335,27 @@ class LLMClient:
                 })
                 _llm_call_logger.write(log_entry)
 
-                if attempt < max_retries:
-                    wait = 2 ** attempt
-                    print(f" ✗ {elapsed:.1f}s ({err_str[:80]}), 等待{wait}s重试")
-                    time.sleep(wait)
-                else:
-                    print(f" ✗ {elapsed:.1f}s 失败: {err_str[:160]}")
+                # 429限流/超时：重试无意义，立即放弃
+                no_retry = (
+                    "429" in err_str
+                    or "timed out" in err_str.lower()
+                    or "timeout" in err_str.lower()
+                    or err_str.lstrip().startswith("<")  # HTML错误页（代理拦截）
+                )
+                if no_retry or attempt >= max_retries:
+                    tag = ""
+                    if "429" in err_str:
+                        tag = "（限流，跳过重试）"
+                    elif "timed out" in err_str.lower() or "timeout" in err_str.lower():
+                        tag = "（超时，跳过重试）"
+                    elif err_str.lstrip().startswith("<"):
+                        tag = "（收到HTML，疑似代理拦截，跳过重试）"
+                    print(f" ✗ {elapsed:.1f}s 失败{tag}: {err_str[:120]}")
                     return None
+
+                wait = 2 ** attempt
+                print(f" ✗ {elapsed:.1f}s ({err_str[:80]}), 等待{wait}s重试")
+                time.sleep(wait)
 
     def call_primary(
         self,

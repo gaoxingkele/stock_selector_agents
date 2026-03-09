@@ -2396,12 +2396,13 @@ picks 数量：选出10-20支，按信心度从高到低排名。如候选池不
 
         picks = self._parse_debate_picks(debate_resp)
 
-        # 重试一次：解析失败或 picks 不足 5 支
-        if len(picks) < 5:
+        # 重试一次：解析失败或 picks 不足预期（考虑候选池大小）
+        min_expected = min(5, len(self.stock_profiles))
+        if len(picks) < min_expected:
             self.logger.log(
                 "debate_retry",
                 model=self.provider_name,
-                detail={"reason": f"首次解析仅得到{len(picks)}支，重试"},
+                detail={"reason": f"首次解析仅得到{len(picks)}支（预期≥{min_expected}），重试"},
             )
             retry_resp = session.say(
                 "请重新输出JSON。只需返回 {\"picks\": [...]} 格式，"
@@ -2413,7 +2414,7 @@ picks 数量：选出10-20支，按信心度从高到低排名。如候选池不
                 debate_resp = retry_resp
 
         # 降级兜底：从专家结果聚合
-        if len(picks) < 5:
+        if len(picks) < min_expected:
             self.logger.log(
                 "debate_fallback",
                 model=self.provider_name,

@@ -36,16 +36,18 @@ class WorkLogger:
     """
 
     EVENT_ICONS: Dict[str, str] = {
-        "session_start": "[启动]",
-        "expert_start":  "[>> ] ",
-        "expert_done":   "[OK ] ",
-        "debate_start":  "[辩论]",
-        "debate_done":   "[论毕]",
-        "model_done":    "[完成]",
-        "fusion_start":  "[融合]",
-        "fusion_done":   "[融毕]",
-        "error":         "[错误]",
-        "pipeline_done": "[结束]",
+        "session_start":  "[启动]",
+        "expert_start":   "[>> ] ",
+        "expert_done":    "[OK ] ",
+        "debate_start":   "[辩论]",
+        "debate_retry":   "[重试]",
+        "debate_fallback":"[降级]",
+        "debate_done":    "[论毕]",
+        "model_done":     "[完成]",
+        "fusion_start":   "[融合]",
+        "fusion_done":    "[融毕]",
+        "error":          "[错误]",
+        "pipeline_done":  "[结束]",
     }
 
     _SENTINEL = object()  # 终止 writer 线程的哨兵对象
