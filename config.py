@@ -28,6 +28,7 @@ class ProviderConfig:
     supports_vision: bool = False  # 推理模型是否直接支持图片输入
     use_proxy: bool = True        # 是否通过 LLM_PROXY 代理（国内服务设 False）
     max_tokens: int = 8192        # 最大输出 token（推理模型需要较大值）
+    timeout: float = 300.0        # HTTP/API 请求超时（秒）
 
     def __repr__(self):
         return f"Provider({self.name}:{self.model})"
@@ -154,6 +155,11 @@ def load_config() -> Config:
         },
     ]
 
+    # 慢速模型默认超时（秒）—— 可通过 {PREFIX}_TIMEOUT 环境变量覆盖
+    _default_timeouts = {
+        "deepseek": 600.0,
+    }
+
     for spec in provider_specs:
         api_key = os.getenv(spec["key_env"], "").strip()
         if not api_key:
@@ -164,6 +170,9 @@ def load_config() -> Config:
         supports_vision = (
             os.getenv(f"{prefix}_SUPPORTS_VISION", "false").strip().lower() == "true"
         )
+        timeout = float(
+            os.getenv(f"{prefix}_TIMEOUT", _default_timeouts.get(spec["name"], 300.0))
+        )
         cfg.providers[spec["name"]] = ProviderConfig(
             name=spec["name"],
             api_key=api_key,
@@ -172,6 +181,7 @@ def load_config() -> Config:
             vision_model=vision_model,
             supports_vision=supports_vision,
             use_proxy=spec.get("use_proxy", True),
+            timeout=timeout,
         )
 
     return cfg

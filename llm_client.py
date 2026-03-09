@@ -101,6 +101,7 @@ class ConversationSession:
     def say(self, content: str, images: Optional[List[str]] = None) -> Optional[str]:
         """
         添加 user 消息（含可选图片），调用 LLM，追加 assistant 消息，返回响应文本。
+        若 LLM 调用失败（超时等），自动移除孤立的 user 消息，避免连续 user 消息干扰后续调用。
 
         参数:
             content : 文本内容
@@ -128,7 +129,33 @@ class ConversationSession:
         )
         if resp:
             self.messages.append({"role": "assistant", "content": resp})
+        else:
+            # 调用失败：移除刚追加的 user 消息，防止连续 user 消息干扰后续专家
+            if self.messages and self.messages[-1].get("role") == "user":
+                self.messages.pop()
         return resp
+
+    def compact_last_assistant(self) -> None:
+        """
+        压缩最后一条 assistant 消息：仅保留 JSON 结果，丢弃冗长的分析文本。
+        在每位专家完成后调用，大幅减少后续专家面对的上下文长度。
+        """
+        if len(self.messages) < 2:
+            return
+        last = self.messages[-1]
+        if last.get("role") != "assistant":
+            return
+        content = last.get("content", "")
+        if not content or len(content) <= 600:
+            return  # 已经足够精简
+
+        parsed = LLMClient.parse_json(content)
+        if parsed:
+            compact = json.dumps(parsed, ensure_ascii=False, separators=(',', ':'))
+            self.messages[-1]["content"] = compact
+        elif len(content) > 1200:
+            # 无法提取 JSON，截断保留关键信息
+            self.messages[-1]["content"] = content[:800] + "\n...(已截断)"
 
     def say_with_vision(
         self,
@@ -209,19 +236,21 @@ class LLMClient:
         懒初始化 OpenAI 客户端。
         国外LLM (use_proxy=True): 走代理
         国内LLM (use_proxy=False): 直连，trust_env=False 屏蔽系统代理
+        超时时间从 ProviderConfig.timeout 读取（默认120s）。
         """
         if provider_name not in self._clients:
             prov: ProviderConfig = self.config.providers[provider_name]
             use_proxy = getattr(prov, "use_proxy", True)
+            timeout = getattr(prov, "timeout", 120.0)
             if use_proxy and self.proxy:
-                http_client = httpx.Client(proxy=self.proxy, timeout=120.0)
+                http_client = httpx.Client(proxy=self.proxy, timeout=timeout)
             else:
-                http_client = httpx.Client(timeout=120.0, trust_env=False)
+                http_client = httpx.Client(timeout=timeout, trust_env=False)
             self._clients[provider_name] = OpenAI(
                 api_key=prov.api_key,
                 base_url=prov.base_url,
                 http_client=http_client,
-                timeout=120.0,
+                timeout=timeout,
                 max_retries=0,
             )
         return self._clients[provider_name]
@@ -347,7 +376,8 @@ class LLMClient:
                     if "429" in err_str:
                         tag = "（限流，跳过重试）"
                     elif "timed out" in err_str.lower() or "timeout" in err_str.lower():
-                        tag = "（超时，跳过重试）"
+                        prov_timeout = getattr(prov, "timeout", 120.0)
+                        tag = f"（超时>{prov_timeout:.0f}s，跳过重试）"
                     elif err_str.lstrip().startswith("<"):
                         tag = "（HTML错误页，跳过重试）"
                     print(f" ✗ {elapsed:.1f}s 失败{tag}: {err_str[:120]}")

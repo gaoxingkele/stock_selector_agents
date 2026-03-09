@@ -2368,6 +2368,8 @@ picks 数量：选出10-20支，按信心度从高到低排名。如候选池不
                     stock_packages=self.stock_packages,
                     include_profiles=(i == 0),  # Only E1 embeds all profiles
                 )
+                # 压缩 assistant 响应，减少后续专家的上下文负担
+                session.compact_last_assistant()
                 expert_logs[expert.EXPERT_ID] = {
                     "picks_count": len(er.picks),
                     "picks": [
