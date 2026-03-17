@@ -1186,21 +1186,30 @@ class DataEngine:
                         if len(fields) < 47:
                             continue
                         code = fields[2]
+                        # 腾讯行情字段索引（经验证）:
+                        # [1]名称 [2]代码 [3]现价 [4]昨收 [5]今开
+                        # [6]买入价(非最高) [7]卖出价(非最低)
+                        # [33]最高 [34]最低  (注: 部分股票这两个位置为空)
+                        # [36]成交量(手) [37]成交额(万) [38]换手率
+                        # [39]PE(动态) [44]流通市值(亿) [45]总市值(亿) [46]PB
+                        # [41]最高(备用) [42]最低(备用)
+                        high_val = _safe_float(fields[41]) if len(fields) > 41 and fields[41] else _safe_float(fields[33]) if len(fields) > 33 and fields[33] else 0.0
+                        low_val = _safe_float(fields[42]) if len(fields) > 42 and fields[42] else _safe_float(fields[34]) if len(fields) > 34 and fields[34] else 0.0
                         result[code] = {
                             "名称": fields[1],
                             "最新价": _safe_float(fields[3]),
                             "昨收": _safe_float(fields[4]),
                             "今开": _safe_float(fields[5]),
-                            "最高": _safe_float(fields[33] if len(fields) > 33 and fields[33] else fields[7]),
-                            "最低": _safe_float(fields[34] if len(fields) > 34 and fields[34] else fields[8]),
-                            "换手率": _safe_float(fields[30]) if len(fields) > 30 else 0.0,
-                            "市盈率-动态": _safe_float(fields[37]) if len(fields) > 37 else 0.0,
-                            "振幅": _safe_float(fields[38]) if len(fields) > 38 else 0.0,
-                            "总市值": _safe_float(fields[44]) * 1e8 if len(fields) > 44 and fields[44] else 0.0,
-                            "流通市值": _safe_float(fields[45]) * 1e8 if len(fields) > 45 and fields[45] else 0.0,
+                            "最高": high_val,
+                            "最低": low_val,
+                            "换手率": _safe_float(fields[38]) if len(fields) > 38 else 0.0,
+                            "市盈率-动态": _safe_float(fields[39]) if len(fields) > 39 else 0.0,
+                            "振幅": _safe_float(fields[43]) if len(fields) > 43 else 0.0,
+                            "总市值": _safe_float(fields[45]) * 1e8 if len(fields) > 45 and fields[45] else 0.0,
+                            "流通市值": _safe_float(fields[44]) * 1e8 if len(fields) > 44 and fields[44] else 0.0,
                             "市净率": _safe_float(fields[46]) if len(fields) > 46 else 0.0,
-                            "成交量": _safe_float(fields[6]) if len(fields) > 6 else 0.0,
-                            "成交额": _safe_float(fields[37 - 1]) if len(fields) > 36 else 0.0,
+                            "成交量": _safe_float(fields[36]) if len(fields) > 36 else 0.0,
+                            "成交额": _safe_float(fields[37]) if len(fields) > 37 else 0.0,
                         }
                         # 计算涨跌幅
                         yesterday = _safe_float(fields[4])
@@ -1413,6 +1422,45 @@ class DataEngine:
                         print(f"  [新浪行情] 补充 {len(sina_data)} 只实时行情")
             except Exception as e:
                 print(f"  [警告] 新浪实时行情获取失败: {e}")
+
+        # Priority 4: tushare daily_basic 补充/修正 PE/PB/市值
+        # tushare 的 PE(TTM)/PB 数据最权威，用于修正腾讯/新浪可能的解析偏差
+        if self._pro and result:
+            try:
+                need_fix = [c for c in result if not result[c].get("市盈率-动态") or result[c].get("市盈率-动态", 0) > 2000]
+                if need_fix:
+                    ts_codes = []
+                    for c in need_fix:
+                        ts_codes.append(f"{c}.SH" if c.startswith("6") else f"{c}.SZ")
+                    # 批量获取
+                    with self._api_sem:
+                        df = self._pro.daily_basic(
+                            trade_date="",
+                            ts_code=",".join(ts_codes[:50]),
+                            fields="ts_code,pe_ttm,pb,total_mv,circ_mv,turnover_rate",
+                        )
+                    if df is not None and len(df) > 0:
+                        fixed = 0
+                        for _, row in df.iterrows():
+                            ts_code = row.get("ts_code", "")
+                            code = ts_code.split(".")[0] if "." in ts_code else ""
+                            if code in result:
+                                pe = row.get("pe_ttm")
+                                pb = row.get("pb")
+                                if pe and not pd.isna(pe):
+                                    result[code]["市盈率-动态"] = round(float(pe), 2)
+                                    result[code]["PE"] = round(float(pe), 2)
+                                    fixed += 1
+                                if pb and not pd.isna(pb):
+                                    result[code]["市净率"] = round(float(pb), 2)
+                                    result[code]["PB"] = round(float(pb), 2)
+                                tmv = row.get("total_mv")
+                                if tmv and not pd.isna(tmv):
+                                    result[code]["总市值"] = float(tmv) * 10000  # 万→元
+                        if fixed:
+                            print(f"  [tushare] 修正 {fixed} 只PE/PB数据")
+            except Exception as e:
+                pass  # tushare补充失败不影响主流程
 
         return result
 
