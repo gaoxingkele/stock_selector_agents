@@ -29,7 +29,7 @@ from config import Config, ProviderConfig
 
 
 # 提供商优先级（面板选择顺序）
-PANEL_PRIORITY = ["grok", "glm", "deepseek", "kimi", "gemini", "doubao", "qwen", "minimax", "perplexity"]
+PANEL_PRIORITY = ["grok", "qwen", "kimi", "doubao", "gemini", "glm", "deepseek", "minimax", "perplexity"]
 
 
 # ===================================================================== #
@@ -93,10 +93,15 @@ class ConversationSession:
     保证模型能看到完整的对话上下文。
     """
 
-    def __init__(self, client: "LLMClient", provider_name: str, system_prompt: str):
+    def __init__(self, client: "LLMClient", provider_name: str, system_prompt: str,
+                 max_session_time: float = 720.0, max_calls: int = 25):
         self.messages: List[Dict] = [{"role": "system", "content": system_prompt}]
         self._client = client
         self._provider = provider_name
+        self.max_session_time = max_session_time
+        self.max_calls = max_calls
+        self._session_start = time.time()
+        self._call_count = 0
 
     def say(self, content: str, images: Optional[List[str]] = None) -> Optional[str]:
         """
@@ -107,6 +112,15 @@ class ConversationSession:
             content : 文本内容
             images  : PNG/JPG 文件路径列表，自动 base64 编码插入 content block
         """
+        elapsed = time.time() - self._session_start
+        if elapsed > self.max_session_time:
+            print(f"  [警告] [{self._provider}] 会话已超时 ({elapsed:.0f}s > {self.max_session_time:.0f}s)，跳过调用")
+            return None
+        self._call_count += 1
+        if self._call_count > self.max_calls:
+            print(f"  [警告] [{self._provider}] 会话调用次数已达上限 ({self._call_count} > {self.max_calls})，跳过调用")
+            return None
+
         if images:
             content_blocks: List[Dict] = [{"type": "text", "text": content}]
             for img_path in images:
@@ -169,6 +183,15 @@ class ConversationSession:
             将描述文本追加到 content，再调用主推理模型
           - 无图片或无视觉能力              → 等同于 say(content)
         """
+        elapsed = time.time() - self._session_start
+        if elapsed > self.max_session_time:
+            print(f"  [警告] [{self._provider}] 会话已超时 ({elapsed:.0f}s > {self.max_session_time:.0f}s)，跳过调用")
+            return None
+        self._call_count += 1
+        if self._call_count > self.max_calls:
+            print(f"  [警告] [{self._provider}] 会话调用次数已达上限 ({self._call_count} > {self.max_calls})，跳过调用")
+            return None
+
         if not image_paths:
             return self.say(content)
 
@@ -335,11 +358,17 @@ class LLMClient:
                     "messages": messages,
                     "max_tokens": max_tokens,
                 }
-                if provider_name != "perplexity":
+                if provider_name == "kimi" and "k2" in prov.model:
+                    kwargs["temperature"] = 1.0   # kimi-k2系列仅支持temperature=1
+                elif provider_name != "perplexity":
                     kwargs["temperature"] = temperature
 
                 resp = client.chat.completions.create(**kwargs)
-                content = resp.choices[0].message.content
+                msg = resp.choices[0].message
+                content = msg.content
+                # 推理模型（deepseek-reasoner / kimi-k2等）可能把结果放在 reasoning_content
+                if not content and hasattr(msg, "reasoning_content") and msg.reasoning_content:
+                    content = msg.reasoning_content
                 elapsed = round(time.time() - t_call, 2)
                 _len = len(content.strip()) if content else 0
 

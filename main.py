@@ -42,6 +42,7 @@ from config import load_config, Config
 from data_engine import DataEngine
 from llm_client import LLMClient
 from stock_agents import (
+    MarketRadar,
     SectorPicker,
     GlobalThemeAdvisor,
     SectorScreener,
@@ -94,6 +95,168 @@ def _consensus_level(model_count: int) -> str:
     elif model_count >= 2:
         return f"弱共识({model_count}模型)"
     return "单一模型"
+
+
+def run_chief_strategist(
+    llm: LLMClient,
+    fusion_top: List[Dict],
+    model_results: List[Dict],
+    mr_result: Optional[Dict] = None,
+) -> Optional[List[Dict]]:
+    """
+    首席策略师综合判断：对Borda融合结果进行定性审视和调整。
+
+    返回调整后的排名列表，失败时返回None（使用原始Borda排名）。
+    """
+    try:
+        # ── 构建市场环境上下文 ──
+        market_ctx = ""
+        if mr_result:
+            env = mr_result.get("market_environment", {})
+            sent = mr_result.get("sentiment", {})
+            market_ctx = (
+                f"【市场环境】\n"
+                f"大盘趋势: {env.get('trend', 'N/A')}\n"
+                f"情绪温度: {sent.get('temperature', 'N/A')} | 周期: {sent.get('cycle_phase', '')}\n"
+                f"策略提示: {sent.get('strategy_hint', '')}\n"
+            )
+
+        # ── 构建融合排名表 ──
+        ranking_lines = []
+        for item in fusion_top:
+            sources = ", ".join(
+                f"{r['model']}(#{r['rank']})" for r in item.get("recommended_by", [])
+            )
+            ranking_lines.append(
+                f"  {item['rank']}. {item['code']} {item['name']}  "
+                f"板块={item.get('sector', '')}  Borda={item['borda_score']:.0f}  "
+                f"模型数={item['model_count']}  来源=[{sources}]"
+            )
+        ranking_table = "\n".join(ranking_lines)
+
+        # ── 识别模型间分歧 ──
+        disagreements = []
+        code_rankings: Dict[str, List] = {}
+        for mr in model_results:
+            model_name = mr.get("model", "unknown")
+            for pick in mr.get("picks", []):
+                code = pick.get("code", "")
+                rank = pick.get("rank", 99)
+                if code:
+                    code_rankings.setdefault(code, []).append((model_name, rank))
+
+        for item in fusion_top:
+            code = item["code"]
+            ranks = code_rankings.get(code, [])
+            if len(ranks) >= 2:
+                rank_values = [r[1] for r in ranks]
+                spread = max(rank_values) - min(rank_values)
+                if spread >= 3:
+                    rank_detail = ", ".join(f"{m}=#{r}" for m, r in ranks)
+                    disagreements.append(
+                        f"  {code} {item['name']}: 排名分歧大(极差={spread}) [{rank_detail}]"
+                    )
+
+        disagreement_text = ""
+        if disagreements:
+            disagreement_text = "\n【模型间主要分歧】\n" + "\n".join(disagreements[:8])
+
+        # ── 构建 code 列表用于验证 ──
+        valid_codes = {item["code"] for item in fusion_top}
+
+        # ── 调用 LLM ──
+        system_msg = (
+            "你是首席投资策略师。你的任务是对量化融合排名进行定性审视，弥补纯投票机制的盲区。"
+            "你可以调整排名顺序，但不能新增融合结果中没有的股票。"
+        )
+
+        user_msg = (
+            f"{market_ctx}\n"
+            f"【Borda融合排名（共{len(fusion_top)}只）】\n{ranking_table}\n"
+            f"{disagreement_text}\n\n"
+            f"请对以上融合排名进行定性审视，可根据市场环境、板块轮动、分歧信号等因素调整排序。\n"
+            f"要求：\n"
+            f"1. 只能重新排列上述股票，不能新增或删除\n"
+            f"2. 返回全部{len(fusion_top)}只股票的调整后排名\n"
+            f"3. 以纯JSON格式输出，不要包含markdown代码块标记：\n"
+            f'{{\n'
+            f'  "adjusted_ranking": [\n'
+            f'    {{"code": "...", "name": "...", "adjustment": "升|降|维持", "reason": "调整理由"}}\n'
+            f'  ],\n'
+            f'  "strategic_commentary": "整体策略点评（50字以内）",\n'
+            f'  "top_conviction": "最高信心标的代码及理由"\n'
+            f'}}'
+        )
+
+        messages = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ]
+
+        raw = llm.call_primary(messages, temperature=0.2)
+        if not raw:
+            return None
+
+        # ── 解析 JSON ──
+        # 去除可能的 markdown 代码块包裹
+        text = raw.strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[-1]  # 去掉第一行 ```json
+            if text.endswith("```"):
+                text = text[:-3]
+            text = text.strip()
+
+        result = json.loads(text)
+        adjusted_ranking = result.get("adjusted_ranking", [])
+        if not adjusted_ranking:
+            return None
+
+        commentary = result.get("strategic_commentary", "")
+        top_conviction = result.get("top_conviction", "")
+
+        # ── 应用调整：按策略师返回的顺序重排 fusion_top ──
+        fusion_lookup = {item["code"]: item for item in fusion_top}
+        adjusted_list = []
+        seen = set()
+
+        for entry in adjusted_ranking:
+            code = entry.get("code", "")
+            if code in valid_codes and code not in seen:
+                item = dict(fusion_lookup[code])  # 浅拷贝
+                item["adjustment"] = entry.get("adjustment", "维持")
+                item["adjustment_reason"] = entry.get("reason", "")
+                item["strategic_commentary"] = commentary
+                item["top_conviction"] = top_conviction
+                adjusted_list.append(item)
+                seen.add(code)
+
+        # 补回策略师遗漏的股票（保持原顺序追加）
+        for item in fusion_top:
+            if item["code"] not in seen:
+                adj_item = dict(item)
+                adj_item["adjustment"] = "维持"
+                adj_item["adjustment_reason"] = "策略师未提及"
+                adj_item["strategic_commentary"] = commentary
+                adj_item["top_conviction"] = top_conviction
+                adjusted_list.append(adj_item)
+
+        # 更新 rank
+        for i, item in enumerate(adjusted_list, 1):
+            item["rank"] = i
+
+        if commentary:
+            print(f"  策略点评: {commentary}")
+        if top_conviction:
+            print(f"  最高信心: {top_conviction}")
+
+        return adjusted_list
+
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
+        print(f"  [策略师] 解析失败: {e}")
+        return None
+    except Exception as e:
+        print(f"  [策略师] 异常: {e}")
+        return None
 
 
 def fusion_to_arb_result(final_top: List[Dict]) -> Dict:
@@ -152,8 +315,10 @@ def format_final_report(
     risk_result: Dict,
     arb_result: Dict,
     fusion_result: Optional[List[Dict]] = None,
+    mr_result: Optional[Dict] = None,
+    etf_sector_match: Optional[Dict] = None,
 ) -> str:
-    """生成最终报告文本（含 Borda 评分和推荐来源）"""
+    """生成最终报告文本（含 Borda 评分、推荐来源、市场雷达、ETF推荐）"""
     # 构建融合信息查找表
     fusion_lookup: Dict[str, Dict] = {}
     if fusion_result:
@@ -173,71 +338,234 @@ def format_final_report(
         "═" * 70,
     ]
 
+    # ── 市场雷达概览 ──────────────────────────────────────────────
+    if mr_result:
+        env = mr_result.get("market_environment", {})
+        sent = mr_result.get("sentiment", {})
+        lines.append("\n  【市场雷达】")
+        lines.append(f"  大盘环境: {env.get('trend', 'N/A')}")
+        idx_s = env.get("index_summary", "")
+        if idx_s:
+            lines.append(f"  指数概况: {idx_s}")
+        lines.append(
+            f"  情绪温度: {sent.get('temperature', 'N/A')} | "
+            f"周期: {sent.get('cycle_phase', '')} | "
+            f"分数: {sent.get('score', 'N/A')}"
+        )
+        hint = sent.get("strategy_hint", "")
+        if hint:
+            lines.append(f"  策略提示: {hint}")
+        adv = mr_result.get("operation_advice", "")
+        if adv:
+            lines.append(f"  操作建议: {adv[:200]}")
+
+        # 概念炒作预判
+        hypes = mr_result.get("hype_predictions", [])
+        if hypes:
+            lines.append("\n  【概念炒作预判】")
+            lines.append(
+                f"  {'排名':<4} {'概念名称':<14} {'阶段':<10} "
+                f"{'信心':<6} {'信号来源':<20} {'ETF替代':<20}"
+            )
+            lines.append("  " + "─" * 75)
+            for h in hypes[:8]:
+                etf_str = ""
+                etf_alts = h.get("etf_alternatives", [])
+                if etf_alts:
+                    etf_str = ", ".join(
+                        f"{e.get('name', '')}({e.get('code', '')})" for e in etf_alts[:2]
+                    )
+                signal = h.get("signal_sources", "")[:18]
+                lines.append(
+                    f"  {h['rank']:<4} {h['concept_name']:<14} {h['hype_stage']:<10} "
+                    f"{h['confidence']:<6.0f} {signal:<20} {etf_str:<20}"
+                )
+        lines.append("")
+
     approved = risk_result.get("approved", [])
-    if not approved:
+    soft_excluded = risk_result.get("soft_excluded", [])
+
+    if not approved and not soft_excluded:
         lines.append("  [警告] 未产生有效推荐，请检查数据和模型配置")
         return "\n".join(lines)
 
-    lines.append(f"\n  共推荐 {len(approved)} 只股票\n")
-
-    # 表头
-    lines.append(
-        f"  {'排名':<4} {'代码':<8} {'名称':<10} {'板块':<12} "
-        f"{'Borda分':<8} {'推荐模型数':<8} {'风险':<6} {'仓位建议':<12}"
-    )
-    lines.append("  " + "─" * 75)
-
+    # 合并所有股票，统一按 Borda 分排序
+    all_stocks = []
     for stock in approved:
-        rank = stock.get("rank", "")
         code = stock.get("code", "")
-        name = stock.get("name", "")[:8]
-        sector = stock.get("sector", "")[:10]
-        risk = stock.get("risk_level", "")[:5]
-        position = stock.get("position_advice", "")[:12]
-
         fi = fusion_lookup.get(code, {})
-        borda = fi.get("borda_score", stock.get("final_score", 0))
-        model_count = fi.get("model_count", stock.get("model_count", 0))
+        all_stocks.append({
+            "code": code,
+            "name": stock.get("name", ""),
+            "sector": stock.get("sector", fi.get("sector", "")),
+            "borda": fi.get("borda_score", stock.get("final_score", 0)),
+            "model_count": fi.get("model_count", stock.get("model_count", 0)),
+            "risk_level": stock.get("risk_level", ""),
+            "position_advice": stock.get("position_advice", ""),
+            "is_excluded": False,
+            "reason": "",
+            "stock_data": stock,
+            "fusion_data": fi,
+        })
+    for exc in soft_excluded:
+        code = exc.get("code", "")
+        fi = fusion_lookup.get(code, {})
+        all_stocks.append({
+            "code": code,
+            "name": exc.get("name", ""),
+            "sector": fi.get("sector", ""),
+            "borda": fi.get("borda_score", 0),
+            "model_count": fi.get("model_count", 0),
+            "risk_level": "⚠️",
+            "position_advice": "",
+            "is_excluded": True,
+            "reason": exc.get("reason", "风控排除"),
+            "stock_data": exc,
+            "fusion_data": fi,
+        })
+    all_stocks.sort(key=lambda x: x["borda"], reverse=True)
 
-        lines.append(
-            f"  {rank:<4} {code:<8} {name:<10} {sector:<12} "
-            f"{borda:<8.0f} {model_count:<8} {risk:<6} {position:<12}"
-        )
+    total = len(all_stocks)
+    n_approved = len(approved)
+    n_excluded = len(soft_excluded)
+    lines.append(f"\n  共 {total} 只股票（按Borda评分排序 | 风控通过 {n_approved} 只，风控提示 {n_excluded} 只）\n")
 
-    lines.append("\n" + "─" * 70)
+    # ── 网格表格（处理中文宽度） ──────────────────────────────
+    def _display_width(s: str) -> int:
+        """计算字符串显示宽度（中文占2，ASCII占1）"""
+        w = 0
+        for ch in s:
+            w += 2 if '\u4e00' <= ch <= '\u9fff' or '\u3000' <= ch <= '\u303f' or '\uff00' <= ch <= '\uffef' else 1
+        return w
 
-    # 详情
+    def _pad(s: str, width: int, align: str = "left") -> str:
+        """按显示宽度填充字符串"""
+        dw = _display_width(s)
+        pad = max(0, width - dw)
+        if align == "center":
+            left = pad // 2
+            right = pad - left
+            return " " * left + s + " " * right
+        elif align == "right":
+            return " " * pad + s
+        return s + " " * pad
+
+    # 列宽定义
+    W = [4, 8, 10, 10, 6, 4, 8, 14, 30]  # 排名/代码/名称/板块/Borda/模型/风险/仓位/风控提示
+    H = ["排名", "代码", "名称", "板块", "Borda", "模型", "风险", "仓位建议", "风控提示"]
+    HA = ["center"] * 6 + ["center", "center", "center"]  # 表头对齐
+
+    top_line  = "  ┌" + "┬".join("─" * w for w in W) + "┐"
+    sep_line  = "  ├" + "┼".join("─" * w for w in W) + "┤"
+    bot_line  = "  └" + "┴".join("─" * w for w in W) + "┘"
+
+    def _row(cells, aligns=None):
+        if aligns is None:
+            aligns = ["center", "center", "left", "left", "center", "center", "left", "left", "left"]
+        parts = []
+        for i, (cell, w) in enumerate(zip(cells, W)):
+            parts.append(_pad(str(cell), w, aligns[i] if i < len(aligns) else "left"))
+        return "  │" + "│".join(parts) + "│"
+
+    lines.append(top_line)
+    lines.append(_row(H, HA))
+    lines.append(sep_line)
+
+    for rank_counter, item in enumerate(all_stocks, 1):
+        code = item["code"]
+        name = item["name"][:5]
+        sector = item["sector"][:5]
+        borda = f"{item['borda']:.0f}"
+        model_count = str(item["model_count"])
+
+        if item["is_excluded"]:
+            risk_str = "⚠风控"
+            position = "—"
+            risk_note = item["reason"][:14]
+        else:
+            risk_str = item["risk_level"][:4]
+            position = item["position_advice"][:7]
+            stock = item["stock_data"]
+            flags = stock.get("risk_flags", [])
+            risk_note = "; ".join(flags)[:14] if flags else ""
+
+        lines.append(_row(
+            [str(rank_counter), code, name, sector, borda, model_count, risk_str, position, risk_note],
+            ["center", "center", "left", "left", "center", "center", "left", "left", "left"],
+        ))
+
+    lines.append(bot_line)
+
+    # 详情（按 Borda 分排序统一展示）
     lines.append("\n  【个股详情】")
-    for stock in approved:
-        code = stock.get("code", "")
-        name = stock.get("name", "")
-        lines.append(f"\n  ▸ {code} {name}")
+    for item in all_stocks:
+        code = item["code"]
+        name = item["stock_data"].get("name", item["name"])
+        fi = item["fusion_data"]
+        lines.append(f"\n  ▸ {code} {name}" + ("  ⚠️风控提示" if item["is_excluded"] else ""))
 
         # Borda 来源信息
-        fi = fusion_lookup.get(code, {})
         recommended_by = fi.get("recommended_by", [])
         if recommended_by:
             by_str = "、".join(
                 f"{r['model']}(#{r['rank']})"
                 for r in recommended_by
             )
-            lines.append(f"    推荐来源: {by_str}  Borda分={fi.get('borda_score', 0):.0f}")
+            lines.append(f"    推荐来源: {by_str}  Borda分={item['borda']:.0f}")
 
-        core = stock.get("core_logic", "")
-        if core:
-            lines.append(f"    核心逻辑: {core}")
+        if item["is_excluded"]:
+            lines.append(f"    风控提示: {item['reason']}")
+        else:
+            stock = item["stock_data"]
+            core = stock.get("core_logic", "")
+            if core:
+                lines.append(f"    核心逻辑: {core}")
 
-        entry = stock.get("entry_point", "")
-        if entry:
-            lines.append(f"    买入时机: {entry}")
+            entry = stock.get("entry_point", "")
+            if entry:
+                lines.append(f"    买入时机: {entry}")
 
-        stop = stock.get("stop_loss", "")
-        if stop:
-            lines.append(f"    止损参考: {stop}")
+            stop = stock.get("stop_loss", "")
+            if stop:
+                lines.append(f"    止损参考: {stop}")
 
-        flags = stock.get("risk_flags", [])
-        if flags:
-            lines.append(f"    风险提示: {'; '.join(flags)}")
+            flags = stock.get("risk_flags", [])
+            if flags:
+                lines.append(f"    风险提示: {'; '.join(flags)}")
+
+    # 首席策略师点评
+    strategist_commentary = ""
+    strategist_conviction = ""
+    has_adjustments = False
+    for item in all_stocks:
+        fi = item["fusion_data"]
+        if fi.get("strategic_commentary"):
+            strategist_commentary = fi["strategic_commentary"]
+        if fi.get("top_conviction"):
+            strategist_conviction = fi["top_conviction"]
+        if fi.get("adjustment") and fi["adjustment"] != "维持":
+            has_adjustments = True
+
+    if strategist_commentary or has_adjustments:
+        lines.append("\n" + "─" * 70)
+        lines.append("  【首席策略师点评】")
+        if strategist_commentary:
+            lines.append(f"  策略总评: {strategist_commentary}")
+        if strategist_conviction:
+            lines.append(f"  最高信心: {strategist_conviction}")
+        # 列出调整过的股票
+        adj_items = [
+            item for item in all_stocks
+            if item["fusion_data"].get("adjustment") and item["fusion_data"]["adjustment"] != "维持"
+        ]
+        if adj_items:
+            lines.append("  排名调整:")
+            for item in adj_items:
+                fi = item["fusion_data"]
+                lines.append(
+                    f"    {item['code']} {item['name']}  "
+                    f"{fi['adjustment']}  {fi.get('adjustment_reason', '')}"
+                )
 
     # 组合建议
     portfolio = risk_result.get("portfolio_advice", "")
@@ -249,6 +577,14 @@ def format_final_report(
             lines.append(f"  建仓时机: {timing}")
         if portfolio:
             lines.append(f"  组合建议: {portfolio}")
+
+    # ── ETF 替代推荐 ─────────────────────────────────────────────
+    if etf_sector_match:
+        lines.append("\n" + "─" * 70)
+        lines.append("  【ETF替代推荐（选不出个股时可先蹭板块涨幅）】")
+        for sector, etfs in etf_sector_match.items():
+            etf_str = " / ".join(f"{e['name']}({e['code']})" for e in etfs[:2])
+            lines.append(f"    {sector} → {etf_str}")
 
     lines.append("\n" + "═" * 70)
     lines.append("  [免责声明] 本报告仅为AI分析参考，不构成投资建议。")
@@ -411,6 +747,63 @@ def run_full_pipeline(
         print("\n  [错误] 未配置任何LLM提供商！请检查 .env 文件中的 API Key。")
         return {}
 
+    # ── Step 0: 市场雷达（大盘+情绪+概念炒作预判+ETF）────────────
+    # 非个股直选模式时执行，为后续板块优选提供市场环境上下文
+    mr_result: Dict = {}
+    etf_data: Dict = {}
+    if not stock_codes and not sectors:
+        print_section("Step 0: 市场雷达扫描（大盘+情绪+概念炒作预判+ETF）")
+        t_step0 = time.time()
+
+        # 并行采集市场雷达所需数据
+        market_indices = engine.fetch_market_indices()
+        market_sentiment = engine.fetch_market_sentiment()
+        market_hot = engine.fetch_market_hot()
+        concept_signals = engine.fetch_concept_hype_signals()
+        etf_data = engine.fetch_etf_hot()
+
+        # 运行市场雷达分析
+        radar = MarketRadar(llm, cfg)
+        mr_result = radar.scan(
+            market_indices=market_indices,
+            market_sentiment=market_sentiment,
+            market_hot=market_hot,
+            concept_signals=concept_signals,
+            etf_data=etf_data,
+            panel_size=len(active_models),
+            verbose=verbose,
+        )
+        save_result(mr_result, f"market_radar_{TODAY}.json")
+
+        # 打印市场雷达结果摘要
+        env = mr_result.get("market_environment", {})
+        sent = mr_result.get("sentiment", {})
+        hypes = mr_result.get("hype_predictions", [])
+        print(f"\n  [MR] 大盘环境: {env.get('trend', 'N/A')}")
+        print(f"  [MR] {env.get('index_summary', '')}")
+        print(f"  [MR] 情绪温度: {sent.get('temperature', 'N/A')} | 周期: {sent.get('cycle_phase', '')}")
+        print(f"  [MR] {sent.get('strategy_hint', '')}")
+        if hypes:
+            print(f"\n  [MR] 概念炒作预判Top5:")
+            for h in hypes[:5]:
+                etf_str = ""
+                etf_alts = h.get("etf_alternatives", [])
+                if etf_alts:
+                    etf_str = " → ETF: " + ", ".join(
+                        f"{e.get('name', '')}({e.get('code', '')})" for e in etf_alts[:2]
+                    )
+                print(
+                    f"    {h['rank']}. {h['concept_name']}  "
+                    f"阶段={h['hype_stage']}  信心={h['confidence']:.0f}%  "
+                    f"票={h['votes']}/{h.get('total_models', '?')}"
+                    f"{etf_str}"
+                )
+        adv = mr_result.get("operation_advice", "")
+        if adv:
+            print(f"\n  [MR] 操作建议: {adv[:200]}")
+
+        print(f"  ✓ Step 0 完成，耗时 {(time.time()-t_step0)/60:.1f} 分钟")
+
     # ── 个股直选模式（--stocks）：跳过板块筛选，直接采集指定股票 ────
     top_sectors = []  # 初始化，个股直选模式下为空列表
     if stock_codes:
@@ -477,13 +870,29 @@ def run_full_pipeline(
         if sectors:
             top_sectors = sectors
             sector_data = {}
-            market_hot = {}
+            if not mr_result:
+                market_hot = {}
             print(f"\n  [用户指定板块] {top_sectors}")
         else:
             print_section("Step 1: 板块数据采集与优选（SP 全面板投票）")
             t_step1 = time.time()
             sector_data = engine.fetch_sector_overview()
-            market_hot = engine.fetch_market_hot()
+            # 如果 MR 已采集过 market_hot，复用之（避免重复网络请求）
+            if not mr_result:
+                market_hot = engine.fetch_market_hot()
+
+            # ETF活跃板块信号（反向推导）
+            etf_signals = engine.etf_active_sectors(etf_data) if etf_data else []
+            if etf_signals:
+                print(f"\n  [ETF信号] 活跃板块（ETF反推）:")
+                for s in etf_signals[:5]:
+                    print(
+                        f"    {s['sector']}  "
+                        f"{s['etf_name']}({s['etf_code']}) "
+                        f"{s['change_pct']:+.2f}%  "
+                        f"{s['amount_yi']:.1f}亿  "
+                        f"{s['signal']}"
+                    )
 
             picker = SectorPicker(llm, cfg)
             pick_result = picker.pick(
@@ -491,6 +900,8 @@ def run_full_pipeline(
                 market_hot=market_hot,
                 panel_size=len(active_models),   # 全部面板模型参与投票
                 verbose=verbose,
+                mr_result=mr_result if mr_result else None,
+                etf_signals=etf_signals if etf_signals else None,
             )
             top_sectors = pick_result.get("sector_names", [])
 
@@ -682,11 +1093,11 @@ def run_full_pipeline(
     save_result({"model_results": model_results}, f"model_results_{TODAY}.json")
 
     # ── Step 5: Borda Count 跨模型融合 ──────────────────────────────
-    print_section("Step 5: Borda Count 跨模型融合（输出 Top10）")
+    print_section("Step 5: Borda Count 跨模型融合（输出 Top25）")
     t_step5 = time.time()
     logger.log("fusion_start", detail={"model_count": len(model_results)})
 
-    final_top10 = borda_fusion(model_results, top_n=10)
+    final_top10 = borda_fusion(model_results, top_n=25)
 
     logger.log("fusion_done", detail={"top_n": len(final_top10)})
 
@@ -703,6 +1114,15 @@ def run_full_pipeline(
     print(f"  ✓ Step 5 完成，耗时 {time.time()-t_step5:.1f}s")
 
     save_result({"final_top10": final_top10}, f"fusion_result_{TODAY}.json")
+
+    # ── Step 5.5: 首席策略师综合判断 ─────────────────────────────────
+    print_section("Step 5.5: 首席策略师综合判断")
+    adjusted = run_chief_strategist(llm, final_top10, model_results, mr_result if mr_result else None)
+    if adjusted:
+        final_top10 = adjusted
+        print("  ✓ 策略师已调整排名")
+    else:
+        print("  [降级] 策略师调整失败，使用原始Borda排名")
 
     # 转换为 RiskController 兼容格式
     arb_result = fusion_to_arb_result(final_top10)
@@ -721,7 +1141,14 @@ def run_full_pipeline(
 
     # ── Step 7: 最终报告（文本）──────────────────────────────────────
     print_section("Step 7: 最终报告")
-    report = format_final_report(risk_result, arb_result, fusion_result=final_top10)
+    # 匹配选出板块对应的ETF
+    etf_sector_match = engine.match_sector_etfs(top_sectors) if top_sectors else {}
+    report = format_final_report(
+        risk_result, arb_result,
+        fusion_result=final_top10,
+        mr_result=mr_result if mr_result else None,
+        etf_sector_match=etf_sector_match if etf_sector_match else None,
+    )
     print(report)
 
     report_path = os.path.join(REPORTS_DIR, f"final_report_{TODAY}.txt")

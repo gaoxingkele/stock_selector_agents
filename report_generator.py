@@ -696,46 +696,73 @@ class ReportGenerator:
         return elems
 
     # ── 推荐总览表 ───────────────────────────────────────────────
-    def _build_recommendation_table(self, approved: List[Dict]) -> List:
+    def _build_recommendation_table(self, approved: List[Dict], soft_excluded: List[Dict] = None) -> List:
         S = self.styles
-        elems = [PageBreak(), Paragraph("推荐股票总览", S["h1"])]
+        elems = [PageBreak(), Paragraph("推荐股票总览（按Borda评分排序）", S["h1"])]
         elems.append(HRFlowable(width="100%", thickness=2, color=GOLD, spaceAfter=10))
+
+        n_approved = len(approved)
+        n_excluded = len(soft_excluded) if soft_excluded else 0
+        elems.append(Paragraph(
+            f"共 {n_approved + n_excluded} 只 · 风控通过 {n_approved} 只 · 风控提示 {n_excluded} 只（⚠ 标记）",
+            S["body_s"],
+        ))
+        elems.append(Spacer(1, 0.2 * cm))
+
+        # 合并并按 Borda/final_score 降序排列
+        all_items = []
+        for stk in approved:
+            all_items.append({"data": stk, "is_excluded": False, "reason": ""})
+        for se in (soft_excluded or []):
+            all_items.append({"data": se, "is_excluded": True, "reason": se.get("reason", "")})
+        all_items.sort(
+            key=lambda x: float(x["data"].get("borda_score", x["data"].get("final_score", x["data"].get("weighted_score", 0))) or 0),
+            reverse=True,
+        )
 
         W = self.PAGE_W - self.MARGIN_L - self.MARGIN_R
         col_w = [0.5*cm, 1.8*cm, 2.5*cm, 2.8*cm, 2.5*cm, 2.0*cm, 2.2*cm, 2.5*cm, 2.2*cm]
         headers = ["#", "代码", "名称", "板块", "共识", "综合评分", "风险", "仓位建议", "持有周期"]
 
         rows = [[Paragraph(h, S["th"]) for h in headers]]
+        excluded_row_indices = []
 
-        for stk in approved:
-            rank       = stk.get("rank", "")
+        for rank_i, item in enumerate(all_items, 1):
+            stk = item["data"]
             code       = stk.get("code", "")
             name       = stk.get("name", "")
             sector     = stk.get("sector", "")
-            consensus  = stk.get("consensus_level", "—")
-            score      = stk.get("final_score", stk.get("weighted_score", 0))
-            risk       = stk.get("risk_level", "未评")
-            position   = stk.get("position_advice", "—")
-            hold       = stk.get("holding_period", stk.get("hold_period", "—"))
+            score      = stk.get("borda_score", stk.get("final_score", stk.get("weighted_score", 0)))
 
-            # 风险颜色
-            if "低" in risk:
-                rs = S["td_g"]
-            elif "高" in risk:
-                rs = S["td_r"]
+            if item["is_excluded"]:
+                consensus = "—"
+                risk      = "⚠风控"
+                position  = item["reason"][:18] if item["reason"] else "风控提示"
+                hold      = "—"
+                rs        = S["td_r"]
+                excluded_row_indices.append(rank_i)  # 1-based data row index
             else:
-                rs = S["td_o"]
+                consensus  = stk.get("consensus_level", "—")
+                risk       = stk.get("risk_level", "未评")
+                position   = stk.get("position_advice", "—")
+                hold       = stk.get("holding_period", stk.get("hold_period", "—"))
+                if "低" in risk:
+                    rs = S["td_g"]
+                elif "高" in risk:
+                    rs = S["td_r"]
+                else:
+                    rs = S["td_o"]
 
             rows.append([
-                Paragraph(str(rank),  S["td"]),
-                Paragraph(code,       S["td"]),
-                Paragraph(name,       S["td_l"]),
-                Paragraph(sector,     S["td_l"]),
-                Paragraph(consensus,  S["td"]),
+                Paragraph(str(rank_i), S["td"]),
+                Paragraph(code,        S["td"]),
+                Paragraph(name,        S["td_l"]),
+                Paragraph(sector,      S["td_l"]),
+                Paragraph(consensus,   S["td"]),
                 Paragraph(f"{float(score):.1f}分" if score else "—", S["td"]),
-                Paragraph(risk,       rs),
-                Paragraph(position,   S["body_s"]),
-                Paragraph(hold,       S["td"]),
+                Paragraph(risk,        rs),
+                Paragraph(position,    S["body_s"]),
+                Paragraph(hold,        S["td"]),
             ])
 
         tbl = Table(rows, colWidths=col_w, repeatRows=1)
@@ -745,9 +772,6 @@ class ReportGenerator:
             ("FONTNAME",      (0, 0), (-1, 0), F_BOLD),
             ("TEXTCOLOR",     (0, 0), (-1, 0), C_WHITE),
             ("ALIGN",         (0, 0), (-1, 0), "CENTER"),
-            # 内容行交替色
-            *[("BACKGROUND",  (0, i), (-1, i), BG_ALT if i % 2 == 0 else colors.white)
-              for i in range(1, len(rows))],
             # 通用
             ("ALIGN",         (0, 0), (-1, -1), "CENTER"),
             ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
@@ -758,6 +782,11 @@ class ReportGenerator:
             ("GRID",          (0, 0), (-1, -1), 0.4, BORDER),
             ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, BG_ALT]),
         ]))
+        # 风控提示行用浅红色背景
+        for row_i in excluded_row_indices:
+            tbl.setStyle(TableStyle([
+                ("BACKGROUND", (0, row_i), (-1, row_i), colors.HexColor("#FFF0F0")),
+            ]))
         elems.append(tbl)
         return elems
 
@@ -767,6 +796,7 @@ class ReportGenerator:
         stk: Dict,
         pkg: Optional[Dict],
         expert_summary: Dict,
+        is_excluded: bool = False,
     ) -> List:
         S = self.styles
         elems = [PageBreak()]
@@ -783,6 +813,24 @@ class ReportGenerator:
         hold    = stk.get("holding_period", "—")
         flags   = stk.get("risk_flags", [])
         consensus = stk.get("consensus_level", "")
+
+        # 风控提示警告横幅
+        if is_excluded:
+            risk_warning = stk.get("risk_warning", "风控提示")
+            warn_tbl = Table(
+                [[Paragraph(f"⚠ 风控提示：{risk_warning}", S["td_r"])]],
+                colWidths=[self.PAGE_W - self.MARGIN_L - self.MARGIN_R],
+            )
+            warn_tbl.setStyle(TableStyle([
+                ("BACKGROUND",    (0, 0), (-1, -1), colors.HexColor("#FFF0F0")),
+                ("ALIGN",         (0, 0), (-1, -1), "LEFT"),
+                ("TOPPADDING",    (0, 0), (-1, -1), 6),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                ("LEFTPADDING",   (0, 0), (-1, -1), 10),
+                ("BOX",           (0, 0), (-1, -1), 1, C_RED),
+            ]))
+            elems.append(warn_tbl)
+            elems.append(Spacer(1, 0.15 * cm))
 
         # ── 股票标题栏 ─────────────────────────────────────────
         rt = (pkg or {}).get("realtime", {})
@@ -1014,10 +1062,12 @@ class ReportGenerator:
         返回: 生成的 PDF 文件路径。
         """
         approved  = risk_result.get("approved", [])
+        soft_excluded = risk_result.get("soft_excluded", [])
         market_view = risk_result.get("market_timing", "")
         portfolio   = risk_result.get("portfolio_advice", "")
 
-        if not approved:
+        all_stocks = approved + soft_excluded
+        if not all_stocks:
             print("  [报告] 无推荐股票，跳过PDF生成")
             return ""
 
@@ -1026,7 +1076,7 @@ class ReportGenerator:
         )
 
         print(f"\n  [报告] 开始生成PDF: {filename}")
-        print(f"  [报告] 推荐股票 {len(approved)} 只")
+        print(f"  [报告] 推荐股票 {len(approved)} 只，风控提示 {len(soft_excluded)} 只")
 
         # ── 文档设置 ──────────────────────────────────────────
         doc = BaseDocTemplate(
@@ -1057,22 +1107,43 @@ class ReportGenerator:
         story = []
 
         # 1. 封面（使用 Cover 模板）
-        story.extend(self._build_cover(approved, top_sectors, n_models))
+        story.extend(self._build_cover(all_stocks, top_sectors, n_models))
         story.append(NextPageTemplate("Body"))
         story.append(PageBreak())
 
         # 2. 执行摘要
         story.extend(self._build_exec_summary(approved, top_sectors, market_view, portfolio))
 
-        # 3. 推荐总览表
-        story.extend(self._build_recommendation_table(approved))
+        # 3. 推荐总览表（按Borda评分排序，含风控提示股票）
+        story.extend(self._build_recommendation_table(approved, soft_excluded))
 
-        # 4. 个股详情
+        # 4. 个股详情 — 按Borda评分排序，统一展示
+        # 合并并排序
+        all_stock_items = []
         for stk in approved:
+            borda = float(stk.get("borda_score", stk.get("final_score", stk.get("weighted_score", 0))) or 0)
+            all_stock_items.append({"data": stk, "is_excluded": False, "borda": borda})
+        for se in soft_excluded:
+            code = se.get("code", "")
+            # 从 arb_result 中找到完整股票数据
+            full_stk = None
+            for pick in arb_result.get("final_picks", []):
+                if str(pick.get("code", "")) == code:
+                    full_stk = pick
+                    break
+            if full_stk:
+                full_stk["risk_warning"] = se.get("reason", "")
+                borda = float(full_stk.get("borda_score", full_stk.get("final_score", 0)) or 0)
+                all_stock_items.append({"data": full_stk, "is_excluded": True, "borda": borda})
+        all_stock_items.sort(key=lambda x: x["borda"], reverse=True)
+
+        for item in all_stock_items:
+            stk = item["data"]
             code = stk.get("code", "")
-            pkg  = stock_packages.get(code)
-            print(f"  [报告] 生成个股分析页: {code} {stk.get('name','')}")
-            story.extend(self._build_stock_page(stk, pkg, expert_summary))
+            pkg = stock_packages.get(code)
+            tag = "风控提示" if item["is_excluded"] else "个股分析"
+            print(f"  [报告] 生成{tag}页: {code} {stk.get('name','')}")
+            story.extend(self._build_stock_page(stk, pkg, expert_summary, is_excluded=item["is_excluded"]))
 
         # 5. 免责声明
         story.extend(self._build_disclaimer())

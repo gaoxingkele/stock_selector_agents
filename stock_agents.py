@@ -3,7 +3,8 @@
 """
 A股多智能体选股系统 - 智能体模块
 
-包含全部12个智能体：
+包含全部智能体：
+  MR. 市场雷达 (MarketRadar)             ← 大盘环境+情绪+概念炒作预判+ETF推荐
   SP. 板块优选专家 (SectorPicker)        ← 全面板多模型投票选出 Top5 板块
   GX. 跨市场主题专家 (GlobalThemeAdvisor) ← 参考美股/港股热门，补充至多1个A股板块
   S0. 板块初筛 (SectorScreener)          ← 轻量3模型快速初筛（降级备用）
@@ -288,6 +289,533 @@ class BaseAgent:
 
 
 # ===================================================================== #
+#  MR: 市场雷达（大盘+情绪+概念炒作预判+ETF推荐）                     #
+# ===================================================================== #
+
+class MarketRadar(BaseAgent):
+    """
+    市场雷达（代号 MR）。
+
+    综合分析大盘环境、市场情绪、概念炒作信号，预判近期可能被炒作的
+    概念主题，并为每个热点概念推荐对应ETF作为替代投资工具。
+
+    输出:
+    1. 大盘多空判断
+    2. 市场情绪温度与周期阶段
+    3. 概念炒作预判 Top5-8
+    4. 每个热点概念对应的ETF推荐
+    """
+
+    EXPERT_ID = "MR"
+    EXPERT_NAME = "市场雷达"
+
+    def _system_prompt(self) -> str:
+        return """你是A股市场雷达分析师（代号MR），负责四项核心任务：
+
+【任务一：大盘环境判断】
+分析上证/深证/创业板三大指数的趋势、均线、量能，给出操作环境判断：
+- "强势做多"：三大指数均线多头排列 + 放量突破
+- "偏多震荡"：指数在均线上方但未放量突破
+- "震荡观望"：指数在均线附近反复穿越
+- "偏空谨慎"：指数在均线下方，缩量反弹
+- "弱势回避"：三大指数空头排列 + 放量下跌
+
+【任务二：市场情绪温度】
+根据以下信号综合判断情绪周期：
+- 涨停数量：>80只=亢奋, 40-80=正常, <40=低迷
+- 连板高度：最高板≥5=情绪高潮, 3-4=正常, ≤2=冰点
+- 炸板率(封板成功率)：>80%=情绪好, 60-80%=正常, <60%=恐慌
+- 昨日涨停今日表现：多数高开=接力好, 多数低开=接力差
+
+情绪周期：冰点→修复→升温→亢奋→过热→退潮→冰点
+- 冰点/修复期：适合低吸首板或强势股回调
+- 升温/亢奋期：适合做龙头接力和板块扩散
+- 过热/退潮期：控制仓位，回避高位追涨
+
+【任务三：概念炒作预判（核心任务）】
+根据以下信号预判近期最可能被炒作的概念主题：
+
+信号权重排序（从高到低）：
+1. 涨停板块聚集度（同一概念涨停≥3只 = 明确的资金共识方向）
+2. 连板龙头所属概念（龙头方向 = 资金主攻方向，跟随龙头选题材）
+3. 概念板块涨幅异动（当日涨幅>3% 且换手放量 = 资金正在进场）
+4. 概念板块5日资金持续流入（趋势性信号，机构在布局）
+5. 龙虎榜游资集中买入方向（知名游资 = 短线风向标）
+6. 政策/事件催化（重大政策发布、技术突破、行业事件等）
+
+对每个概念判断炒作阶段：
+- "酝酿启动"：资金开始流入 + 零星涨停 + 概念刚异动（最佳介入时机）
+- "正在炒作"：多只涨停 + 板块整体放量上涨（可跟随但需选低位）
+- "高潮冲顶"：龙头连板高位 + 大量跟风涨停（风险增大，只做确定性龙头）
+- "退潮分化"：龙头见顶 + 补涨股开始表现（适合做补涨，回避高位）
+
+【任务四：ETF替代推荐】
+对每个热点概念推荐对应ETF（数据中已提供板块→ETF映射表）：
+- 适合"看对方向但选不出个股"的场景
+- ETF可以先蹭2-3个点，比个股安全
+- 优先选成交额大、跟踪误差小的ETF
+
+【输出格式】
+```json
+{
+  "market_environment": {
+    "trend": "强势做多/偏多震荡/震荡观望/偏空谨慎/弱势回避",
+    "reasoning": "判断依据（80字以内）",
+    "index_summary": "三大指数一句话概括（60字以内）"
+  },
+  "sentiment": {
+    "temperature": "冰点/低迷/正常/亢奋/过热",
+    "cycle_phase": "当前情绪周期阶段（冰点/修复/升温/亢奋/过热/退潮）",
+    "score": 65,
+    "key_signals": "关键情绪信号（60字以内）",
+    "strategy_hint": "对应操作策略提示（40字以内）"
+  },
+  "hype_predictions": [
+    {
+      "rank": 1,
+      "concept_name": "概念名称（需为A股实际存在的概念板块名）",
+      "hype_stage": "酝酿启动/正在炒作/高潮冲顶/退潮分化",
+      "confidence": 85,
+      "signal_sources": "信号来源（涨停聚集/资金流入/龙头带动/政策催化等）",
+      "space_estimate": "预估空间（如：龙头还有2-3板空间/板块整体还有5-10%）",
+      "reasoning": "炒作逻辑（100字以内）",
+      "key_stocks": ["龙头股1", "龙头股2"],
+      "etf_alternatives": [{"code": "512480", "name": "半导体ETF"}],
+      "risk_note": "主要风险"
+    }
+  ],
+  "operation_advice": "综合操作建议（100字以内，结合大盘环境+情绪+热点给出）"
+}
+```
+hype_predictions 数量 5-8 个，按炒作可能性（confidence）从高到低排列。
+只推荐"酝酿启动"和"正在炒作"阶段的概念，标注"高潮冲顶"和"退潮分化"的概念供回避。"""
+
+    # ------------------------------------------------------------------ #
+    #  数据文本构建                                                        #
+    # ------------------------------------------------------------------ #
+    def _build_radar_text(
+        self,
+        market_indices: Dict,
+        market_sentiment: Dict,
+        market_hot: Dict,
+        concept_signals: Dict,
+        etf_data: Dict,
+    ) -> str:
+        parts: List[str] = []
+
+        # ── 大盘指数 ────────────────────────────────────────────────
+        if market_indices:
+            parts.append("【A股大盘指数行情】")
+            for name, info in market_indices.items():
+                changes = info.get("changes", {})
+                ma = info.get("ma", {})
+                chg_str = " | ".join(f"{k}={v}%" for k, v in changes.items())
+                ma_str = " ".join(f"{k}={v}" for k, v in ma.items())
+                parts.append(
+                    f"  {name}: 现价={info['current']} | {chg_str} | "
+                    f"均线={ma_str} | 趋势={info['trend']} | "
+                    f"5日/20日量比={info.get('vol_ratio_5d_vs_20d', 'N/A')}"
+                )
+
+        # ── 市场情绪面 ──────────────────────────────────────────────
+        parts.append("\n【市场情绪指标】")
+
+        # 涨停股池（今日总涨停数）
+        zt_pool = market_hot.get("zt_pool", [])
+        parts.append(f"  今日涨停: {len(zt_pool)}只")
+
+        # 连板股
+        strong_zt = market_sentiment.get("strong_zt", [])
+        max_board = market_sentiment.get("max_consecutive_zt", 0)
+        board_dist = market_sentiment.get("board_distribution", {})
+        if strong_zt:
+            parts.append(f"  连板股: {len(strong_zt)}只, 最高连板={max_board}板")
+            if board_dist:
+                dist_str = " ".join(f"{k}板={v}只" for k, v in
+                                   sorted(board_dist.items(), key=lambda x: int(x[0]), reverse=True))
+                parts.append(f"  连板分布: {dist_str}")
+            # 列出高位连板龙头
+            for s in strong_zt[:10]:
+                fields = []
+                for k in ["代码", "名称", "连板数", "涨跌幅", "所属行业", "行业"]:
+                    if k in s and s[k]:
+                        fields.append(f"{k}={s[k]}")
+                if fields:
+                    parts.append(f"    {' | '.join(fields)}")
+
+        # 炸板
+        failed_count = market_sentiment.get("failed_zt_count", 0)
+        success_rate = market_sentiment.get("zt_success_rate")
+        if success_rate is not None:
+            parts.append(f"  炸板: {failed_count}只 | 封板成功率={success_rate}%")
+
+        # 昨涨停今表现
+        prev_zt = market_sentiment.get("prev_zt_today", [])
+        if prev_zt:
+            parts.append(f"  昨日涨停今日: {len(prev_zt)}只")
+            for s in prev_zt[:8]:
+                fields = []
+                for k in ["代码", "名称", "涨跌幅", "昨日涨停时间"]:
+                    if k in s and s[k]:
+                        fields.append(f"{k}={s[k]}")
+                if fields:
+                    parts.append(f"    {' | '.join(fields)}")
+
+        # ── 涨停板块聚集分析 ────────────────────────────────────────
+        if zt_pool:
+            sector_zt: Dict[str, List[str]] = {}
+            for s in zt_pool:
+                sn = s.get("所属行业", s.get("行业", ""))
+                nm = s.get("名称", s.get("代码", ""))
+                if sn:
+                    sector_zt.setdefault(sn, []).append(nm)
+            top_zt = sorted(sector_zt.items(), key=lambda x: len(x[1]), reverse=True)[:15]
+            parts.append(f"\n【涨停板块聚集分析（{len(zt_pool)}只涨停）】")
+            for sn, names in top_zt:
+                parts.append(f"  {sn}({len(names)}只): {', '.join(names[:5])}")
+
+        # ── 概念炒作信号 ────────────────────────────────────────────
+        hot_concepts = concept_signals.get("hot_concepts", [])
+        if hot_concepts:
+            parts.append(f"\n【概念板块异动（今日涨幅>3%，共{len(hot_concepts)}个）】")
+            for r in hot_concepts[:15]:
+                fields = {k: r[k] for k in ["板块名称", "涨跌幅", "换手率", "成交额"] if k in r}
+                if fields:
+                    parts.append("  " + " | ".join(f"{k}={v}" for k, v in fields.items()))
+
+        concept_rank = concept_signals.get("concept_ranking", [])
+        if concept_rank:
+            parts.append(f"\n【概念板块涨幅Top20】")
+            for r in concept_rank[:20]:
+                fields = {k: r[k] for k in ["板块名称", "涨跌幅", "换手率", "成交额"] if k in r}
+                if fields:
+                    parts.append("  " + " | ".join(f"{k}={v}" for k, v in fields.items()))
+
+        industry_rank = concept_signals.get("industry_ranking", [])
+        if industry_rank:
+            parts.append(f"\n【行业板块涨幅Top15】")
+            for r in industry_rank[:15]:
+                fields = {k: r[k] for k in ["板块名称", "涨跌幅", "换手率", "成交额"] if k in r}
+                if fields:
+                    parts.append("  " + " | ".join(f"{k}={v}" for k, v in fields.items()))
+
+        # 5日资金流向
+        cf5 = concept_signals.get("concept_fund_flow_5d", [])
+        if cf5:
+            parts.append(f"\n【概念板块5日资金流向Top15】")
+            for r in cf5[:15]:
+                row_items = list(r.items())[:6]
+                parts.append("  " + " | ".join(f"{k}={v}" for k, v in row_items))
+
+        if5 = concept_signals.get("industry_fund_flow_5d", [])
+        if if5:
+            parts.append(f"\n【行业板块5日资金流向Top15】")
+            for r in if5[:15]:
+                row_items = list(r.items())[:6]
+                parts.append("  " + " | ".join(f"{k}={v}" for k, v in row_items))
+
+        # ── 龙虎榜 ──────────────────────────────────────────────────
+        lhb = market_hot.get("lhb", [])
+        if lhb:
+            parts.append(f"\n【龙虎榜（近5日，{len(lhb)}条）— 前15条】")
+            for r in lhb[:15]:
+                fields = []
+                for k in ["股票名称", "代码", "上榜原因", "买入额", "卖出额"]:
+                    if k in r and r[k]:
+                        fields.append(f"{k}={r[k]}")
+                if fields:
+                    parts.append("  " + " | ".join(fields[:5]))
+
+        # ── 北向资金 ──────────────────────────────────────────────
+        north = market_hot.get("north_flow", [])
+        if north:
+            parts.append(f"\n【北向资金（近{min(10, len(north))}日）】")
+            for r in north[-10:]:
+                row_items = list(r.items())[:3]
+                parts.append("  " + " | ".join(f"{k}={v}" for k, v in row_items))
+
+        # ── ETF映射表 ──────────────────────────────────────────────
+        etf_map = etf_data.get("sector_etf_map", {})
+        if etf_map:
+            parts.append("\n【板块→ETF映射参考（用于推荐ETF替代）】")
+            map_items = []
+            for sector, etfs in sorted(etf_map.items()):
+                etf_str = "/".join(f"{n}({c})" for c, n in etfs[:2])
+                map_items.append(f"{sector}→{etf_str}")
+            parts.append("  " + " | ".join(map_items[:30]))
+
+        # ── ETF涨幅Top10 ──────────────────────────────────────────
+        etf_gainers = etf_data.get("top_gainers", [])
+        if etf_gainers:
+            parts.append(f"\n【今日ETF涨幅Top10】")
+            for r in etf_gainers[:10]:
+                fields = {k: r[k] for k in ["名称", "代码", "涨跌幅", "成交额"] if k in r}
+                if fields:
+                    parts.append("  " + " | ".join(f"{k}={v}" for k, v in fields.items()))
+
+        return "\n".join(parts)
+
+    # ------------------------------------------------------------------ #
+    #  主分析方法                                                          #
+    # ------------------------------------------------------------------ #
+    def scan(
+        self,
+        market_indices: Dict,
+        market_sentiment: Dict,
+        market_hot: Dict,
+        concept_signals: Dict,
+        etf_data: Dict,
+        panel_size: Optional[int] = None,
+        verbose: bool = True,
+    ) -> Dict:
+        """
+        运行市场雷达全面扫描，多模型投票聚合。
+
+        返回:
+        {
+          "market_environment": {"trend": str, "reasoning": str, ...},
+          "sentiment": {"temperature": str, "cycle_phase": str, "score": int, ...},
+          "hype_predictions": [{"concept_name": str, "hype_stage": str, ...}],
+          "operation_advice": str,
+          "raw_results": {provider: text},
+        }
+        """
+        if verbose:
+            print(f"\n{'='*60}")
+            print("  MR: 市场雷达启动（大盘+情绪+概念炒作预判+ETF）")
+            print(f"{'='*60}")
+
+        data_text = self._build_radar_text(
+            market_indices, market_sentiment, market_hot, concept_signals, etf_data,
+        )
+
+        def _build_msgs(_: str) -> List[Dict]:
+            return [
+                {"role": "system", "content": self._system_prompt()},
+                {
+                    "role": "user",
+                    "content": (
+                        f"【市场全景数据】\n\n{data_text}\n\n"
+                        "---\n"
+                        "请综合分析以上数据：\n"
+                        "1. 判断大盘环境和操作方向\n"
+                        "2. 评估市场情绪温度和所处周期阶段\n"
+                        "3. 预判近期最可能被炒作的5-8个概念主题及其阶段\n"
+                        "4. 为每个热点概念推荐对应ETF\n\n"
+                        "必须以 JSON 格式返回。"
+                    ),
+                },
+            ]
+
+        n_models = panel_size or len(self.config.providers)
+        raw_results = self.llm.call_panel(
+            messages=_build_msgs(""),
+            max_models=n_models,
+            verbose=verbose,
+        )
+
+        # ── 聚合多模型结果 ─────────────────────────────────────────
+        env_trends: List[str] = []
+        env_reasonings: List[str] = []
+        sent_temps: List[str] = []
+        sent_scores: List[float] = []
+        sent_phases: List[str] = []
+        sent_signals: List[str] = []
+        sent_hints: List[str] = []
+        hype_votes: Dict[str, Dict] = {}  # concept -> aggregated info
+        advices: List[str] = []
+        index_summaries: List[str] = []
+
+        for provider, text in raw_results.items():
+            parsed = LLMClient.parse_json(text)
+            if not parsed:
+                continue
+
+            # 大盘
+            env = parsed.get("market_environment", {})
+            if isinstance(env, dict):
+                t = env.get("trend", "")
+                if t:
+                    env_trends.append(t)
+                r = env.get("reasoning", "")
+                if r:
+                    env_reasonings.append(f"[{provider}] {r}")
+                idx_s = env.get("index_summary", "")
+                if idx_s:
+                    index_summaries.append(idx_s)
+
+            # 情绪
+            sent = parsed.get("sentiment", {})
+            if isinstance(sent, dict):
+                tmp = sent.get("temperature", "")
+                if tmp:
+                    sent_temps.append(tmp)
+                sc = sent.get("score")
+                if sc is not None:
+                    sent_scores.append(float(sc))
+                ph = sent.get("cycle_phase", "")
+                if ph:
+                    sent_phases.append(ph)
+                ks = sent.get("key_signals", "")
+                if ks:
+                    sent_signals.append(f"[{provider}] {ks}")
+                sh = sent.get("strategy_hint", "")
+                if sh:
+                    sent_hints.append(sh)
+
+            # 概念炒作预判（聚合投票）
+            hypes = parsed.get("hype_predictions", [])
+            if isinstance(hypes, list):
+                for h in hypes:
+                    if not isinstance(h, dict):
+                        continue
+                    cn = str(h.get("concept_name", "")).strip()
+                    if not cn:
+                        continue
+                    if cn not in hype_votes:
+                        hype_votes[cn] = {
+                            "concept_name": cn,
+                            "votes": 0,
+                            "conf_sum": 0.0,
+                            "stages": [],
+                            "signals": [],
+                            "reasonings": [],
+                            "key_stocks_all": [],
+                            "etf_alternatives": [],
+                            "spaces": [],
+                            "risk_notes": [],
+                            "models": [],
+                        }
+                    hype_votes[cn]["votes"] += 1
+                    hype_votes[cn]["conf_sum"] += float(h.get("confidence", 70))
+                    hype_votes[cn]["models"].append(provider)
+                    stage = h.get("hype_stage", "")
+                    if stage:
+                        hype_votes[cn]["stages"].append(stage)
+                    sig = h.get("signal_sources", "")
+                    if sig:
+                        hype_votes[cn]["signals"].append(sig)
+                    reason = h.get("reasoning", "")
+                    if reason:
+                        hype_votes[cn]["reasonings"].append(f"[{provider}] {reason}")
+                    ks = h.get("key_stocks", [])
+                    if isinstance(ks, list):
+                        hype_votes[cn]["key_stocks_all"].extend(ks)
+                    etf_alt = h.get("etf_alternatives", [])
+                    if isinstance(etf_alt, list):
+                        hype_votes[cn]["etf_alternatives"].extend(etf_alt)
+                    sp = h.get("space_estimate", "")
+                    if sp:
+                        hype_votes[cn]["spaces"].append(sp)
+                    rn = h.get("risk_note", "")
+                    if rn:
+                        hype_votes[cn]["risk_notes"].append(rn)
+
+            adv = parsed.get("operation_advice", "")
+            if adv:
+                advices.append(f"[{provider}] {adv}")
+
+        # ── 计算共识结果 ───────────────────────────────────────────
+        # 大盘趋势：取众数
+        from collections import Counter
+
+        trend_consensus = "震荡观望"
+        if env_trends:
+            trend_consensus = Counter(env_trends).most_common(1)[0][0]
+
+        # 情绪：取众数+均分
+        temp_consensus = "正常"
+        if sent_temps:
+            temp_consensus = Counter(sent_temps).most_common(1)[0][0]
+        phase_consensus = ""
+        if sent_phases:
+            phase_consensus = Counter(sent_phases).most_common(1)[0][0]
+        avg_score = round(sum(sent_scores) / len(sent_scores)) if sent_scores else 50
+
+        # 概念排序：按票数 → 平均置信度
+        for v in hype_votes.values():
+            n = max(v["votes"], 1)
+            v["avg_confidence"] = round(v["conf_sum"] / n, 1)
+            # 取众数作为阶段共识
+            if v["stages"]:
+                v["stage_consensus"] = Counter(v["stages"]).most_common(1)[0][0]
+            else:
+                v["stage_consensus"] = "未知"
+            # 去重龙头股
+            v["key_stocks"] = list(dict.fromkeys(v["key_stocks_all"]))[:5]
+            # 去重ETF
+            seen_etf = set()
+            unique_etfs = []
+            for e in v["etf_alternatives"]:
+                if isinstance(e, dict) and e.get("code") and e["code"] not in seen_etf:
+                    seen_etf.add(e["code"])
+                    unique_etfs.append(e)
+            v["etf_alternatives"] = unique_etfs[:3]
+
+        ranked_hypes = sorted(
+            hype_votes.values(),
+            key=lambda x: (x["votes"], x["avg_confidence"]),
+            reverse=True,
+        )
+
+        # 打印结果
+        if verbose:
+            total_models = len(raw_results)
+            print(f"\n  [MR] 参与模型: {total_models} 个")
+            print(f"  [MR] 大盘环境: {trend_consensus}")
+            print(f"  [MR] 情绪温度: {temp_consensus} | 周期: {phase_consensus} | 分数: {avg_score}")
+            print(f"  [MR] 概念炒作预判（共{len(ranked_hypes)}个概念）:")
+            for i, h in enumerate(ranked_hypes[:8], 1):
+                etf_str = ""
+                if h["etf_alternatives"]:
+                    etf_str = " ETF=" + ",".join(e.get("name", e.get("code", "")) for e in h["etf_alternatives"][:2])
+                print(
+                    f"    {i}. {h['concept_name']}  "
+                    f"票={h['votes']}/{total_models}  "
+                    f"阶段={h['stage_consensus']}  "
+                    f"信心={h['avg_confidence']:.0f}%"
+                    f"{etf_str}"
+                )
+
+        # 构建预判列表
+        hype_list = []
+        for rank, h in enumerate(ranked_hypes[:8], 1):
+            hype_list.append({
+                "rank": rank,
+                "concept_name": h["concept_name"],
+                "hype_stage": h["stage_consensus"],
+                "confidence": h["avg_confidence"],
+                "votes": h["votes"],
+                "total_models": len(raw_results),
+                "signal_sources": "; ".join(h["signals"][:3]),
+                "space_estimate": h["spaces"][0] if h["spaces"] else "",
+                "reasoning": "; ".join(h["reasonings"][:2]),
+                "key_stocks": h["key_stocks"],
+                "etf_alternatives": h["etf_alternatives"],
+                "risk_note": h["risk_notes"][0] if h["risk_notes"] else "",
+                "models": h["models"],
+            })
+
+        return {
+            "market_environment": {
+                "trend": trend_consensus,
+                "reasoning": "; ".join(env_reasonings[:3]),
+                "index_summary": index_summaries[0] if index_summaries else "",
+            },
+            "sentiment": {
+                "temperature": temp_consensus,
+                "cycle_phase": phase_consensus,
+                "score": avg_score,
+                "key_signals": "; ".join(sent_signals[:3]),
+                "strategy_hint": sent_hints[0] if sent_hints else "",
+            },
+            "hype_predictions": hype_list,
+            "operation_advice": "; ".join(advices[:3]),
+            "raw_results": raw_results,
+        }
+
+
+# ===================================================================== #
 #  SP: 板块优选智能体（全面板投票，输出 Top5）                          #
 # ===================================================================== #
 
@@ -373,9 +901,14 @@ top5 数量恰好为5个，按综合评分从高到低排列。"""
         market_hot: Dict,
         panel_size: Optional[int] = None,
         verbose: bool = True,
+        mr_result: Optional[Dict] = None,
+        etf_signals: Optional[List[Dict]] = None,
     ) -> Dict:
         """
         全面板模型投票，返回得票最高的 Top5 板块。
+
+        参数:
+            mr_result: MarketRadar 的分析结果（可选），包含大盘环境/情绪/概念炒作预判
 
         返回:
         {
@@ -392,15 +925,67 @@ top5 数量恰好为5个，按综合评分从高到低排列。"""
 
         data_text = self._build_data_text(sector_overview, market_hot)
 
+        # 追加市场雷达上下文（若有）
+        mr_context = ""
+        if mr_result:
+            mr_parts = []
+            env = mr_result.get("market_environment", {})
+            sent = mr_result.get("sentiment", {})
+            hypes = mr_result.get("hype_predictions", [])
+            if env:
+                mr_parts.append(
+                    f"\n【市场雷达（MR）分析结论】\n"
+                    f"大盘环境: {env.get('trend', '')} | {env.get('index_summary', '')}\n"
+                    f"情绪温度: {sent.get('temperature', '')} | "
+                    f"周期: {sent.get('cycle_phase', '')} | "
+                    f"分数: {sent.get('score', '')}"
+                )
+            if hypes:
+                mr_parts.append("\n【MR概念炒作预判（供板块选择参考）】")
+                for h in hypes[:5]:
+                    mr_parts.append(
+                        f"  {h['rank']}. {h['concept_name']} "
+                        f"阶段={h.get('hype_stage', '')} "
+                        f"信心={h.get('confidence', 0):.0f}% "
+                        f"信号={h.get('signal_sources', '')[:60]}"
+                    )
+            adv = mr_result.get("operation_advice", "")
+            if adv:
+                mr_parts.append(f"\n[MR操作建议] {adv[:150]}")
+            mr_context = "\n".join(mr_parts)
+
+        # ETF活跃板块信号
+        etf_context = ""
+        if etf_signals:
+            etf_parts = ["\n【ETF活跃板块信号（ETF表现反推板块热度）】"]
+            for s in etf_signals[:10]:
+                etf_parts.append(
+                    f"  {s['sector']}  ETF={s['etf_name']}({s['etf_code']}) "
+                    f"涨跌={s['change_pct']:+.2f}%  "
+                    f"成交={s['amount_yi']:.1f}亿  "
+                    f"信号={s['signal']}"
+                )
+            etf_parts.append(
+                "  → ETF涨幅靠前或量能异动的板块，说明资金正在关注该方向，"
+                "应优先考虑纳入候选板块。"
+            )
+            etf_context = "\n".join(etf_parts)
+
         def _build_msgs(_: str) -> List[Dict]:
+            full_data = data_text
+            if mr_context:
+                full_data += "\n\n" + mr_context
+            if etf_context:
+                full_data += "\n\n" + etf_context
             return [
                 {"role": "system", "content": self._system_prompt()},
                 {
                     "role": "user",
                     "content": (
-                        f"【当前市场板块数据】\n\n{data_text}\n\n"
+                        f"【当前市场板块数据】\n\n{full_data}\n\n"
                         "---\n"
                         "请分析以上数据，从热度、资金流入、成交量三个维度，"
+                        "结合市场雷达的概念炒作预判和ETF活跃板块信号，"
                         "选出最值得重点关注的5个板块。\n"
                         "必须以 JSON 格式返回，top5 恰好5个。"
                     ),
@@ -2066,6 +2651,9 @@ class RiskController:
 - 大股东大规模减持
 - 商誉占净资产>30%
 - 现金流连续4期为负
+- 🔴 乖离率(MA5)>7.5%: 严重追高风险，建议回避（强多头排列MA5>MA10>MA20>MA60时可放宽至7.5%）
+
+⚠ 乖离率(MA5)>5%: 短线追高风险，建议降低仓位或等回调
 
 【仓位建议】
 - 低风险（无信号）：标准仓位 10-15%
@@ -2105,11 +2693,33 @@ class RiskController:
                 except Exception:
                     pass
 
+            # 乖离率(MA5)
+            bias_pct_str = "N/A"
+            if df_d is not None and len(df_d) >= 5:
+                try:
+                    sig = pkg.get("signal_score")
+                    if sig and "bias_pct" in sig:
+                        bias_val = sig["bias_pct"]
+                    else:
+                        close_val = float(df_d["close"].iloc[-1])
+                        ma5_val = float(df_d["close"].iloc[-5:].mean())
+                        bias_val = (close_val - ma5_val) / ma5_val * 100
+                    bias_pct_str = f"{bias_val:+.1f}%"
+                except Exception:
+                    pass
+
+            # 乖离率预警标记
+            bias_warn = c.get("bias_warning", "")
+            bias_line = f"  乖离率(MA5)={bias_pct_str}"
+            if bias_warn:
+                bias_line += f" [{bias_warn}]"
+
             candidates_text.append(
                 f"• {code} {name} [{sector}]\n"
                 f"  共识={consensus} 综合分={score:.1f}\n"
                 f"  PE={pe} PB={pb} 总市值={mktcap}\n"
                 f"  近60日涨幅={d60_gain}\n"
+                f"{bias_line}\n"
                 f"  专家风险提示: {warn_str}"
             )
 
@@ -2185,6 +2795,40 @@ class RiskController:
         if verbose and hard_excluded:
             print(f"  [硬性排除] {len(hard_excluded)} 只: {[e['code'] for e in hard_excluded]}")
 
+        # 乖离率预检：为候选股票添加 bias_warning
+        for c in to_review:
+            code = c.get("code", "")
+            pkg = stock_packages.get(code, {})
+            df_d = pkg.get("daily")
+            if df_d is not None and len(df_d) >= 5:
+                try:
+                    sig = pkg.get("signal_score")
+                    if sig and "bias_pct" in sig:
+                        bias_pct = sig["bias_pct"]
+                    else:
+                        close_val = float(df_d["close"].iloc[-1])
+                        ma5_val = float(df_d["close"].iloc[-5:].mean())
+                        bias_pct = (close_val - ma5_val) / ma5_val * 100
+
+                    # 判断是否强多头排列 MA5>MA10>MA20>MA60
+                    multi_head = False
+                    if len(df_d) >= 60:
+                        try:
+                            ma5 = float(df_d["close"].iloc[-5:].mean())
+                            ma10 = float(df_d["close"].iloc[-10:].mean())
+                            ma20 = float(df_d["close"].iloc[-20:].mean())
+                            ma60 = float(df_d["close"].iloc[-60:].mean())
+                            multi_head = ma5 > ma10 > ma20 > ma60
+                        except Exception:
+                            pass
+
+                    if bias_pct > 7.5 and not multi_head:
+                        c["bias_warning"] = f"乖离率{bias_pct:.1f}%偏高，严重追高风险"
+                    elif bias_pct > 5:
+                        c["bias_warning"] = f"乖离率{bias_pct:.1f}%偏高，短线追高风险"
+                except Exception:
+                    pass
+
         # LLM 风控审查
         msgs = self._build_risk_prompt(to_review, stock_packages)
         resp = self.llm.call_primary(msgs, temperature=0.2)
@@ -2203,6 +2847,11 @@ class RiskController:
                         print(
                             f"    {a.get('rank','')}.{a.get('code','')} {a.get('name','')} "
                             f"[{a.get('risk_level','')}] {a.get('position_advice','')}"
+                        )
+                    for e in soft_excluded:
+                        print(
+                            f"    ⚠️ {e.get('code','')} {e.get('name','')} "
+                            f"[风控提示] {e.get('reason','')[:50]}"
                         )
 
                 return {
@@ -2275,9 +2924,87 @@ class ModelTask:
         "最终你将综合7位专家的意见，作为首席分析师给出最终选股决策。"
     )
 
-    INTRA_MODEL_DEBATE_PROMPT = """\
+    # ── 多空对抗辩论提示词 ──────────────────────────────────────
+    BULL_DEBATE_PROMPT = """\
+现在你作为看多研究员，基于以上7位专家的分析结论，为候选股票池中最具潜力的标的构建强有力的买入论证。
+
+要求：
+1. 从7位专家推荐中选出你最看好的15-25只，每只给出3个数据支撑的买入理由
+2. 预判可能的风险质疑并提前反驳
+3. 给出每只股票的保守/基准/乐观三档目标价（基于当前价位的预期涨幅%）
+
+请以JSON格式返回：
+```json
+{
+  "bull_picks": [
+    {
+      "code": "股票代码", "name": "名称",
+      "buy_reasons": ["理由1", "理由2", "理由3"],
+      "counter_bear": "预判看空方质疑并反驳",
+      "target_prices": {"conservative": 5, "baseline": 15, "optimistic": 30}
+    }
+  ]
+}
+```"""
+
+    BEAR_DEBATE_PROMPT = """\
+现在你作为看空研究员，针对看多方刚才推荐的每只股票进行风险质疑。
+
+要求：
+1. 逐一审视看多方推荐的股票，指出每只的核心风险和潜在陷阱
+2. 质疑看多方的乐观假设，提出下行风险情景
+3. 标注你认为应该被淘汰的高风险标的
+
+请以JSON格式返回：
+```json
+{
+  "bear_warnings": [
+    {
+      "code": "股票代码", "name": "名称",
+      "risk_points": ["风险1", "风险2"],
+      "challenge": "对看多方论点的质疑",
+      "verdict": "保留|降级|淘汰"
+    }
+  ]
+}
+```"""
+
+    JUDGE_DEBATE_PROMPT = """\
+现在你作为首席策略师，综合看多方和看空方的辩论，做出最终决策。
+
+规则：
+1. 不允许对每只股票都给出"持有"——必须做出倾向性判断
+2. 基于论据质量而非数量做判断
+3. 对看多方和看空方分歧最大的股票，必须明确站队并解释原因
+
+请返回如下JSON格式（不要包含其他文字）：
+```json
+{
+  "picks": [
+    {
+      "rank": 1,
+      "code": "股票代码(6位)",
+      "name": "股票名称",
+      "sector": "所属板块",
+      "score": 85,
+      "reasoning": "综合多空辩论后的选择理由（100字以内）",
+      "recommended_by_experts": ["E1", "E3"],
+      "target_prices": {
+        "conservative": 5,
+        "baseline": 15,
+        "optimistic": 30
+      },
+      "stop_loss_pct": -7
+    }
+  ]
+}
+```
+picks数量：选出15-25支，按信心度从高到低排名。"""
+
+    # Legacy fallback prompt (kept for retry/fallback scenarios)
+    _LEGACY_DEBATE_PROMPT = """\
 现在你作为首席分析师，综合以上7位专家的分析意见，进行辩论与取舍，\
-从候选股票池中精选出最具投资价值的20支股票，按信心度从高到低排名。
+从候选股票池中精选出最具投资价值的25支股票，按信心度从高到低排名。
 
 请返回如下 JSON 格式（不要包含其他文字）：
 ```json
@@ -2295,7 +3022,7 @@ class ModelTask:
   ]
 }
 ```
-picks 数量：选出10-20支，按信心度从高到低排名。如候选池不足10支，则全部列出。"""
+picks 数量：选出15-25支，按信心度从高到低排名。如候选池不足15支，则全部列出。"""
 
     def __init__(
         self,
@@ -2394,9 +3121,24 @@ picks 数量：选出10-20支，按信心度从高到低排名。如候选池不
                     "error": str(exc),
                 }
 
-        # ── Intra-model 辩论 ──────────────────────────────────────────
+        # ── 多空对抗辩论（Bull → Bear → Judge） ─────────────────────
         self.logger.log("debate_start", model=self.provider_name)
-        debate_resp = session.say(self.INTRA_MODEL_DEBATE_PROMPT)
+
+        # Round 1: Bull case
+        self.logger.log("debate_bull", model=self.provider_name)
+        bull_resp = session.say(self.BULL_DEBATE_PROMPT)
+        if bull_resp:
+            session.compact_last_assistant()
+
+        # Round 2: Bear case
+        self.logger.log("debate_bear", model=self.provider_name)
+        bear_resp = session.say(self.BEAR_DEBATE_PROMPT)
+        if bear_resp:
+            session.compact_last_assistant()
+
+        # Round 3: Judge final decision
+        self.logger.log("debate_judge", model=self.provider_name)
+        debate_resp = session.say(self.JUDGE_DEBATE_PROMPT)
 
         picks = self._parse_debate_picks(debate_resp)
 
@@ -2472,6 +3214,23 @@ picks 数量：选出10-20支，按信心度从高到低排名。如候选池不
                 score = float(pick.get("score", 70))
             except (ValueError, TypeError):
                 score = 70.0
+            # 解析多情景目标价
+            raw_tp = pick.get("target_prices")
+            if isinstance(raw_tp, dict):
+                target_prices = {}
+                for key in ("conservative", "baseline", "optimistic"):
+                    try:
+                        target_prices[key] = float(raw_tp.get(key, 0))
+                    except (ValueError, TypeError):
+                        target_prices[key] = 0.0
+            else:
+                target_prices = {}
+            # 解析止损比例
+            try:
+                stop_loss_pct = float(pick.get("stop_loss_pct", 0))
+            except (ValueError, TypeError):
+                stop_loss_pct = 0.0
+
             picks.append({
                 "rank": rank,
                 "code": code,
@@ -2480,6 +3239,8 @@ picks 数量：选出10-20支，按信心度从高到低排名。如候选池不
                 "score": score,
                 "reasoning": str(pick.get("reasoning", ""))[:300],
                 "recommended_by_experts": pick.get("recommended_by_experts", []),
+                "target_prices": target_prices,
+                "stop_loss_pct": stop_loss_pct,
             })
         return sorted(picks, key=lambda x: x["rank"])[:20]
 
