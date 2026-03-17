@@ -35,44 +35,68 @@ import pandas as pd
 # 屏蔽 mootdx 的 FutureWarning（pandas fillna method= 参数已废弃，不影响功能）
 warnings.filterwarnings("ignore", category=FutureWarning, module="mootdx")
 
+# ===================================================================== #
+#  进程级代理屏蔽：所有国内数据接口（akshare/tushare/adata/baostock等）      #
+#  必须直连，不经过 LLM_PROXY。在导入任何数据库之前清除代理环境变量，         #
+#  然后用 requests 猴子补丁确保底层 HTTP 也不走代理。                       #
+# ===================================================================== #
+
+import requests as _requests
+
+# 1) 保存 LLM 代理配置，然后从环境变量中移除（防止 requests/urllib3 自动读取）
+_SAVED_PROXY = {}
+for _proxy_key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
+                    "ALL_PROXY", "all_proxy"):
+    if _proxy_key in os.environ:
+        _SAVED_PROXY[_proxy_key] = os.environ.pop(_proxy_key)
+
+# 2) 猴子补丁 requests.Session：所有 Session 默认 trust_env=False + 清空 proxies
+_OrigSession = _requests.Session
+
+class _NoProxySession(_OrigSession):
+    """所有国内数据采集用的 Session，强制不走代理"""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.trust_env = False
+        self.proxies = {"http": None, "https": None}
+
+_requests.Session = _NoProxySession
+
+# 3) 猴子补丁 requests.get/post 等快捷方法
+_orig_request = _requests.api.request
+
+def _no_proxy_request(method, url, **kwargs):
+    kwargs.setdefault("proxies", {"http": None, "https": None})
+    return _orig_request(method, url, **kwargs)
+
+_requests.api.request = _no_proxy_request
+_requests.get = lambda url, **kw: _no_proxy_request("GET", url, **kw)
+_requests.post = lambda url, **kw: _no_proxy_request("POST", url, **kw)
+_requests.head = lambda url, **kw: _no_proxy_request("HEAD", url, **kw)
+
+# 4) 猴子补丁 urllib3（pandas.read_html / lxml 底层用的）
+try:
+    import urllib3
+    _orig_urlopen = urllib3.HTTPConnectionPool.urlopen
+
+    def _no_proxy_urlopen(self, method, url, **kwargs):
+        # 确保不使用 CONNECT 隧道代理
+        self.proxy = None
+        self.proxy_headers = {}
+        return _orig_urlopen(self, method, url, **kwargs)
+
+    urllib3.HTTPConnectionPool.urlopen = _no_proxy_urlopen
+except Exception:
+    pass
+
+# 5) 设置 NO_PROXY 环境变量覆盖所有国内域名
+os.environ["NO_PROXY"] = "*"
+os.environ["no_proxy"] = "*"
+
+# ── 导入数据库 ───────────────────────────────────────────────────────
+
 try:
     import akshare as ak
-    # Fix: bypass Windows system proxy for all akshare calls
-    # (Windows system proxy is set for LLM APIs but breaks domestic Chinese data sources)
-    try:
-        import requests as _requests
-        import random as _rand
-        import time as _time
-        from requests.adapters import HTTPAdapter as _HTTPAdapter
-        import akshare.utils.request as _ak_req
-
-        def _request_no_proxy(
-            url, params=None, timeout=15, max_retries=3,
-            base_delay=1.0, random_delay_range=(0.5, 1.5),
-        ):
-            last_ex = None
-            for attempt in range(max_retries):
-                try:
-                    with _requests.Session() as s:
-                        s.trust_env = False  # bypass Windows system proxy
-                        adapter = _HTTPAdapter(pool_connections=1, pool_maxsize=1)
-                        s.mount("http://", adapter)
-                        s.mount("https://", adapter)
-                        resp = s.get(url, params=params, timeout=timeout)
-                        resp.raise_for_status()
-                        return resp
-                except (_requests.RequestException, ValueError) as e:
-                    last_ex = e
-                    if attempt < max_retries - 1:
-                        _time.sleep(base_delay * (2 ** attempt) + _rand.uniform(*random_delay_range))
-            raise last_ex
-
-        # Patch both the source module and the func module's local reference
-        _ak_req.request_with_retry = _request_no_proxy
-        import akshare.utils.func as _ak_func
-        _ak_func.request_with_retry = _request_no_proxy
-    except Exception:
-        pass  # patch failed silently, akshare still works normally
 except ImportError:
     print("请先安装: pip install akshare")
     ak = None
@@ -99,6 +123,10 @@ try:
     _BAOSTOCK_AVAILABLE = True
 except ImportError:
     _BAOSTOCK_AVAILABLE = False
+
+# 6) 恢复 LLM 代理环境变量（供 llm_client.py 的 httpx 使用）
+for _k, _v in _SAVED_PROXY.items():
+    os.environ[_k] = _v
 
 
 # ===================================================================== #
