@@ -850,11 +850,32 @@ class DataEngine:
         """
         东财HTTP直调：绕过akshare/adata，直接请求东方财富API获取概念板块成分股。
         先查板块代码，再查成分股。
+        使用多个东财子域名做 fallback（push2 经常不可用）。
         """
         import requests as _req
+
+        # 可用的东财 API 子域名（按优先级）
+        api_hosts = [
+            "https://push2.eastmoney.com/api/qt/clist/get",
+            "https://datacenter-web.eastmoney.com/api/qt/clist/get",
+        ]
+
+        def _try_get(params: dict) -> Optional[dict]:
+            """尝试多个子域名请求"""
+            for url in api_hosts:
+                try:
+                    with _req.Session() as s:
+                        s.trust_env = False
+                        resp = s.get(url, params=params, timeout=10)
+                        data = resp.json()
+                        if data and data.get("data"):
+                            return data
+                except Exception:
+                    continue
+            return None
+
         try:
             # Step 1: 获取概念板块列表，找到匹配的板块代码
-            url_boards = "https://push2.eastmoney.com/api/qt/clist/get"
             params_boards = {
                 "pn": 1, "pz": 500, "po": 1, "np": 1,
                 "fltt": 2, "invt": 2,
@@ -862,35 +883,31 @@ class DataEngine:
                 "fields": "f2,f3,f12,f14",
                 "ut": "bd1d9ddb04089700cf9c27f6f7426281",
             }
-            with _req.Session() as s:
-                s.trust_env = False
-                resp = s.get(url_boards, params=params_boards, timeout=10)
-                data = resp.json()
+            data = _try_get(params_boards)
 
             board_code = None
-            for item in (data.get("data", {}) or {}).get("diff", []):
-                if item.get("f14", "") == concept_name:
-                    board_code = item.get("f12", "")
-                    break
-
-            # 也尝试模糊匹配
-            if not board_code:
+            if data:
                 for item in (data.get("data", {}) or {}).get("diff", []):
-                    if concept_name in item.get("f14", ""):
+                    if item.get("f14", "") == concept_name:
                         board_code = item.get("f12", "")
                         break
+
+                # 也尝试模糊匹配
+                if not board_code:
+                    for item in (data.get("data", {}) or {}).get("diff", []):
+                        if concept_name in item.get("f14", ""):
+                            board_code = item.get("f12", "")
+                            break
 
             if not board_code:
                 # 再试行业板块 m:90+t:2
                 params_boards["fs"] = "m:90+t:2"
-                with _req.Session() as s:
-                    s.trust_env = False
-                    resp = s.get(url_boards, params=params_boards, timeout=10)
-                    data = resp.json()
-                for item in (data.get("data", {}) or {}).get("diff", []):
-                    if item.get("f14", "") == concept_name or concept_name in item.get("f14", ""):
-                        board_code = item.get("f12", "")
-                        break
+                data = _try_get(params_boards)
+                if data:
+                    for item in (data.get("data", {}) or {}).get("diff", []):
+                        if item.get("f14", "") == concept_name or concept_name in item.get("f14", ""):
+                            board_code = item.get("f12", "")
+                            break
 
             if not board_code:
                 return []
@@ -903,17 +920,15 @@ class DataEngine:
                 "fields": "f12,f14,f2,f3,f6,f7,f15,f16,f17,f18",
                 "ut": "bd1d9ddb04089700cf9c27f6f7426281",
             }
-            with _req.Session() as s:
-                s.trust_env = False
-                resp = s.get(url_boards, params=params_stocks, timeout=10)
-                data = resp.json()
+            data = _try_get(params_stocks)
 
             stocks = []
-            for item in (data.get("data", {}) or {}).get("diff", []):
-                code = item.get("f12", "")
-                name = item.get("f14", "")
-                if code and len(code) == 6:
-                    stocks.append({"代码": code, "名称": name, "code": code, "name": name})
+            if data:
+                for item in (data.get("data", {}) or {}).get("diff", []):
+                    code = item.get("f12", "")
+                    name = item.get("f14", "")
+                    if code and len(code) == 6:
+                        stocks.append({"代码": code, "名称": name, "code": code, "name": name})
             return stocks
 
         except Exception:
@@ -973,7 +988,7 @@ class DataEngine:
         获取单只股票 K 线数据。
         period: "monthly" | "weekly" | "daily"
         n_bars: 目标 K 线条数
-        数据源优先级: TDX本地通达信（Priority 1）→ akshare（Priority 2）→ tushare（Priority 3）
+        数据源优先级: TDX本地（1）→ akshare（2）→ tushare（3）→ 腾讯K线（3.5）→ adata（4）→ baostock（5）
         """
         period_map = {"monthly": "monthly", "weekly": "weekly", "daily": "daily"}
         ak_period = period_map.get(period, "daily")
@@ -1024,6 +1039,12 @@ class DataEngine:
                     return df.tail(n_bars)
             except Exception as e:
                 print(f"  [tushare] {code} {period} K线失败: {e}")
+
+        # ── Priority 3.5: 腾讯K线（push2.eastmoney.com不可用时的备用）──
+        if period == "daily":
+            df = self._tencent_kline(code, period, n_bars)
+            if df is not None and len(df) >= min_bars:
+                return df
 
         # ── Priority 4: adata ──────────────────────────────────────
         if _ADATA_AVAILABLE and period == "daily":
@@ -1122,6 +1143,194 @@ class DataEngine:
         return df
 
     # ------------------------------------------------------------------ #
+    #  腾讯/新浪 fallback 数据源（push2.eastmoney.com 不可用时）            #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _code_with_market(code: str) -> str:
+        """将纯数字代码转为带市场前缀: sh600519, sz000001"""
+        if code.startswith("6") or code.startswith("9"):
+            return f"sh{code}"
+        return f"sz{code}"
+
+    def _tencent_realtime_quotes(self, codes: List[str]) -> Dict[str, Dict]:
+        """
+        腾讯实时行情（替代 ak.stock_zh_a_spot_em）。
+        Endpoint: https://qt.gtimg.cn/q={code_list}
+        """
+        import requests as _req
+        result: Dict[str, Dict] = {}
+        if not codes:
+            return result
+
+        # 批量请求，每批最多50个
+        market_codes = [self._code_with_market(c) for c in codes]
+        for i in range(0, len(market_codes), 50):
+            batch = market_codes[i:i + 50]
+            code_list = ",".join(batch)
+            try:
+                resp = _req.get(f"https://qt.gtimg.cn/q={code_list}", timeout=10)
+                resp.encoding = "gbk"
+                text = resp.text
+                for line in text.strip().split(";"):
+                    line = line.strip()
+                    if not line or "=" not in line:
+                        continue
+                    # v_sh600519="1~贵州茅台~600519~1850.00~..."
+                    try:
+                        var_part, val_part = line.split("=", 1)
+                        val_part = val_part.strip().strip('"')
+                        if not val_part:
+                            continue
+                        fields = val_part.split("~")
+                        if len(fields) < 47:
+                            continue
+                        code = fields[2]
+                        result[code] = {
+                            "名称": fields[1],
+                            "最新价": _safe_float(fields[3]),
+                            "昨收": _safe_float(fields[4]),
+                            "今开": _safe_float(fields[5]),
+                            "最高": _safe_float(fields[33] if len(fields) > 33 and fields[33] else fields[7]),
+                            "最低": _safe_float(fields[34] if len(fields) > 34 and fields[34] else fields[8]),
+                            "换手率": _safe_float(fields[30]) if len(fields) > 30 else 0.0,
+                            "市盈率-动态": _safe_float(fields[37]) if len(fields) > 37 else 0.0,
+                            "振幅": _safe_float(fields[38]) if len(fields) > 38 else 0.0,
+                            "总市值": _safe_float(fields[44]) * 1e8 if len(fields) > 44 and fields[44] else 0.0,
+                            "流通市值": _safe_float(fields[45]) * 1e8 if len(fields) > 45 and fields[45] else 0.0,
+                            "市净率": _safe_float(fields[46]) if len(fields) > 46 else 0.0,
+                            "成交量": _safe_float(fields[6]) if len(fields) > 6 else 0.0,
+                            "成交额": _safe_float(fields[37 - 1]) if len(fields) > 36 else 0.0,
+                        }
+                        # 计算涨跌幅
+                        yesterday = _safe_float(fields[4])
+                        current = _safe_float(fields[3])
+                        if yesterday > 0:
+                            result[code]["涨跌幅"] = round((current - yesterday) / yesterday * 100, 2)
+                    except Exception:
+                        continue
+            except Exception as e:
+                print(f"  [腾讯行情] 批次请求失败: {e}")
+        return result
+
+    def _sina_realtime_quotes(self, codes: List[str]) -> Dict[str, Dict]:
+        """
+        新浪实时行情（备用）。
+        Endpoint: https://hq.sinajs.cn/list={code_list}
+        """
+        import requests as _req
+        result: Dict[str, Dict] = {}
+        if not codes:
+            return result
+
+        market_codes = [self._code_with_market(c) for c in codes]
+        for i in range(0, len(market_codes), 50):
+            batch = market_codes[i:i + 50]
+            code_list = ",".join(batch)
+            try:
+                resp = _req.get(
+                    f"https://hq.sinajs.cn/list={code_list}",
+                    headers={"Referer": "https://finance.sina.com.cn"},
+                    timeout=10,
+                )
+                resp.encoding = "gbk"
+                for line in resp.text.strip().split("\n"):
+                    line = line.strip()
+                    if not line or "=" not in line:
+                        continue
+                    try:
+                        # var hq_str_sh600519="贵州茅台,1838.00,..."
+                        var_part, val_part = line.split("=", 1)
+                        val_part = val_part.strip().strip('"').rstrip(";").strip('"')
+                        if not val_part:
+                            continue
+                        # 从变量名提取代码
+                        mc = var_part.split("_")[-1]  # sh600519
+                        code = mc[2:]  # 600519
+                        fields = val_part.split(",")
+                        if len(fields) < 10:
+                            continue
+                        current = _safe_float(fields[3])
+                        yesterday = _safe_float(fields[2])
+                        result[code] = {
+                            "名称": fields[0],
+                            "今开": _safe_float(fields[1]),
+                            "昨收": yesterday,
+                            "最新价": current,
+                            "最高": _safe_float(fields[4]),
+                            "最低": _safe_float(fields[5]),
+                            "成交量": _safe_float(fields[8]),
+                            "成交额": _safe_float(fields[9]),
+                        }
+                        if yesterday > 0:
+                            result[code]["涨跌幅"] = round((current - yesterday) / yesterday * 100, 2)
+                    except Exception:
+                        continue
+            except Exception as e:
+                print(f"  [新浪行情] 批次请求失败: {e}")
+        return result
+
+    def _tencent_kline(self, code: str, period: str, n_bars: int = 120) -> Optional[pd.DataFrame]:
+        """
+        腾讯K线数据（替代 akshare 的 stock_zh_a_hist）。
+        Endpoint: https://web.ifzq.gtimg.cn/appstock/app/fqkline/get
+        仅支持日线。
+        """
+        import requests as _req
+        if period != "daily":
+            return None
+        try:
+            market_code = self._code_with_market(code)
+            start_date = (datetime.now() - timedelta(days=n_bars * 2)).strftime("%Y-%m-%d")
+            url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+            params = {
+                "param": f"{market_code},day,{start_date},,{n_bars},qfq",
+                "_var": "kline_dayqfq",
+                "r": str(time.time()),
+            }
+            resp = _req.get(url, params=params, timeout=10)
+            resp.encoding = "utf-8"
+            text = resp.text
+            # 响应可能是 kline_dayqfq={json} 格式
+            if "=" in text:
+                text = text.split("=", 1)[1]
+            data = json.loads(text)
+
+            kdata = data.get("data", {}).get(market_code, {})
+            # 尝试前复权数据，降级到普通日线
+            bars = kdata.get("qfqday") or kdata.get("day") or []
+            if not bars:
+                return None
+
+            rows = []
+            for bar in bars:
+                # [date, open, close, high, low, volume, ...]
+                if len(bar) < 6:
+                    continue
+                rows.append({
+                    "date": bar[0],
+                    "open": _safe_float(bar[1]),
+                    "close": _safe_float(bar[2]),
+                    "high": _safe_float(bar[3]),
+                    "low": _safe_float(bar[4]),
+                    "volume": _safe_float(bar[5]),
+                })
+
+            if not rows:
+                return None
+
+            df = pd.DataFrame(rows)
+            df["date"] = pd.to_datetime(df["date"])
+            for col in ["open", "high", "low", "close", "volume"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            df = df.dropna(subset=["close"]).sort_values("date").reset_index(drop=True)
+            return df.tail(n_bars) if len(df) >= 5 else None
+
+        except Exception as e:
+            print(f"  [腾讯K线] {code} 获取失败: {e}")
+            return None
+
+    # ------------------------------------------------------------------ #
     #  资金流向                                                            #
     # ------------------------------------------------------------------ #
 
@@ -1167,6 +1376,7 @@ class DataEngine:
     def fetch_realtime_info(self, codes: List[str]) -> Dict[str, Dict]:
         """批量获取实时行情（用于获取PE、PB、市值等）"""
         result: Dict[str, Dict] = {}
+        # Priority 1: akshare (东方财富 push2.eastmoney.com)
         try:
             df = ak.stock_zh_a_spot_em()
             if df is not None and len(df) > 0:
@@ -1178,7 +1388,32 @@ class DataEngine:
                             row = df.loc[code]
                             result[code] = row.to_dict()
         except Exception as e:
-            print(f"  [警告] 实时行情获取失败: {e}")
+            print(f"  [警告] akshare实时行情获取失败: {e}")
+
+        # Priority 2: 腾讯实时行情（push2.eastmoney.com 不可用时）
+        missing = [c for c in codes if c not in result]
+        if missing:
+            try:
+                tencent_data = self._tencent_realtime_quotes(missing)
+                if tencent_data:
+                    result.update(tencent_data)
+                    if len(tencent_data) > 0:
+                        print(f"  [腾讯行情] 补充 {len(tencent_data)} 只实时行情")
+            except Exception as e:
+                print(f"  [警告] 腾讯实时行情获取失败: {e}")
+
+        # Priority 3: 新浪实时行情（最终备用）
+        missing = [c for c in codes if c not in result]
+        if missing:
+            try:
+                sina_data = self._sina_realtime_quotes(missing)
+                if sina_data:
+                    result.update(sina_data)
+                    if len(sina_data) > 0:
+                        print(f"  [新浪行情] 补充 {len(sina_data)} 只实时行情")
+            except Exception as e:
+                print(f"  [警告] 新浪实时行情获取失败: {e}")
+
         return result
 
     # ------------------------------------------------------------------ #
