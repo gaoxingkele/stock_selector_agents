@@ -2626,45 +2626,8 @@ class RiskController:
         self.llm = llm_client
         self.config = config
 
-    def _build_risk_prompt(self, candidates: List[Dict], stock_packages: Dict) -> List[Dict]:
-        """构建风控审查提示词"""
-        system = """你是A股风险控制专家，负责对候选股票进行最终风险审查。
-
-【硬性排除（一票否决）】
-- ST/*ST 或退市警示股
-- 证监会立案调查中
-- 大股东质押率>90%（爆仓风险）
-- 近30日出现连续跌停（≥3次）
-- 净利润连续3期为负（持续亏损）
-- 财务数据严重异常
-
-【风险信号】
-黄灯⚠️（提示仓位减半）:
-- 近60日涨幅>30%（短期涨幅较大）
-- 日换手率>5%（连续3日，过热）
-- 大股东减持公告（小规模）
-- 近期商誉占净资产20-30%
-
-红灯🔴（建议排除或极小仓位<5%）:
-- 近60日涨幅>50%
-- 换手率>8%（连续3日）
-- 大股东大规模减持
-- 商誉占净资产>30%
-- 现金流连续4期为负
-- 🔴 乖离率(MA5)>7.5%: 严重追高风险，建议回避（强多头排列MA5>MA10>MA20>MA60时可放宽至7.5%）
-
-⚠ 乖离率(MA5)>5%: 短线追高风险，建议降低仓位或等回调
-
-【仓位建议】
-- 低风险（无信号）：标准仓位 10-15%
-- 中风险（1-2个黄灯）：轻仓 5-10%
-- 高风险（3+黄灯或1个红灯）：极轻仓 <5% 或排除
-
-【止损建议】
-- 短线（3-10日）：跌破MA5或最高点回落7%
-- 中线（10-30日）：跌破MA20或最高点回落10%
-- 事件驱动：逻辑证伪即出"""
-
+    def _build_candidates_text(self, candidates: List[Dict], stock_packages: Dict) -> str:
+        """构建候选股票描述文本（供多个prompt方法共享）"""
         candidates_text = []
         for c in candidates[:15]:
             code = c.get("code", "")
@@ -2722,14 +2685,177 @@ class RiskController:
                 f"{bias_line}\n"
                 f"  专家风险提示: {warn_str}"
             )
+        return "\n\n".join(candidates_text)
 
+    def _build_aggressive_prompt(self, candidates: List[Dict], stock_packages: Dict) -> List[Dict]:
+        """激进派：强调机会，反对过度保守"""
+        system = (
+            "你是激进派投资分析师。你的任务是为候选股票辩护，找出被低估的机会。\n"
+            "对于每只股票，你要：\n"
+            "1. 指出其上涨潜力和催化剂\n"
+            "2. 解释为什么短期涨幅大不一定是风险（可能是趋势确认）\n"
+            "3. 对PE偏高的股票，解释成长性是否能消化估值\n\n"
+            "返回JSON: {\"aggressive_picks\": [{\"code\": \"...\", \"name\": \"...\", "
+            "\"opportunity\": \"机会分析\", \"position\": \"建议仓位10-20%\"}]}"
+        )
+        ctext = self._build_candidates_text(candidates, stock_packages)
+        return [
+            {"role": "system", "content": system},
+            {"role": "user", "content": f"【候选股票列表】\n\n{ctext}\n\n---\n请逐只分析以上股票的投资机会。"},
+        ]
+
+    def _build_conservative_prompt(self, candidates: List[Dict], stock_packages: Dict, aggressive_result: str) -> List[Dict]:
+        """保守派：强调风险，质疑激进派"""
+        system = (
+            "你是保守派风险分析师。你的任务是识别每只股票被忽视的风险。\n"
+            "以下是激进派的分析，请逐只质疑：\n"
+            "1. 高涨幅股票的回调风险和历史回撤\n"
+            "2. PE/PB异常背后的财务隐患\n"
+            "3. 板块轮动结束的信号\n"
+            "4. 标注你认为必须排除的高危标的\n\n"
+            "返回JSON: {\"conservative_warnings\": [{\"code\": \"...\", \"name\": \"...\", "
+            "\"risk\": \"风险分析\", \"verdict\": \"通过|谨慎|排除\"}]}"
+        )
+        ctext = self._build_candidates_text(candidates, stock_packages)
+        return [
+            {"role": "system", "content": system},
+            {
+                "role": "user",
+                "content": (
+                    f"【候选股票列表】\n\n{ctext}\n\n"
+                    f"---\n【激进派分析结果】\n{aggressive_result}\n\n"
+                    "---\n请逐只质疑激进派的分析，识别被忽视的风险。"
+                ),
+            },
+        ]
+
+    def _build_risk_manager_prompt(self, candidates: List[Dict], stock_packages: Dict,
+                                   aggressive_result: str, conservative_result: str) -> List[Dict]:
+        """风险经理：综合两方意见做最终判决"""
+        system = """你是A股风险控制专家，负责对候选股票进行最终风险审查。
+你已看到激进派和保守派的分析，请综合双方意见做出最终判决。
+
+【硬性排除（一票否决）】
+- ST/*ST 或退市警示股
+- 证监会立案调查中
+- 大股东质押率>90%（爆仓风险）
+- 近30日出现连续跌停（≥3次）
+- 净利润连续3期为负（持续亏损）
+- 财务数据严重异常
+
+【风险信号】
+黄灯⚠️（提示仓位减半）:
+- 近60日涨幅>30%（短期涨幅较大）
+- 日换手率>5%（连续3日，过热）
+- 大股东减持公告（小规模）
+- 近期商誉占净资产20-30%
+
+红灯🔴（建议排除或极小仓位<5%）:
+- 近60日涨幅>50%
+- 换手率>8%（连续3日）
+- 大股东大规模减持
+- 商誉占净资产>30%
+- 现金流连续4期为负
+- 🔴 乖离率(MA5)>7.5%: 严重追高风险，建议回避（强多头排列MA5>MA10>MA20>MA60时可放宽至7.5%）
+
+⚠ 乖离率(MA5)>5%: 短线追高风险，建议降低仓位或等回调
+
+【仓位建议】
+- 低风险（无信号）：标准仓位 10-15%
+- 中风险（1-2个黄灯）：轻仓 5-10%
+- 高风险（3+黄灯或1个红灯）：极轻仓 <5% 或排除
+
+【止损建议】
+- 短线（3-10日）：跌破MA5或最高点回落7%
+- 中线（10-30日）：跌破MA20或最高点回落10%
+- 事件驱动：逻辑证伪即出"""
+
+        ctext = self._build_candidates_text(candidates, stock_packages)
+        return [
+            {"role": "system", "content": system},
+            {
+                "role": "user",
+                "content": (
+                    f"【候选股票列表】\n\n{ctext}\n\n"
+                    f"---\n【激进派分析】\n{aggressive_result}\n\n"
+                    f"---\n【保守派分析】\n{conservative_result}\n\n"
+                    "---\n"
+                    "请综合激进派和保守派的意见，对以上股票进行最终风险审查，输出最终推荐结果。\n"
+                    "JSON 格式：\n"
+                    "```json\n"
+                    "{\n"
+                    '  "approved": [\n'
+                    "    {\n"
+                    '      "rank": 1,\n'
+                    '      "code": "代码",\n'
+                    '      "name": "名称",\n'
+                    '      "sector": "板块",\n'
+                    '      "risk_level": "低风险/中风险/高风险",\n'
+                    '      "risk_flags": ["风险信号列表"],\n'
+                    '      "position_advice": "仓位建议，如标准仓位10-15%",\n'
+                    '      "stop_loss": "止损建议",\n'
+                    '      "entry_point": "建议买入时机描述",\n'
+                    '      "core_logic": "核心投资逻辑（100字以内）",\n'
+                    '      "holding_period": "建议持有周期"\n'
+                    "    }\n"
+                    "  ],\n"
+                    '  "excluded": [\n'
+                    '    {"code": "代码", "name": "名称", "reason": "排除原因"}\n'
+                    "  ],\n"
+                    '  "portfolio_advice": "整体组合建议（100字以内）",\n'
+                    '  "market_timing": "当前建仓时机判断"\n'
+                    "}\n```"
+                ),
+            },
+        ]
+
+    def _build_risk_prompt(self, candidates: List[Dict], stock_packages: Dict) -> List[Dict]:
+        """构建风控审查提示词（单轮降级兜底用）"""
+        system = """你是A股风险控制专家，负责对候选股票进行最终风险审查。
+
+【硬性排除（一票否决）】
+- ST/*ST 或退市警示股
+- 证监会立案调查中
+- 大股东质押率>90%（爆仓风险）
+- 近30日出现连续跌停（≥3次）
+- 净利润连续3期为负（持续亏损）
+- 财务数据严重异常
+
+【风险信号】
+黄灯⚠️（提示仓位减半）:
+- 近60日涨幅>30%（短期涨幅较大）
+- 日换手率>5%（连续3日，过热）
+- 大股东减持公告（小规模）
+- 近期商誉占净资产20-30%
+
+红灯🔴（建议排除或极小仓位<5%）:
+- 近60日涨幅>50%
+- 换手率>8%（连续3日）
+- 大股东大规模减持
+- 商誉占净资产>30%
+- 现金流连续4期为负
+- 🔴 乖离率(MA5)>7.5%: 严重追高风险，建议回避（强多头排列MA5>MA10>MA20>MA60时可放宽至7.5%）
+
+⚠ 乖离率(MA5)>5%: 短线追高风险，建议降低仓位或等回调
+
+【仓位建议】
+- 低风险（无信号）：标准仓位 10-15%
+- 中风险（1-2个黄灯）：轻仓 5-10%
+- 高风险（3+黄灯或1个红灯）：极轻仓 <5% 或排除
+
+【止损建议】
+- 短线（3-10日）：跌破MA5或最高点回落7%
+- 中线（10-30日）：跌破MA20或最高点回落10%
+- 事件驱动：逻辑证伪即出"""
+
+        ctext = self._build_candidates_text(candidates, stock_packages)
         return [
             {"role": "system", "content": system},
             {
                 "role": "user",
                 "content": (
                     "【候选股票列表】\n\n"
-                    + "\n\n".join(candidates_text)
+                    + ctext
                     + "\n\n---\n"
                     "请对以上股票进行风险审查，输出最终推荐结果。\n"
                     "JSON 格式：\n"
@@ -2829,9 +2955,37 @@ class RiskController:
                 except Exception:
                     pass
 
-        # LLM 风控审查
-        msgs = self._build_risk_prompt(to_review, stock_packages)
-        resp = self.llm.call_primary(msgs, temperature=0.2)
+        # LLM 风控审查：三视角辩论（激进派→保守派→风险经理）
+        resp = None
+        try:
+            # Round 1: 激进派
+            aggressive_msgs = self._build_aggressive_prompt(to_review, stock_packages)
+            aggressive_resp = self.llm.call_primary(aggressive_msgs, temperature=0.3)
+            aggressive_text = aggressive_resp if aggressive_resp else "激进派分析失败"
+            if verbose:
+                print("  [风控] 激进派分析完成")
+
+            # Round 2: 保守派
+            conservative_msgs = self._build_conservative_prompt(to_review, stock_packages, aggressive_text)
+            conservative_resp = self.llm.call_primary(conservative_msgs, temperature=0.2)
+            conservative_text = conservative_resp if conservative_resp else "保守派分析失败"
+            if verbose:
+                print("  [风控] 保守派分析完成")
+
+            # Round 3: 风险经理（最终判决）
+            manager_msgs = self._build_risk_manager_prompt(to_review, stock_packages, aggressive_text, conservative_text)
+            resp = self.llm.call_primary(manager_msgs, temperature=0.2)
+            if verbose:
+                print("  [风控] 风险经理最终判决...")
+        except Exception as exc:
+            if verbose:
+                print(f"  [风控] 三视角辩论异常({exc})，降级为单轮风控")
+            # 降级：回退到单轮风控
+            try:
+                msgs = self._build_risk_prompt(to_review, stock_packages)
+                resp = self.llm.call_primary(msgs, temperature=0.2)
+            except Exception:
+                resp = None
 
         if resp:
             parsed = LLMClient.parse_json(resp)

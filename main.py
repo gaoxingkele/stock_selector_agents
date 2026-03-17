@@ -52,6 +52,7 @@ from stock_agents import (
 from fusion import borda_fusion
 from work_logger import WorkLogger
 from report_generator import generate_report
+from memory import StockMemory
 
 _BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR  = os.path.join(_BASE_DIR, "output")        # output/ 根
@@ -1004,6 +1005,23 @@ def run_full_pipeline(
             f"stock_profiles_{TODAY}.json"
         )
 
+    # ── 记忆检索：注入历史经验到系统提示词 ──────────────────────
+    mem = StockMemory()
+    memory_env = {}
+    if mr_result:
+        env = mr_result.get("market_environment", {})
+        sent = mr_result.get("sentiment", {})
+        memory_env = {
+            "trend": env.get("trend", ""),
+            "sentiment_temp": sent.get("temperature", ""),
+            "cycle_phase": sent.get("cycle_phase", ""),
+            "sentiment_score": sent.get("score", 0),
+            "top_sectors": top_sectors,
+        }
+    reflection_text = mem.get_reflection_prompt(memory_env, mr_result)
+    if reflection_text:
+        print(f"\n  [记忆] 检索到历史决策参考，已注入提示词")
+
     # ── Step 4: N模型并行（每模型内E1→E7顺序执行 + intra-model辩论）──
     print_section(
         f"Step 4: {len(active_models)} 模型纵向并行分析"
@@ -1173,6 +1191,23 @@ def run_full_pipeline(
         print(f"  [警告] PDF生成失败: {e}")
         import traceback
         traceback.print_exc()
+
+    # ── 存储记忆（供下次运行检索）──────────────────────────────
+    try:
+        approved = risk_result.get("approved", [])
+        soft_excluded = risk_result.get("soft_excluded", [])
+        all_recs = []
+        for s in approved:
+            all_recs.append({"code": s.get("code",""), "name": s.get("name",""),
+                            "borda_score": s.get("borda_score", s.get("final_score",0)),
+                            "risk_level": s.get("risk_level","")})
+        for s in soft_excluded:
+            all_recs.append({"code": s.get("code",""), "name": s.get("name",""),
+                            "borda_score": 0, "risk_level": "⚠️"})
+        mem.store(TODAY, memory_env, all_recs, mr_result)
+        print(f"  [记忆] 已存储本次决策（{len(all_recs)}只）")
+    except Exception as e:
+        print(f"  [记忆] 存储失败: {e}")
 
     logger.log("pipeline_done", detail={"message": "完整流程结束"})
 

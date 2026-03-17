@@ -2175,6 +2175,69 @@ class DataEngine:
                 pass
         return None
 
+    def fetch_chip_distribution(self, code: str, daily_df=None) -> Optional[Dict]:
+        """
+        获取筹码分布数据。
+
+        Returns: {
+            "avg_cost": float,          # 60日成交量加权均价（近似平均成本）
+            "profit_ratio": float,      # 获利比例(0-1)
+            "concentration": float,     # 筹码集中度(越小越集中)
+            "main_net_inflow_5d": float,# 近5日主力净流入(万)
+            "super_net_inflow_5d": float,# 近5日超大单净流入(万)
+        }
+        """
+        result = {}
+
+        # 从日线计算筹码指标
+        df = daily_df
+        if df is not None and len(df) >= 20:
+            try:
+                recent = df.tail(60)
+                close = float(recent["close"].iloc[-1])
+
+                # VWAP as average cost
+                if "volume" in recent.columns and "close" in recent.columns:
+                    vol = recent["volume"].astype(float)
+                    prices = recent["close"].astype(float)
+                    total_vol = vol.sum()
+                    if total_vol > 0:
+                        vwap = (prices * vol).sum() / total_vol
+                        result["avg_cost"] = round(float(vwap), 2)
+
+                        # Profit ratio: volume bought below current price / total volume
+                        profit_vol = vol[prices <= close].sum()
+                        result["profit_ratio"] = round(float(profit_vol / total_vol), 3)
+
+                # Concentration: coefficient of variation of close prices
+                if len(recent) >= 10:
+                    std = float(recent["close"].std())
+                    mean = float(recent["close"].mean())
+                    if mean > 0:
+                        result["concentration"] = round(std / mean, 4)
+            except Exception:
+                pass
+
+        # efinance fund flow (主力资金)
+        try:
+            import efinance as ef
+            bill_df = ef.stock.get_history_bill(code)
+            if bill_df is not None and len(bill_df) >= 5:
+                recent_bill = bill_df.tail(5)
+                # Column names may vary, try common ones
+                for col_main in ["主力净流入", "主力净额"]:
+                    if col_main in recent_bill.columns:
+                        result["main_net_inflow_5d"] = round(float(recent_bill[col_main].astype(float).sum()), 2)
+                        break
+                for col_super in ["超大单净流入", "超大单净额"]:
+                    if col_super in recent_bill.columns:
+                        result["super_net_inflow_5d"] = round(float(recent_bill[col_super].astype(float).sum()), 2)
+                        break
+        except Exception:
+            pass
+
+        return result if result else None
+
     # ------------------------------------------------------------------ #
     #  全量股票数据包（供专家分析用）                                      #
     # ------------------------------------------------------------------ #
@@ -2306,6 +2369,11 @@ class DataEngine:
             with _api_sem:
                 pkg["margin_history"] = self.fetch_margin_history(code)
 
+            # ── 筹码分布（日线计算 + efinance资金流）─────────────────
+            chip = self.fetch_chip_distribution(code, pkg.get("daily"))
+            if chip:
+                pkg["chip"] = chip
+
             elapsed_s = round(time.time() - t_s, 1)
             with _cnt_lock:
                 _done[0] += 1
@@ -2434,6 +2502,21 @@ class DataEngine:
         signal_tag = ""
         if sig and sig.get("total_score", 0) > 0:
             signal_tag = f" | 量化评分={sig['total_score']}分({sig['signal']}) 乖离率(MA5)={sig['bias_pct']:+.1f}%"
+
+        # 筹码分布
+        chip = pkg.get("chip", {})
+        if chip:
+            chip_parts = []
+            if "avg_cost" in chip:
+                chip_parts.append(f"均成本={chip['avg_cost']}")
+            if "profit_ratio" in chip:
+                chip_parts.append(f"获利比={chip['profit_ratio']:.0%}")
+            if "concentration" in chip:
+                chip_parts.append(f"集中度={chip['concentration']:.3f}")
+            if "main_net_inflow_5d" in chip:
+                chip_parts.append(f"5日主力净流入={chip['main_net_inflow_5d']:.0f}万")
+            if chip_parts:
+                extra += " | 筹码: " + " ".join(chip_parts)
 
         # 盘中标记
         intraday_tag = ""
