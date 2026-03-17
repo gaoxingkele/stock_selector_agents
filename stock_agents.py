@@ -2841,6 +2841,30 @@ class RiskController:
                 portfolio_advice = parsed.get("portfolio_advice", "")
                 market_timing = parsed.get("market_timing", "")
 
+                # 补回LLM遗漏的股票（LLM有时不返回全部候选）
+                reviewed_codes = set()
+                for a in approved:
+                    reviewed_codes.add(a.get("code", ""))
+                for e in soft_excluded:
+                    reviewed_codes.add(e.get("code", ""))
+                for c in to_review:
+                    code = c.get("code", "")
+                    if code and code not in reviewed_codes:
+                        # LLM未提及的股票，按默认规则补入approved
+                        approved.append({
+                            "rank": len(approved) + 1,
+                            "code": code,
+                            "name": c.get("name", ""),
+                            "sector": c.get("sector", ""),
+                            "risk_level": "待评估",
+                            "risk_flags": [],
+                            "position_advice": "谨慎仓位5-10%",
+                            "stop_loss": "跌破MA20或-7%",
+                            "entry_point": "结合实盘判断",
+                            "core_logic": c.get("consensus_level", "") + "; " + "; ".join((c.get("all_reasonings") or [])[:1]),
+                            "holding_period": "5-10日",
+                        })
+
                 if verbose:
                     print(f"\n  [风控] 通过: {len(approved)} 只 | 软性排除: {len(soft_excluded)} 只")
                     for a in approved:
