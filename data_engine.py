@@ -88,6 +88,18 @@ try:
 except ImportError:
     _MOOTDX_AVAILABLE = False
 
+try:
+    import adata
+    _ADATA_AVAILABLE = True
+except ImportError:
+    _ADATA_AVAILABLE = False
+
+try:
+    import baostock as bs
+    _BAOSTOCK_AVAILABLE = True
+except ImportError:
+    _BAOSTOCK_AVAILABLE = False
+
 
 # ===================================================================== #
 #  全局常量                                                              #
@@ -717,41 +729,167 @@ class DataEngine:
         return []
 
     def fetch_sector_components(self, sector_names: List[str]) -> Dict[str, List[Dict]]:
-        """获取指定板块的成分股列表（akshare→tushare申万降级）"""
+        """
+        获取指定板块的成分股列表（5级降级链）：
+        Level 1: akshare 行业板块
+        Level 2: akshare 概念板块
+        Level 3: adata 同花顺概念 / 东财概念
+        Level 4: tushare 申万行业（精确 + 概念映射）
+        Level 5: 东财HTTP直调（绕过库）
+        """
         print(f"[数据] 获取板块成分股: {sector_names}")
         components: Dict[str, List[Dict]] = {}
 
+        # 概念板块→申万行业的模糊映射
+        _CONCEPT_TO_SW = {
+            "智能电网": "电力设备", "电网设备": "电力设备",
+            "中字头": "建筑装饰", "国资云": "计算机",
+            "人工智能": "计算机", "机器人": "专用设备",
+            "新能源": "电力设备", "新能源汽车": "汽车",
+            "光伏": "光伏设备", "储能": "电力设备",
+            "芯片": "半导体", "消费电子": "消费电子",
+            "军工": "国防军工", "医药": "医药生物",
+            "创新药": "医药生物", "白酒": "食品饮料",
+            "食品饮料": "食品饮料", "房地产": "房地产",
+            "数字经济": "计算机", "网络安全": "计算机",
+            "工业母机": "通用设备", "锂电池": "电力设备",
+            "钠电池": "电力设备", "算力": "通信", "CPO": "通信",
+        }
+
         for name in sector_names:
             stocks = []
-            # 尝试 akshare 行业板块
-            try:
-                df = ak.stock_board_industry_cons_em(symbol=name)
+
+            # ── Level 1: akshare 行业板块 ──
+            df = self._call_with_fallback(
+                lambda n=name: ak.stock_board_industry_cons_em(symbol=n),
+                label=f"{name}行业成分股",
+            )
+            if df is not None and len(df) > 0:
+                stocks = df.to_dict("records")
+                print(f"  {name}: {len(stocks)} 只成分股 [akshare 行业]")
+
+            # ── Level 2: akshare 概念板块 ──
+            if not stocks:
+                df = self._call_with_fallback(
+                    lambda n=name: ak.stock_board_concept_cons_em(symbol=n),
+                    label=f"{name}概念成分股",
+                )
                 if df is not None and len(df) > 0:
                     stocks = df.to_dict("records")
-            except Exception:
-                pass
+                    print(f"  {name}: {len(stocks)} 只成分股 [akshare 概念]")
 
-            # 尝试 akshare 概念板块
-            if not stocks:
-                try:
-                    df = ak.stock_board_concept_cons_em(symbol=name)
-                    if df is not None and len(df) > 0:
-                        stocks = df.to_dict("records")
-                except Exception:
-                    pass
+            # ── Level 3: adata 同花顺/东财概念 ──
+            if not stocks and _ADATA_AVAILABLE:
+                for src, fn in [
+                    ("adata THS", lambda n=name: adata.stock.info.concept_constituent_ths(concept_name=n)),
+                    ("adata East", lambda n=name: adata.stock.info.concept_constituent_east(concept_name=n)),
+                ]:
+                    try:
+                        df = fn()
+                        if df is not None and len(df) > 0:
+                            stocks = df.to_dict("records")
+                            print(f"  {name}: {len(stocks)} 只成分股 [{src}]")
+                            break
+                    except Exception as e:
+                        pass
 
-            # 降级：tushare 申万行业索引
+            # ── Level 4: tushare 申万（精确 + 概念映射） ──
             if not stocks:
                 stocks = self._tushare_sector_stocks(name)
                 if stocks:
                     print(f"  {name}: {len(stocks)} 只成分股 [tushare SW]")
 
+            if not stocks and name in _CONCEPT_TO_SW:
+                sw_name = _CONCEPT_TO_SW[name]
+                stocks = self._tushare_sector_stocks(sw_name)
+                if stocks:
+                    print(f"  {name}: {len(stocks)} 只成分股 [tushare SW 映射→{sw_name}]")
+
+            # ── Level 5: 东财HTTP直调（绕过所有库） ──
+            if not stocks:
+                stocks = self._eastmoney_concept_stocks_direct(name)
+                if stocks:
+                    print(f"  {name}: {len(stocks)} 只成分股 [东财HTTP直调]")
+
             if stocks:
                 components[name] = stocks
             else:
-                print(f"  [警告] {name}: 未获取到成分股")
+                print(f"  [警告] {name}: 未获取到成分股（全部数据源失败）")
 
         return components
+
+    def _eastmoney_concept_stocks_direct(self, concept_name: str) -> List[Dict]:
+        """
+        东财HTTP直调：绕过akshare/adata，直接请求东方财富API获取概念板块成分股。
+        先查板块代码，再查成分股。
+        """
+        import requests as _req
+        try:
+            # Step 1: 获取概念板块列表，找到匹配的板块代码
+            url_boards = "https://push2.eastmoney.com/api/qt/clist/get"
+            params_boards = {
+                "pn": 1, "pz": 500, "po": 1, "np": 1,
+                "fltt": 2, "invt": 2,
+                "fs": "m:90+t:3",  # 概念板块
+                "fields": "f2,f3,f12,f14",
+                "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+            }
+            with _req.Session() as s:
+                s.trust_env = False
+                resp = s.get(url_boards, params=params_boards, timeout=10)
+                data = resp.json()
+
+            board_code = None
+            for item in (data.get("data", {}) or {}).get("diff", []):
+                if item.get("f14", "") == concept_name:
+                    board_code = item.get("f12", "")
+                    break
+
+            # 也尝试模糊匹配
+            if not board_code:
+                for item in (data.get("data", {}) or {}).get("diff", []):
+                    if concept_name in item.get("f14", ""):
+                        board_code = item.get("f12", "")
+                        break
+
+            if not board_code:
+                # 再试行业板块 m:90+t:2
+                params_boards["fs"] = "m:90+t:2"
+                with _req.Session() as s:
+                    s.trust_env = False
+                    resp = s.get(url_boards, params=params_boards, timeout=10)
+                    data = resp.json()
+                for item in (data.get("data", {}) or {}).get("diff", []):
+                    if item.get("f14", "") == concept_name or concept_name in item.get("f14", ""):
+                        board_code = item.get("f12", "")
+                        break
+
+            if not board_code:
+                return []
+
+            # Step 2: 获取板块成分股
+            params_stocks = {
+                "pn": 1, "pz": 500, "po": 1, "np": 1,
+                "fltt": 2, "invt": 2,
+                "fs": f"b:{board_code}",
+                "fields": "f12,f14,f2,f3,f6,f7,f15,f16,f17,f18",
+                "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+            }
+            with _req.Session() as s:
+                s.trust_env = False
+                resp = s.get(url_boards, params=params_stocks, timeout=10)
+                data = resp.json()
+
+            stocks = []
+            for item in (data.get("data", {}) or {}).get("diff", []):
+                code = item.get("f12", "")
+                name = item.get("f14", "")
+                if code and len(code) == 6:
+                    stocks.append({"代码": code, "名称": name, "code": code, "name": name})
+            return stocks
+
+        except Exception:
+            return []
 
     # ------------------------------------------------------------------ #
     #  K 线数据（月/周/日）                                               #
@@ -859,7 +997,67 @@ class DataEngine:
             except Exception as e:
                 print(f"  [tushare] {code} {period} K线失败: {e}")
 
+        # ── Priority 4: adata ──────────────────────────────────────
+        if _ADATA_AVAILABLE and period == "daily":
+            try:
+                df = adata.stock.market.get_market(stock_code=code, k_type=1, start_date=start)
+                if df is not None and len(df) > 0:
+                    df = self._normalize_adata_kline(df)
+                    return df.tail(n_bars)
+            except Exception:
+                pass
+
+        # ── Priority 5: baostock ───────────────────────────────────
+        if _BAOSTOCK_AVAILABLE and period == "daily":
+            try:
+                bs.login()
+                bs_code = f"sh.{code}" if code.startswith("6") else f"sz.{code}"
+                rs = bs.query_history_k_data_plus(
+                    bs_code,
+                    "date,open,high,low,close,volume,amount",
+                    start_date=start[:4] + "-" + start[4:6] + "-" + start[6:],
+                    end_date=TODAY[:4] + "-" + TODAY[4:6] + "-" + TODAY[6:],
+                    frequency="d", adjustflag="2",  # 前复权
+                )
+                rows = []
+                while (rs.error_code == '0') and rs.next():
+                    rows.append(rs.get_row_data())
+                bs.logout()
+                if rows:
+                    df = pd.DataFrame(rows, columns=rs.fields)
+                    df = self._normalize_baostock_kline(df)
+                    return df.tail(n_bars)
+            except Exception:
+                try:
+                    bs.logout()
+                except Exception:
+                    pass
+
         return None
+
+    @staticmethod
+    def _normalize_adata_kline(df: pd.DataFrame) -> pd.DataFrame:
+        """统一 adata K 线列名"""
+        rename = {
+            "trade_date": "date", "trade_time": "date",
+        }
+        df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
+        for col in ["open", "high", "low", "close", "volume"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=["close"])
+        df = df.sort_values("date").reset_index(drop=True)
+        return df
+
+    @staticmethod
+    def _normalize_baostock_kline(df: pd.DataFrame) -> pd.DataFrame:
+        """统一 baostock K 线列名"""
+        for col in ["open", "high", "low", "close", "volume", "amount"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=["close"])
+        df = df.sort_values("date").reset_index(drop=True)
+        return df
 
     @staticmethod
     def _normalize_kline(df: pd.DataFrame) -> pd.DataFrame:
@@ -995,13 +1193,29 @@ class DataEngine:
         except Exception as e:
             print(f"  [警告] 龙虎榜: {e}")
 
-        # 北向资金
+        # 北向资金（akshare接口已失效，优先用adata）
         try:
-            df = self._call_with_fallback(
-                lambda: ak.stock_hsgt_north_net_flow_in_em(symbol="北上"), label="北向资金")
-            if df is not None and len(df) > 0:
-                data["north_flow"] = df.tail(20).to_dict("records")
-                print(f"  北向资金: 近20日")
+            north_ok = False
+            # Level 1: adata 北向资金
+            if _ADATA_AVAILABLE and not north_ok:
+                try:
+                    df = adata.sentiment.north.north_flow()
+                    if df is not None and len(df) > 0:
+                        data["north_flow"] = df.tail(20).to_dict("records")
+                        print(f"  北向资金: 近20日 [adata]")
+                        north_ok = True
+                except Exception:
+                    pass
+            # Level 2: akshare（可能已失效）
+            if not north_ok:
+                df = self._call_with_fallback(
+                    lambda: ak.stock_hsgt_north_net_flow_in_em(symbol="北上"), label="北向资金")
+                if df is not None and len(df) > 0:
+                    data["north_flow"] = df.tail(20).to_dict("records")
+                    print(f"  北向资金: 近20日 [akshare]")
+                    north_ok = True
+            if not north_ok:
+                print(f"  [警告] 北向资金: 全部数据源失败")
         except Exception as e:
             print(f"  [警告] 北向资金: {e}")
 
