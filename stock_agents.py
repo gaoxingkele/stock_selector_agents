@@ -3072,6 +3072,208 @@ class RiskController:
 
 
 # ===================================================================== #
+#  EventAnalyst: 事件驱动因果推理分析师                                   #
+# ===================================================================== #
+
+class EventAnalyst:
+    """事件驱动因果推理分析师：从新闻事件推理A股受益标的"""
+
+    SYSTEM_PROMPT = """你是事件驱动投资分析师，擅长从新闻事件推理A股影响。
+
+对提供的近期重大新闻/事件，请分析：
+1.【因果链】事件 → 行业影响方向 → 具体受益/受损
+2.【时效性】即时冲击(1-3天) / 中期趋势(1-3周) / 长期主题(1-3月)
+3.【确定性】0-100分（历史规律越明确越高）
+4.【受益标的】具体A股代码+名称，优先市值>30亿的
+5.【操作建议】提前埋伏 / 开盘低吸 / 观望确认
+
+仅分析确定性>60%的事件，忽略不确定或对A股无影响的新闻。
+
+返回JSON:
+{
+  "events": [
+    {
+      "event": "事件标题",
+      "causal_chain": "事件→行业→个股的因果推理",
+      "timeframe": "即时|中期|长期",
+      "certainty": 85,
+      "beneficiaries": [
+        {"code": "688295", "name": "中复神鹰", "logic": "碳纤维量产受益", "score": 90}
+      ],
+      "action": "提前埋伏"
+    }
+  ]
+}
+如果没有值得关注的事件，返回 {"events": []}"""
+
+    def __init__(self, llm: LLMClient, config: Config):
+        self.llm = llm
+        self.config = config
+
+    def analyze(self, news_list: list, panel_size: int = 3) -> Dict:
+        """Multi-model analysis of events"""
+        if not news_list:
+            return {"events": []}
+
+        # Build news text
+        news_text = "\n".join(
+            f"- [{n.get('time','')}] {n.get('title','')} {n.get('summary','')}"
+            for n in news_list[:20]
+        )
+
+        msgs = [
+            {"role": "system", "content": self.SYSTEM_PROMPT},
+            {"role": "user", "content": f"以下是近期重大新闻/事件，请分析对A股的影响：\n\n{news_text}"},
+        ]
+
+        # Panel vote
+        results = self.llm.call_panel(msgs, max_models=panel_size, temperature=0.3)
+
+        # Aggregate: merge events from all models, vote on beneficiaries
+        all_events = []
+        for provider, resp in results.items():
+            parsed = LLMClient.parse_json(resp)
+            if parsed and "events" in parsed:
+                for evt in parsed["events"]:
+                    evt["source_model"] = provider
+                    all_events.append(evt)
+
+        # Deduplicate and merge by similar event titles
+        merged = self._merge_events(all_events)
+        return {"events": merged, "model_count": len(results)}
+
+    def _merge_events(self, all_events: list) -> list:
+        """Merge similar events from multiple models, aggregate beneficiaries"""
+        groups: Dict[str, list] = {}
+        for evt in all_events:
+            title = evt.get("event", "")[:20]
+            matched = False
+            for key in groups:
+                if any(w in title for w in key.split()[:3] if len(w) > 1):
+                    groups[key].append(evt)
+                    matched = True
+                    break
+            if not matched:
+                groups[title] = [evt]
+
+        merged = []
+        for key, evts in groups.items():
+            # Take highest certainty event as base
+            base = max(evts, key=lambda e: e.get("certainty", 0))
+            # Collect all beneficiaries with vote count
+            ben_votes: Dict[str, Dict] = {}
+            for e in evts:
+                for b in e.get("beneficiaries", []):
+                    code = b.get("code", "")
+                    if code:
+                        if code not in ben_votes:
+                            ben_votes[code] = {**b, "votes": 0, "models": []}
+                        ben_votes[code]["votes"] += 1
+                        ben_votes[code]["models"].append(e.get("source_model", ""))
+                        # Keep highest score
+                        if b.get("score", 0) > ben_votes[code].get("score", 0):
+                            ben_votes[code]["score"] = b["score"]
+                            ben_votes[code]["logic"] = b.get("logic", "")
+
+            base["beneficiaries"] = sorted(
+                ben_votes.values(), key=lambda x: (-x["votes"], -x.get("score", 0))
+            )[:10]
+            base["model_votes"] = len(evts)
+            merged.append(base)
+
+        return sorted(
+            merged, key=lambda e: (-e.get("model_votes", 0), -e.get("certainty", 0))
+        )[:5]
+
+
+# ===================================================================== #
+#  BreakoutAnalyst: 异动爆发股快速分析师                                  #
+# ===================================================================== #
+
+class BreakoutAnalyst:
+    """异动爆发股快速分析师：识别涨停/放量突破的短线机会"""
+
+    SYSTEM_PROMPT = """你是短线题材分析师，擅长识别爆发启动信号。
+
+对以下异动股票，快速判断：
+1. 题材逻辑（什么概念/事件驱动？）
+2. 启动位置（低位首板/中位加速/高位见顶？）
+3. 后续空间（预期涨幅空间）
+4. 参与风险（追高/流动性/市值风险）
+
+返回JSON:
+{
+  "picks": [
+    {
+      "code": "688295", "name": "中复神鹰",
+      "score": 85,
+      "theme": "碳纤维量产",
+      "position": "低位首板",
+      "upside": "2-3个板空间",
+      "risk": "科创板20cm波动大",
+      "action": "低吸"
+    }
+  ]
+}
+仅保留score>=60的，按score降序排列。"""
+
+    def __init__(self, llm: LLMClient, config: Config):
+        self.llm = llm
+        self.config = config
+
+    def analyze(self, breakout_stocks: list, event_result: Optional[Dict] = None,
+                panel_size: int = 3) -> Dict:
+        """Analyze breakout stocks, optionally cross-reference with events"""
+        if not breakout_stocks:
+            return {"picks": []}
+
+        # Build candidate text
+        lines = []
+        for s in breakout_stocks[:30]:
+            lines.append(
+                f"{s['code']} {s['name']} 触发={s.get('trigger','')} "
+                f"涨幅={s.get('pct_chg',0):+.1f}% "
+                f"换手={s.get('turnover','N/A')}%"
+            )
+        stock_text = "\n".join(lines)
+
+        # Add event context if available
+        event_ctx = ""
+        if event_result and event_result.get("events"):
+            evt_lines = []
+            for evt in event_result["events"][:3]:
+                evt_lines.append(f"- {evt.get('event','')}: {evt.get('causal_chain','')}")
+            event_ctx = f"\n\n【近期重大事件参考】\n" + "\n".join(evt_lines)
+
+        msgs = [
+            {"role": "system", "content": self.SYSTEM_PROMPT},
+            {"role": "user", "content": f"以下是今日异动股票，请快速分析：\n\n{stock_text}{event_ctx}"},
+        ]
+
+        results = self.llm.call_panel(msgs, max_models=panel_size, temperature=0.3)
+
+        # Aggregate picks with voting
+        pick_votes: Dict[str, Dict] = {}
+        for provider, resp in results.items():
+            parsed = LLMClient.parse_json(resp)
+            if parsed and "picks" in parsed:
+                for p in parsed["picks"]:
+                    code = p.get("code", "")
+                    if code:
+                        if code not in pick_votes:
+                            pick_votes[code] = {**p, "votes": 0, "models": []}
+                        pick_votes[code]["votes"] += 1
+                        pick_votes[code]["models"].append(provider)
+                        if p.get("score", 0) > pick_votes[code].get("score", 0):
+                            pick_votes[code].update(
+                                {k: v for k, v in p.items() if k not in ("votes", "models")}
+                            )
+
+        picks = sorted(pick_votes.values(), key=lambda x: (-x["votes"], -x.get("score", 0)))
+        return {"picks": picks[:15], "model_count": len(results)}
+
+
+# ===================================================================== #
 #  ModelTask: 模型纵向并行任务                                           #
 # ===================================================================== #
 

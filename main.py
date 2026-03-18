@@ -48,6 +48,8 @@ from stock_agents import (
     SectorScreener,
     ModelTask,
     RiskController,
+    EventAnalyst,
+    BreakoutAnalyst,
 )
 from fusion import borda_fusion
 from work_logger import WorkLogger
@@ -318,6 +320,8 @@ def format_final_report(
     fusion_result: Optional[List[Dict]] = None,
     mr_result: Optional[Dict] = None,
     etf_sector_match: Optional[Dict] = None,
+    event_result: Optional[Dict] = None,
+    breakout_result: Optional[Dict] = None,
 ) -> str:
     """生成最终报告文本（含 Borda 评分、推荐来源、市场雷达、ETF推荐）"""
     # 构建融合信息查找表
@@ -586,6 +590,32 @@ def format_final_report(
         for sector, etfs in etf_sector_match.items():
             etf_str = " / ".join(f"{e['name']}({e['code']})" for e in etfs[:2])
             lines.append(f"    {sector} → {etf_str}")
+
+    # ── 事件驱动推荐 ──
+    if event_result and event_result.get("events"):
+        lines.append("\n" + "═" * 70)
+        lines.append("  【事件驱动推荐（前瞻预判）】")
+        for evt in event_result["events"]:
+            lines.append(f"\n  ■ {evt.get('event','')}")
+            lines.append(f"    因果链: {evt.get('causal_chain','')[:80]}")
+            lines.append(f"    时效: {evt.get('timeframe','')}  确定性: {evt.get('certainty',0)}%  模型数: {evt.get('model_votes',0)}")
+            bens = evt.get("beneficiaries", [])
+            if bens:
+                for b in bens[:5]:
+                    lines.append(f"    → {b.get('code','')} {b.get('name','')}  评分={b.get('score',0)}  {b.get('logic','')[:30]}")
+
+    # ── 异动爆发推荐 ──
+    if breakout_result and breakout_result.get("picks"):
+        lines.append("\n" + "═" * 70)
+        lines.append("  【异动爆发推荐（技术短线）】")
+        lines.append("  ⚠ 短线激进策略，仓位≤5%/只，严格止损")
+        for p in breakout_result["picks"][:10]:
+            lines.append(
+                f"    {p.get('code','')} {p.get('name',''):<8}  "
+                f"评分={p.get('score',0)}  题材={p.get('theme','')}  "
+                f"位置={p.get('position','')}  "
+                f"票={p.get('votes',0)}"
+            )
 
     lines.append("\n" + "═" * 70)
     lines.append("  [免责声明] 本报告仅为AI分析参考，不构成投资建议。")
@@ -1161,22 +1191,6 @@ def run_full_pipeline(
     print(f"  ✓ Step 6 完成，耗时 {(time.time()-t_step6)/60:.1f} 分钟")
     save_result(risk_result, f"risk_result_{TODAY}.json")
 
-    # ── Step 7: 最终报告（文本）──────────────────────────────────────
-    print_section("Step 7: 最终报告")
-    # 匹配选出板块对应的ETF
-    etf_sector_match = engine.match_sector_etfs(top_sectors) if top_sectors else {}
-    report = format_final_report(
-        risk_result, arb_result,
-        fusion_result=final_top10,
-        mr_result=mr_result if mr_result else None,
-        etf_sector_match=etf_sector_match if etf_sector_match else None,
-    )
-    print(report)
-
-    report_path = os.path.join(REPORTS_DIR, f"final_report_{TODAY}.txt")
-    with open(report_path, "w", encoding="utf-8") as f:
-        f.write(report)
-
     # ── Step 8: 生成 PDF 投顾报告 ────────────────────────────────────
     print_section("Step 8: 生成PDF投顾报告")
     expert_summary = build_expert_summary(model_results)
@@ -1195,6 +1209,72 @@ def run_full_pipeline(
         print(f"  [警告] PDF生成失败: {e}")
         import traceback
         traceback.print_exc()
+
+    # ── Step 9: 事件驱动预判 ──────────────────────────────────────
+    print_section("Step 9: 事件驱动预判（新闻→因果链→受益标的）")
+    event_result = {"events": []}
+    try:
+        t_step9 = time.time()
+        news = engine.fetch_breaking_news()
+        if news:
+            print(f"  采集到 {len(news)} 条新闻")
+            event_analyst = EventAnalyst(llm, cfg)
+            event_result = event_analyst.analyze(news, panel_size=len(active_models))
+            events = event_result.get("events", [])
+            if events:
+                print(f"\n  事件驱动推荐（{len(events)} 个事件）:")
+                for evt in events:
+                    print(f"    ■ {evt.get('event','')[:40]}")
+                    print(f"      因果链: {evt.get('causal_chain','')[:60]}")
+                    print(f"      确定性: {evt.get('certainty',0)}%  时效: {evt.get('timeframe','')}")
+                    for b in evt.get("beneficiaries", [])[:3]:
+                        print(f"      → {b.get('code','')} {b.get('name','')} ({b.get('logic','')[:30]})")
+        else:
+            print("  未采集到有效新闻")
+        print(f"  ✓ Step 9 完成，耗时 {(time.time()-t_step9)/60:.1f} 分钟")
+    except Exception as e:
+        print(f"  [警告] Step 9 事件驱动分析失败: {e}")
+
+    # ── Step 10: 异动爆发股扫描 ───────────────────────────────────
+    print_section("Step 10: 异动爆发股扫描（涨停/放量突破）")
+    breakout_result = {"picks": []}
+    try:
+        t_step10 = time.time()
+        breakout_stocks = engine.scan_breakout_stocks()
+        if breakout_stocks:
+            print(f"  扫描到 {len(breakout_stocks)} 只异动股")
+            breakout_analyst = BreakoutAnalyst(llm, cfg)
+            breakout_result = breakout_analyst.analyze(breakout_stocks, event_result, panel_size=len(active_models))
+            picks = breakout_result.get("picks", [])
+            if picks:
+                print(f"\n  异动推荐 Top{len(picks)}:")
+                for p in picks[:10]:
+                    print(f"    {p.get('code','')} {p.get('name','')} "
+                          f"评分={p.get('score',0)} 题材={p.get('theme','')[:15]} "
+                          f"票={p.get('votes',0)}")
+        else:
+            print("  未扫描到异动股")
+        print(f"  ✓ Step 10 完成，耗时 {(time.time()-t_step10)/60:.1f} 分钟")
+    except Exception as e:
+        print(f"  [警告] Step 10 异动扫描失败: {e}")
+
+    # ── Step 7: 最终报告（文本）──────────────────────────────────────
+    print_section("Step 7: 最终报告（含事件驱动+异动推荐）")
+    # 匹配选出板块对应的ETF
+    etf_sector_match = engine.match_sector_etfs(top_sectors) if top_sectors else {}
+    report = format_final_report(
+        risk_result, arb_result,
+        fusion_result=final_top10,
+        mr_result=mr_result if mr_result else None,
+        etf_sector_match=etf_sector_match if etf_sector_match else None,
+        event_result=event_result if event_result.get("events") else None,
+        breakout_result=breakout_result if breakout_result.get("picks") else None,
+    )
+    print(report)
+
+    report_path = os.path.join(REPORTS_DIR, f"final_report_{TODAY}.txt")
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(report)
 
     # ── 存储记忆（供下次运行检索）──────────────────────────────
     try:
@@ -1230,6 +1310,8 @@ def run_full_pipeline(
         "risk_result": risk_result,
         "report": report,
         "pdf_path": pdf_path,
+        "event_result": event_result,
+        "breakout_result": breakout_result,
     }
 
 

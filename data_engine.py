@@ -2732,6 +2732,170 @@ class DataEngine:
         return "\n".join(lines)
 
     # ------------------------------------------------------------------ #
+    #  新闻采集（事件驱动分析用）                                           #
+    # ------------------------------------------------------------------ #
+
+    def fetch_breaking_news(self) -> List[Dict]:
+        """
+        采集近期财经新闻/快讯，用于事件驱动因果分析。
+        Level 1: 东方财富快讯 API
+        Level 2: 新浪财经滚动新闻
+        返回: [{"title": str, "time": str, "source": str, "summary": str}]
+        """
+        import requests as _req
+        print("[数据] 采集财经新闻快讯...")
+        news_list: List[Dict] = []
+
+        # Level 1: 东方财富快讯
+        try:
+            url = (
+                "https://np-listapi.eastmoney.com/comm/wap/getListInfo"
+                "?cb=&client=wap&type=0&mession=&pageSize=30&pageIndex=1"
+                "&keyword=&sitelibId=Information&source="
+            )
+            resp = _req.get(url, timeout=15, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Referer": "https://wap.eastmoney.com/",
+            })
+            if resp.status_code == 200:
+                text = resp.text.strip()
+                # 去掉可能的 JSONP callback 包裹
+                if text.startswith("(") and text.endswith(")"):
+                    text = text[1:-1]
+                data = json.loads(text) if text else {}
+                items = data.get("data", {}).get("list", []) if isinstance(data.get("data"), dict) else []
+                if not items and isinstance(data.get("data"), list):
+                    items = data["data"]
+                for item in items[:30]:
+                    title = item.get("title", item.get("Title", ""))
+                    summary = item.get("digest", item.get("content", item.get("Art_Content", "")))
+                    t = item.get("showtime", item.get("time", item.get("Art_ShowTime", "")))
+                    if title:
+                        news_list.append({
+                            "title": title,
+                            "time": str(t),
+                            "source": "东方财富",
+                            "summary": str(summary)[:200] if summary else "",
+                        })
+                if news_list:
+                    print(f"  东方财富快讯: {len(news_list)} 条")
+        except Exception as e:
+            print(f"  [警告] 东方财富快讯: {e}")
+
+        # Level 2: 新浪财经滚动新闻
+        try:
+            url = (
+                "https://feed.mix.sina.com.cn/api/roll/get"
+                "?pageid=153&lid=2516&k=&num=30&page=1&r=0.1"
+            )
+            resp = _req.get(url, timeout=15, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Referer": "https://finance.sina.com.cn/",
+            })
+            if resp.status_code == 200:
+                data = resp.json()
+                items = data.get("result", {}).get("data", [])
+                existing_titles = {n["title"] for n in news_list}
+                count_before = len(news_list)
+                for item in items[:30]:
+                    title = item.get("title", "")
+                    if title and title not in existing_titles:
+                        news_list.append({
+                            "title": title,
+                            "time": item.get("ctime", item.get("intime", "")),
+                            "source": "新浪财经",
+                            "summary": item.get("intro", item.get("summary", ""))[:200],
+                        })
+                        existing_titles.add(title)
+                added = len(news_list) - count_before
+                if added > 0:
+                    print(f"  新浪财经: +{added} 条")
+        except Exception as e:
+            print(f"  [警告] 新浪财经: {e}")
+
+        print(f"  新闻采集完成: 共 {len(news_list)} 条")
+        return news_list
+
+    # ------------------------------------------------------------------ #
+    #  异动爆发股扫描                                                      #
+    # ------------------------------------------------------------------ #
+
+    def scan_breakout_stocks(self) -> List[Dict]:
+        """
+        扫描异动爆发股（涨停池 + 昨涨停溢价股）。
+        返回: [{"code", "name", "trigger", "pct_chg", "close", "turnover", "sector"}]
+        """
+        print("[数据] 扫描异动爆发股...")
+        candidates: Dict[str, Dict] = {}  # code -> info
+
+        # A: 今日涨停池
+        try:
+            df = self._call_with_fallback(
+                lambda: ak.stock_zt_pool_em(date=TODAY), label="涨停池(breakout)")
+            if df is not None and len(df) > 0:
+                code_col = [c for c in df.columns if "代码" in str(c)]
+                name_col = [c for c in df.columns if "名称" in str(c)]
+                pct_col = [c for c in df.columns if "涨跌幅" in str(c)]
+                price_col = [c for c in df.columns if "最新价" in str(c)]
+                turnover_col = [c for c in df.columns if "换手率" in str(c)]
+                for _, row in df.iterrows():
+                    code = str(row[code_col[0]]) if code_col else ""
+                    if not code:
+                        continue
+                    candidates[code] = {
+                        "code": code,
+                        "name": str(row[name_col[0]]) if name_col else "",
+                        "trigger": "涨停",
+                        "pct_chg": float(row[pct_col[0]]) if pct_col else 0.0,
+                        "close": float(row[price_col[0]]) if price_col else 0.0,
+                        "turnover": str(round(float(row[turnover_col[0]]), 2)) if turnover_col else "N/A",
+                        "sector": "",
+                    }
+                print(f"  涨停池: {len(candidates)} 只")
+        except Exception as e:
+            print(f"  [警告] 涨停池扫描: {e}")
+
+        # B: 昨涨停今表现（溢价率>3%视为涨停接力）
+        try:
+            df = self._call_with_fallback(
+                lambda: ak.stock_zt_pool_previous_em(date=TODAY), label="昨涨停(breakout)")
+            if df is not None and len(df) > 0:
+                code_col = [c for c in df.columns if "代码" in str(c)]
+                name_col = [c for c in df.columns if "名称" in str(c)]
+                pct_col = [c for c in df.columns if "涨跌幅" in str(c)]
+                price_col = [c for c in df.columns if "最新价" in str(c) or "现价" in str(c)]
+                turnover_col = [c for c in df.columns if "换手率" in str(c)]
+                added_count = 0
+                for _, row in df.iterrows():
+                    code = str(row[code_col[0]]) if code_col else ""
+                    if not code or code in candidates:
+                        continue
+                    pct = float(row[pct_col[0]]) if pct_col else 0.0
+                    # 溢价>3%算涨停接力
+                    if pct > 3.0:
+                        candidates[code] = {
+                            "code": code,
+                            "name": str(row[name_col[0]]) if name_col else "",
+                            "trigger": "涨停溢价",
+                            "pct_chg": pct,
+                            "close": float(row[price_col[0]]) if price_col else 0.0,
+                            "turnover": str(round(float(row[turnover_col[0]]), 2)) if turnover_col else "N/A",
+                            "sector": "",
+                        }
+                        added_count += 1
+                if added_count:
+                    print(f"  涨停溢价: +{added_count} 只")
+        except Exception as e:
+            print(f"  [警告] 昨涨停扫描: {e}")
+
+        result = list(candidates.values())
+        # 按涨跌幅降序，取 Top30
+        result.sort(key=lambda x: x.get("pct_chg", 0), reverse=True)
+        result = result[:30]
+        print(f"  异动扫描完成: 共 {len(result)} 只候选")
+        return result
+
+    # ------------------------------------------------------------------ #
     #  全流程数据采集                                                      #
     # ------------------------------------------------------------------ #
 
