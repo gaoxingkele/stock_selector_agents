@@ -1133,14 +1133,18 @@ def run_full_pipeline(
 
     save_result({"final_top10": final_top10}, f"fusion_result_{TODAY}.json")
 
-    # ── Step 5.5: 首席策略师综合判断 ─────────────────────────────────
-    print_section("Step 5.5: 首席策略师综合判断")
-    adjusted = run_chief_strategist(llm, final_top10, model_results, mr_result if mr_result else None)
-    if adjusted:
-        final_top10 = adjusted
-        print("  ✓ 策略师已调整排名")
+    # ── Step 5.5: 首席策略师综合判断（默认禁用，--strategist 开启）─────
+    # 注意：首席策略师会用单一LLM主观调整Borda排名，可能干扰多模型投票的客观性
+    if getattr(cfg, '_enable_strategist', False):
+        print_section("Step 5.5: 首席策略师综合判断")
+        adjusted = run_chief_strategist(llm, final_top10, model_results, mr_result if mr_result else None)
+        if adjusted:
+            final_top10 = adjusted
+            print("  ✓ 策略师已调整排名")
+        else:
+            print("  [降级] 策略师调整失败，使用原始Borda排名")
     else:
-        print("  [降级] 策略师调整失败，使用原始Borda排名")
+        print("\n  [跳过] Step 5.5 首席策略师（默认禁用，--strategist 开启）")
 
     # 转换为 RiskController 兼容格式
     arb_result = fusion_to_arb_result(final_top10)
@@ -1304,11 +1308,17 @@ def main():
         action="store_true",
         help="安静模式（减少输出）",
     )
+    parser.add_argument(
+        "--strategist",
+        action="store_true",
+        help="启用首席策略师（Step 5.5，默认禁用，会用单一LLM主观调整Borda排名）",
+    )
 
     args = parser.parse_args()
 
     # 加载配置
     cfg = load_config()
+    cfg._enable_strategist = args.strategist
 
     # 显示配置
     if args.config:
