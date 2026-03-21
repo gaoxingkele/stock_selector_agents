@@ -38,7 +38,8 @@ except ImportError:
     print("请安装依赖: pip install -r requirements.txt")
     sys.exit(1)
 
-from config import load_config, Config
+import config as config_module
+from config import load_config, Config, get_connection_mode_str
 from data_engine import DataEngine
 from llm_client import LLMClient
 from stock_agents import (
@@ -53,7 +54,7 @@ from stock_agents import (
 )
 from fusion import borda_fusion
 from work_logger import WorkLogger
-from report_generator import generate_report
+from report_generator import generate_report, generate_overview_image
 from memory import StockMemory
 
 _BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
@@ -761,6 +762,7 @@ def run_full_pipeline(
 
     # ── Step 0: 初始化 ───────────────────────────────────────────────
     print_section("初始化系统组件")
+    print(f"  连接模式: {get_connection_mode_str()}")
     llm = LLMClient(cfg)
     engine = DataEngine(tushare_token=cfg.tushare_token, tdx_dir=cfg.tdx_dir)
     logger = WorkLogger(log_dir=LOGS_DIR)
@@ -771,8 +773,26 @@ def run_full_pipeline(
         active_models = valid if valid else llm.get_panel(max_models=panel_size)
     else:
         active_models = llm.get_panel(max_models=panel_size)
-    print(f"  可用LLM: {available_providers}")
-    print(f"  本次并行模型: {active_models}（共{len(active_models)}个）")
+    # 设置全局模型约束，确保 MR/SP/GX 等所有步骤都使用相同的模型列表
+    llm.set_active_models(active_models)
+    # 回显模型面板表格
+    from config import should_route_via_cloubic, CLOUBIC_MODEL_MAP
+    print(f"\n  {'='*60}")
+    print(f"  {'#':<4}{'Provider':<12}{'Model':<35}{'Route':<10}")
+    print(f"  {'-'*60}")
+    for i, name in enumerate(active_models, 1):
+        via = should_route_via_cloubic(name)
+        if via:
+            model = CLOUBIC_MODEL_MAP.get(name, '?')
+            route = 'Cloubic'
+        else:
+            prov = cfg.providers.get(name)
+            model = prov.model if prov else '?'
+            route = 'Direct'
+        print(f"  {i:<4}{name:<12}{model:<35}{route:<10}")
+    print(f"  {'='*60}")
+    print(f"  Risk Control: claude -> claude-opus-4-6 (Cloubic)")
+    print(f"  {'='*60}\n")
 
     if not available_providers:
         print("\n  [错误] 未配置任何LLM提供商！请检查 .env 文件中的 API Key。")
@@ -1255,6 +1275,8 @@ def run_full_pipeline(
         else:
             print("  未扫描到异动股")
         print(f"  ✓ Step 10 完成，耗时 {(time.time()-t_step10)/60:.1f} 分钟")
+        if breakout_result.get("picks"):
+            save_result(breakout_result, f"breakout_result_{TODAY}.json")
     except Exception as e:
         print(f"  [警告] Step 10 异动扫描失败: {e}")
 
@@ -1275,6 +1297,31 @@ def run_full_pipeline(
     report_path = os.path.join(REPORTS_DIR, f"final_report_{TODAY}.txt")
     with open(report_path, "w", encoding="utf-8") as f:
         f.write(report)
+
+    # ── Step 7.5: 生成总览分析图片（推荐股+异动股拼接）──────────
+    overview_img = ""
+    try:
+        # 读取股票画像
+        profiles_path = os.path.join(DATA_DIR, f"stock_profiles_{TODAY}.json")
+        stock_profiles_data = {}
+        if os.path.exists(profiles_path):
+            with open(profiles_path, "r", encoding="utf-8") as f:
+                stock_profiles_data = json.load(f)
+
+        overview_img = generate_overview_image(
+            risk_result=risk_result,
+            fusion_result=final_top10,
+            stock_profiles=stock_profiles_data,
+            breakout_result=breakout_result if breakout_result.get("picks") else None,
+            mr_result=mr_result if mr_result else None,
+            engine=engine,
+            active_models=active_models,
+            llm_mode=get_connection_mode_str(),
+            output_dir=REPORTS_DIR,
+        )
+        print(f"  [总览图片] {overview_img}")
+    except Exception as e:
+        print(f"  [警告] 总览图片生成失败: {e}")
 
     # ── 存储记忆（供下次运行检索）──────────────────────────────
     try:
@@ -1300,6 +1347,8 @@ def run_full_pipeline(
     print(f"  [文本报告] {report_path}")
     if pdf_path:
         print(f"  [PDF报告]  {pdf_path}")
+    if overview_img:
+        print(f"  [总览图片] {overview_img}")
     print(f"  [工作日志] {logger.log_path}")
 
     return {
@@ -1310,6 +1359,7 @@ def run_full_pipeline(
         "risk_result": risk_result,
         "report": report,
         "pdf_path": pdf_path,
+        "overview_img": overview_img,
         "event_result": event_result,
         "breakout_result": breakout_result,
     }
@@ -1346,8 +1396,8 @@ def main():
     )
     parser.add_argument(
         "--panel", "-p",
-        type=int, default=3,
-        help="并行模型数量（默认4）",
+        type=int, default=4,
+        help="并行模型数量（默认4: qwen+kimi+openai+claude）",
     )
     parser.add_argument(
         "--models",
@@ -1395,8 +1445,24 @@ def main():
         action="store_true",
         help="启用首席策略师（Step 5.5，默认禁用，会用单一LLM主观调整Borda排名）",
     )
+    parser.add_argument(
+        "--cloubic",
+        action="store_true",
+        help="强制启用 Cloubic 路由（覆盖 .env.cloubic 中的 CLOUBIC_ENABLED）",
+    )
+    parser.add_argument(
+        "--direct",
+        action="store_true",
+        help="强制全部直连（禁用 Cloubic 路由）",
+    )
 
     args = parser.parse_args()
+
+    # 根据 --cloubic / --direct 覆盖连接模式
+    if args.cloubic:
+        config_module.CLOUBIC_ENABLED = True
+    elif args.direct:
+        config_module.CLOUBIC_ENABLED = False
 
     # 加载配置
     cfg = load_config()
@@ -1404,16 +1470,22 @@ def main():
 
     # 显示配置
     if args.config:
+        from config import should_route_via_cloubic, CLOUBIC_MODEL_MAP
         print("\n  [配置信息]")
+        print(f"  连接模式: {get_connection_mode_str()}")
         print(f"  主提供商: {cfg.primary_provider}")
         print(f"  已配置提供商: {list(cfg.providers.keys())}")
         print(f"  LLM代理: {cfg.llm_proxy or '未设置'}")
         print(f"  Tushare: {'已配置' if cfg.tushare_token else '未配置'}")
         print(f"\n  各提供商模型:")
         for name, prov in cfg.providers.items():
+            via = should_route_via_cloubic(name)
+            if via:
+                tag = f" [Cloubic -> {CLOUBIC_MODEL_MAP.get(name, '?')}]"
+            else:
+                tag = " [代理]" if prov.use_proxy else " [直连]"
             vision_str = f" | vision={prov.vision_model}" if prov.vision_model else ""
-            vision_native = " [原生视觉]" if prov.supports_vision else ""
-            print(f"    {name}: {prov.model} ({prov.base_url}){vision_str}{vision_native}")
+            print(f"    {name}: {prov.model}{tag}{vision_str}")
         return
 
     # 演示模式

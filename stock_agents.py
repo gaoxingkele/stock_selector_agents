@@ -2622,6 +2622,9 @@ class RiskController:
         "财务造假", "强制退市", "连续跌停",
     ]
 
+    # 风控专用 provider（需要稳定的 JSON 输出能力）
+    RISK_PROVIDER = "claude"
+
     def __init__(self, llm_client: LLMClient, config: Config):
         self.llm = llm_client
         self.config = config
@@ -2956,25 +2959,32 @@ class RiskController:
                     pass
 
         # LLM 风控审查：三视角辩论（激进派→保守派→风险经理）
+        # 使用 RISK_PROVIDER（claude）确保稳定的 JSON 输出
+        risk_prov = self.RISK_PROVIDER
+        if risk_prov not in self.llm.config.providers:
+            risk_prov = self.config.primary_provider  # fallback
+        if verbose:
+            print(f"  [风控] 使用模型: {risk_prov}")
+
         resp = None
         try:
             # Round 1: 激进派
             aggressive_msgs = self._build_aggressive_prompt(to_review, stock_packages)
-            aggressive_resp = self.llm.call_primary(aggressive_msgs, temperature=0.3)
+            aggressive_resp = self.llm.call(risk_prov, aggressive_msgs, temperature=0.3)
             aggressive_text = aggressive_resp if aggressive_resp else "激进派分析失败"
             if verbose:
                 print("  [风控] 激进派分析完成")
 
             # Round 2: 保守派
             conservative_msgs = self._build_conservative_prompt(to_review, stock_packages, aggressive_text)
-            conservative_resp = self.llm.call_primary(conservative_msgs, temperature=0.2)
+            conservative_resp = self.llm.call(risk_prov, conservative_msgs, temperature=0.2)
             conservative_text = conservative_resp if conservative_resp else "保守派分析失败"
             if verbose:
                 print("  [风控] 保守派分析完成")
 
             # Round 3: 风险经理（最终判决）
             manager_msgs = self._build_risk_manager_prompt(to_review, stock_packages, aggressive_text, conservative_text)
-            resp = self.llm.call_primary(manager_msgs, temperature=0.2)
+            resp = self.llm.call(risk_prov, manager_msgs, temperature=0.2)
             if verbose:
                 print("  [风控] 风险经理最终判决...")
         except Exception as exc:
@@ -2983,7 +2993,7 @@ class RiskController:
             # 降级：回退到单轮风控
             try:
                 msgs = self._build_risk_prompt(to_review, stock_packages)
-                resp = self.llm.call_primary(msgs, temperature=0.2)
+                resp = self.llm.call(risk_prov, msgs, temperature=0.2)
             except Exception:
                 resp = None
 
@@ -3041,12 +3051,12 @@ class RiskController:
                     "total_approved": len(approved),
                 }
 
-        # 降级处理：直接返回 to_review 并加默认风控标注
+        # 降级处理：直接返回全部 to_review 并加默认风控标注
         if verbose:
-            print("  [警告] LLM风控审查失败，使用默认结果")
+            print("  [警告] LLM风控审查失败，使用默认结果（保留全部候选）")
 
         approved = []
-        for i, c in enumerate(to_review[:10], 1):
+        for i, c in enumerate(to_review, 1):
             approved.append({
                 "rank": i,
                 "code": c.get("code", ""),

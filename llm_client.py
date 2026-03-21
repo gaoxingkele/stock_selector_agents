@@ -25,11 +25,20 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import httpx
 from openai import OpenAI
 
-from config import Config, ProviderConfig
+from config import (
+    Config, ProviderConfig,
+    should_route_via_cloubic, is_cloubic_mode,
+    CLOUBIC_API_KEY, CLOUBIC_BASE_URL, CLOUBIC_MODEL_MAP,
+)
 
 
 # 提供商优先级（面板选择顺序）
-PANEL_PRIORITY = ["grok", "qwen", "kimi", "doubao", "gemini", "glm", "deepseek", "minimax", "perplexity"]
+# 默认4个: qwen(直连) + kimi(直连) + openai/gpt-5.4(Cloubic) + claude/opus-4-6(Cloubic)
+PANEL_PRIORITY = [
+    "qwen", "kimi", "openai", "claude",
+    "grok", "doubao", "gemini", "glm", "deepseek",
+    "minimax", "perplexity",
+]
 
 
 # ===================================================================== #
@@ -249,6 +258,8 @@ class LLMClient:
         self.config = config
         self.proxy = config.llm_proxy
         self._clients: Dict[str, OpenAI] = {}
+        # 全局模型约束：若设置，get_panel() 只从此列表中选取
+        self._active_models: Optional[List[str]] = None
 
     # ------------------------------------------------------------------ #
     #  内部工具                                                            #
@@ -257,26 +268,42 @@ class LLMClient:
     def _get_client(self, provider_name: str) -> OpenAI:
         """
         懒初始化 OpenAI 客户端。
-        国外LLM (use_proxy=True): 走代理
-        国内LLM (use_proxy=False): 直连，trust_env=False 屏蔽系统代理
-        超时时间从 ProviderConfig.timeout 读取（默认120s）。
+        Cloubic 路由: 白名单内的 provider 走 Cloubic（国内直连，无需代理）
+        直连模式: 国外LLM走代理，国内LLM直连（trust_env=False 屏蔽系统代理）
         """
-        if provider_name not in self._clients:
+        # Cloubic 路由的 provider 使用独立 key 缓存
+        via_cloubic = should_route_via_cloubic(provider_name)
+        cache_key = f"{provider_name}__cloubic" if via_cloubic else provider_name
+
+        if cache_key not in self._clients:
             prov: ProviderConfig = self.config.providers[provider_name]
-            use_proxy = getattr(prov, "use_proxy", True)
             timeout = getattr(prov, "timeout", 120.0)
-            if use_proxy and self.proxy:
-                http_client = httpx.Client(proxy=self.proxy, timeout=timeout)
-            else:
+
+            if via_cloubic:
+                # Cloubic 路由：统一 API Key + Base URL，国内直连无代理
                 http_client = httpx.Client(timeout=timeout, trust_env=False)
-            self._clients[provider_name] = OpenAI(
-                api_key=prov.api_key,
-                base_url=prov.base_url,
-                http_client=http_client,
-                timeout=timeout,
-                max_retries=0,
-            )
-        return self._clients[provider_name]
+                self._clients[cache_key] = OpenAI(
+                    api_key=CLOUBIC_API_KEY,
+                    base_url=CLOUBIC_BASE_URL,
+                    http_client=http_client,
+                    timeout=timeout,
+                    max_retries=0,
+                )
+            else:
+                # 直连模式
+                use_proxy = getattr(prov, "use_proxy", True)
+                if use_proxy and self.proxy:
+                    http_client = httpx.Client(proxy=self.proxy, timeout=timeout)
+                else:
+                    http_client = httpx.Client(timeout=timeout, trust_env=False)
+                self._clients[cache_key] = OpenAI(
+                    api_key=prov.api_key,
+                    base_url=prov.base_url,
+                    http_client=http_client,
+                    timeout=timeout,
+                    max_retries=0,
+                )
+        return self._clients[cache_key]
 
     def _close(self):
         """关闭所有 HTTP 客户端"""
@@ -332,19 +359,31 @@ class LLMClient:
         client = self._get_client(provider_name)
         stats = self._input_stats(messages)
 
+        # Cloubic 路由时使用映射模型名
+        via_cloubic = should_route_via_cloubic(provider_name)
+        actual_model = CLOUBIC_MODEL_MAP.get(provider_name, prov.model) if via_cloubic else prov.model
+        route_tag = "[C]" if via_cloubic else ""
+
         for attempt in range(max_retries + 1):
             attempt_tag = f"(重试{attempt})" if attempt > 0 else ""
-            model_short = prov.model[:40]
-            print(
-                f"  [{provider_name}]{attempt_tag} ▶ {model_short}"
-                f" ({stats['msgs']}条/{stats['chars']}字)...",
-                end="", flush=True,
-            )
+            model_short = actual_model[:40]
+            try:
+                print(
+                    f"  [{provider_name}]{route_tag}{attempt_tag} > {model_short}"
+                    f" ({stats['msgs']}msg/{stats['chars']}ch)...",
+                    end="", flush=True,
+                )
+            except UnicodeEncodeError:
+                print(
+                    f"  [{provider_name}]{route_tag}{attempt_tag} > {model_short}...",
+                    end="", flush=True,
+                )
             t_call = time.time()
             log_entry: Dict = {
                 "ts": datetime.now().isoformat(),
                 "provider": provider_name,
-                "model": prov.model,
+                "model": actual_model,
+                "via_cloubic": via_cloubic,
                 "attempt": attempt,
                 "temperature": temperature,
                 "max_tokens": max_tokens,
@@ -354,7 +393,7 @@ class LLMClient:
             }
             try:
                 kwargs: Dict[str, Any] = {
-                    "model": prov.model,
+                    "model": actual_model,
                     "messages": messages,
                     "max_tokens": max_tokens,
                 }
@@ -380,7 +419,7 @@ class LLMClient:
 
                 log_entry.update({"status": "ok", "elapsed": elapsed, "output_chars": _len})
                 _llm_call_logger.write(log_entry)
-                print(f" ✓ {elapsed:.1f}s {_len}字")
+                print(f" OK {elapsed:.1f}s {_len}ch")
                 return content.strip() if content else None
 
             except Exception as exc:
@@ -409,11 +448,11 @@ class LLMClient:
                         tag = f"（超时>{prov_timeout:.0f}s，跳过重试）"
                     elif err_str.lstrip().startswith("<"):
                         tag = "（HTML错误页，跳过重试）"
-                    print(f" ✗ {elapsed:.1f}s 失败{tag}: {err_str[:120]}")
+                    print(f" FAIL {elapsed:.1f}s {tag}: {err_str[:120]}")
                     return None
 
                 wait = 2 ** attempt
-                print(f" ✗ {elapsed:.1f}s ({err_str[:80]}), 等待{wait}s重试")
+                print(f" FAIL {elapsed:.1f}s ({err_str[:80]}), wait {wait}s")
                 time.sleep(wait)
 
     def call_primary(
@@ -497,12 +536,22 @@ class LLMClient:
     #  面板多模型调用                                                      #
     # ------------------------------------------------------------------ #
 
+    def set_active_models(self, models: List[str]) -> None:
+        """设置全局模型约束，后续所有 get_panel/call_panel 只从此列表选取。"""
+        self._active_models = [m for m in models if m in self.config.providers]
+
     def get_panel(self, max_models: Optional[int] = None) -> List[str]:
         """
         按优先级返回面板提供商列表。
+        若 _active_models 已设置，只从中选取（尊重 --models 参数）。
         max_models 默认使用 config.panel_size。
         """
         n = max_models if max_models is not None else self.config.panel_size
+
+        if self._active_models:
+            # 用户指定了模型列表，按指定顺序返回
+            return self._active_models[:n]
+
         ordered = [p for p in PANEL_PRIORITY if p in self.config.providers]
         # 补充不在优先级列表中的提供商
         for p in self.config.providers:
@@ -517,11 +566,16 @@ class LLMClient:
         temperature: float = 0.3,
         max_tokens: int = 4096,
         verbose: bool = True,
+        models: Optional[List[str]] = None,
     ) -> Dict[str, str]:
         """
         并行(顺序)调用多个LLM，返回 {provider_name: response_text}。
+        models: 指定模型列表（优先级高于 max_models）
         """
-        panel = self.get_panel(max_models)
+        if models:
+            panel = [m for m in models if m in self.config.providers]
+        else:
+            panel = self.get_panel(max_models)
         results: Dict[str, str] = {}
 
         for name in panel:
@@ -549,6 +603,7 @@ class LLMClient:
         temperature: float = 0.15,
         max_tokens: int = 4096,
         verbose: bool = True,
+        models: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         多轮辩论流程:
@@ -563,8 +618,12 @@ class LLMClient:
         参数:
             build_prompt_fn(provider_name) -> messages  构建初始提示词
             summarize_fn(results_dict)     -> str       将上一轮结果合并为可供辩论的文本
+            models: 指定模型列表（优先级高于 max_models）
         """
-        panel = self.get_panel(max_models)
+        if models:
+            panel = [m for m in models if m in self.config.providers]
+        else:
+            panel = self.get_panel(max_models)
 
         # ---------- Round 1: 独立分析 ----------
         if verbose:

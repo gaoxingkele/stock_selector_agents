@@ -1,5 +1,6 @@
 # Environment & secrets
 .env
+.env.cloubic
 
 # Python cache
 __pycache__/

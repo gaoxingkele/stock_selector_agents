@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import matplotlib
 matplotlib.use("Agg")
+import matplotlib.font_manager as fm
 import matplotlib.gridspec as gridspec
 import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
@@ -1194,3 +1195,419 @@ def generate_report(
         n_models=n_models,
         output_filename=output_filename,
     )
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  推荐股 + 异动股 总览图片生成
+# ─────────────────────────────────────────────────────────────────────
+
+def _compute_support_resistance(engine, codes: List[str]) -> Dict:
+    """为一组股票代码计算支撑/压力位"""
+    results = {}
+    for code in codes:
+        try:
+            df = engine.fetch_kline(code, period="daily", n_bars=120)
+            if df is None or len(df) < 20:
+                results[code] = {}
+                continue
+            closes = df["close"].astype(float).tolist()
+            highs = df["high"].astype(float).tolist()
+            lows = df["low"].astype(float).tolist()
+            current = closes[-1]
+            ma20 = sum(closes[-20:]) / len(closes[-20:])
+            n60 = min(60, len(closes))
+            ma60 = sum(closes[-n60:]) / n60
+            h20 = max(highs[-20:])
+            l20 = min(lows[-20:])
+            n60h = min(60, len(highs))
+            h60 = max(highs[-n60h:])
+            l60 = min(lows[-n60h:])
+            sup = sorted([v for v in [ma20, ma60, l20] if v < current], reverse=True)
+            res = sorted([v for v in [h20, h60] if v > current * 1.005])
+            results[code] = {
+                "price": round(current, 2),
+                "ma20": round(ma20, 2), "ma60": round(ma60, 2),
+                "s1": round(sup[0], 2) if sup else round(l20, 2),
+                "s2": round(sup[1], 2) if len(sup) > 1 else round(l60, 2),
+                "r1": round(res[0], 2) if res else round(h20, 2),
+                "r2": round(res[1], 2) if len(res) > 1 else round(h60, 2),
+            }
+        except Exception:
+            results[code] = {}
+    return results
+
+
+def generate_overview_image(
+    risk_result: Dict,
+    fusion_result: Optional[List[Dict]] = None,
+    stock_profiles: Optional[Dict] = None,
+    breakout_result: Optional[Dict] = None,
+    mr_result: Optional[Dict] = None,
+    engine=None,
+    active_models: Optional[List[str]] = None,
+    llm_mode: str = "direct",
+    output_dir: str = ".",
+) -> str:
+    """
+    生成推荐股 + 异动股拼接总览图片（PNG）。
+
+    参数:
+        risk_result      风控审查结果
+        fusion_result    Borda融合结果列表
+        stock_profiles   股票画像字典 {code: profile_text}
+        breakout_result  异动爆发扫描结果（可选）
+        mr_result        市场雷达结果（含概念炒作预判+ETF）
+        engine           DataEngine 实例
+        active_models    本次使用的模型列表
+        llm_mode         LLM 接入模式描述
+        output_dir       输出目录
+
+    返回: 图片文件路径
+    """
+    import re
+    import warnings
+    warnings.filterwarnings("ignore")
+    from matplotlib.patches import Rectangle as Rect
+
+    models_str = ", ".join(active_models) if active_models else "?"
+    stock_profiles = stock_profiles or {}
+    fusion_result = fusion_result or []
+    mr_result = mr_result or {}
+
+    # ── 构建板块→概念阶段+ETF映射（from MR hype_predictions） ──
+    sector_concept_map = {}  # sector_name → {"stage": ..., "etfs": [...]}
+    for hp in mr_result.get("hype_predictions", []):
+        cname = hp.get("concept_name", "")
+        stage = hp.get("hype_stage", "")
+        etfs = hp.get("etf_alternatives", [])
+        etf_str = "/".join(e.get("name", "") for e in etfs[:2]) if etfs else ""
+        if cname:
+            sector_concept_map[cname] = {"stage": stage, "etfs": etf_str}
+
+    # ── 字体 ──
+    font_path = "C:/Windows/Fonts/msyh.ttc"
+    if not os.path.exists(font_path):
+        font_path = "C:/Windows/Fonts/simhei.ttf"
+
+    def mkfp(sz, bold=False):
+        return fm.FontProperties(fname=font_path, size=sz, weight='bold' if bold else 'normal')
+
+    fp9=mkfp(9); fp10=mkfp(10); fp10b=mkfp(10,True); fp11=mkfp(11); fp11b=mkfp(11,True)
+    fp12b=mkfp(12,True); fp14b=mkfp(14,True); fp18b=mkfp(18,True)
+
+    # ── 构建 fusion 索引（code → fusion item）──
+    fusion_map = {}
+    for item in (fusion_result or []):
+        fusion_map[item.get("code", "")] = item
+
+    # ── 提取推荐股数据 ──
+    approved = risk_result.get("approved", [])
+    soft_excluded = risk_result.get("soft_excluded", [])
+
+    # 按 fusion 排名排序（fusion_result 已排好序）
+    all_codes_ordered = [item.get("code", "") for item in (fusion_result or [])]
+    code_set_approved = {s.get("code", "") for s in approved}
+    code_set_excluded = {s.get("code", "") for s in soft_excluded}
+    risk_map = {}
+    for s in approved + soft_excluded:
+        risk_map[s.get("code", "")] = s
+
+    # 按 fusion 顺序排列，保留 risk 信息
+    all_recs_ordered = []
+    for code in all_codes_ordered:
+        if code in risk_map:
+            all_recs_ordered.append(risk_map[code])
+    # 补充 fusion 中没有但 risk 有的
+    for s in approved + soft_excluded:
+        if s.get("code", "") not in {r.get("code","") for r in all_recs_ordered}:
+            all_recs_ordered.append(s)
+
+    rec_codes = [s.get("code", "") for s in all_recs_ordered]
+
+    # 计算支撑压力
+    sr_main = {}
+    sr_anomaly = {}
+    if engine:
+        sr_main = _compute_support_resistance(engine, rec_codes)
+        anomaly_codes = [p.get("code", "") for p in (breakout_result or {}).get("picks", [])]
+        if anomaly_codes:
+            sr_anomaly = _compute_support_resistance(engine, anomaly_codes)
+
+    # 构建推荐股行数据
+    def _extract_profile_field(code, field_re):
+        p = stock_profiles.get(code, "")
+        m = re.search(field_re, str(p))
+        return m.group(1) if m else ""
+
+    stocks_main = []
+    for s in all_recs_ordered:
+        code = s.get("code", "")
+        name = s.get("name", "")
+        # 从 fusion_result 获取准确的 borda/sector/model 数据
+        fi = fusion_map.get(code, {})
+        borda = fi.get("borda_score", s.get("borda_score", s.get("final_score", 0)))
+        sector = fi.get("sector", s.get("sector", ""))
+        model_count = fi.get("model_count", 0)
+        total_models = len(active_models) if active_models else 3
+        consensus = f"{model_count}/{total_models}"
+        # 投票来源
+        rec_by = fi.get("recommended_by", [])
+        voters_str = ",".join(f"{r['model']}#{r['rank']}" for r in rec_by) if rec_by else ""
+
+        risk_note = s.get("risk_note", "")
+        if not risk_note and code in code_set_excluded:
+            for ex in soft_excluded:
+                if ex.get("code") == code:
+                    risk_note = ex.get("reason", "")[:50]
+                    break
+
+        # 板块+概念+ETF
+        sector_info = sector
+        cm = sector_concept_map.get(sector, {})
+        if cm:
+            stage = cm.get("stage", "")
+            etf = cm.get("etfs", "")
+            if stage:
+                sector_info += f"|{stage}"
+            if etf:
+                sector_info += f"|{etf}"
+        else:
+            # 模糊匹配：板块名可能是概念名的子串
+            for cname, cdata in sector_concept_map.items():
+                if cname in sector or sector in cname:
+                    stage = cdata.get("stage", "")
+                    etf = cdata.get("etfs", "")
+                    if stage:
+                        sector_info += f"|{stage}"
+                    if etf:
+                        sector_info += f"|{etf}"
+                    break
+
+        # 位置
+        chg20 = _extract_profile_field(code, r"近20日=([+\-]?[\d.]+%)")
+        position = f"20日{chg20}" if chg20 else ""
+
+        stocks_main.append((code, name, int(borda), consensus, sector_info, risk_note, voters_str, position))
+
+    # 构建异动股行数据
+    anomaly_rows = []
+    for p in (breakout_result or {}).get("picks", []):
+        code = p.get("code", "")
+        name = p.get("name", "")
+        score = p.get("score", 0)
+        votes = p.get("votes", 0)
+        theme = p.get("theme", "")
+        position = p.get("position", "")
+        anomaly_rows.append((code, name, score, votes, theme, position))
+
+    n_main = len(stocks_main)
+    n_anomaly = len(anomaly_rows)
+    has_anomaly = n_anomaly > 0
+
+    # ── 表格布局 ──
+    # 列定义: (x, width, max_chars) — max_chars 控制每行文字截断字数
+    # 总宽 18.0，充分利用空间
+    cols_main_def = [
+        (0.00, 0.30, 3),    # 0: #
+        (0.30, 0.75, 6),    # 1: 代码
+        (1.05, 0.90, 5),    # 2: 名称
+        (1.95, 2.40, 16),   # 3: 板块/概念/ETF
+        (4.35, 0.50, 4),    # 4: Borda
+        (4.85, 0.45, 3),    # 5: 共识
+        (5.30, 0.80, 7),    # 6: 现价
+        (6.10, 0.75, 7),    # 7: 支撑1
+        (6.85, 0.75, 7),    # 8: 支撑2
+        (7.60, 0.75, 7),    # 9: 压力1
+        (8.35, 0.75, 7),    # 10: 压力2
+        (9.10, 1.15, 9),    # 11: 位置
+        (10.25,2.75, 18),   # 12: 投票来源
+        (13.00,5.00, 32),   # 13: 风控
+    ]
+    cols_main = [(x, w) for x, w, _ in cols_main_def]
+    max_chars_main = [mc for _, _, mc in cols_main_def]
+    hdrs_main = ["#","代码","名称","板块/概念/ETF","Borda","共识",
+                 "现价","支撑1","支撑2","压力1","压力2","位置","投票来源","风控"]
+
+    cols_anom_def = [
+        (0.00, 0.30, 3),    # 0: #
+        (0.30, 0.75, 6),    # 1: 代码
+        (1.05, 0.90, 5),    # 2: 名称
+        (1.95, 0.50, 3),    # 3: 评分
+        (2.45, 0.45, 3),    # 4: 票数
+        (2.90, 3.00, 20),   # 5: 事件题材
+        (5.90, 0.80, 7),    # 6: 现价
+        (6.70, 0.75, 7),    # 7: 支撑1
+        (7.45, 0.75, 7),    # 8: 支撑2
+        (8.20, 0.75, 7),    # 9: 压力1
+        (8.95, 0.75, 7),    # 10: 压力2
+        (9.70, 1.30, 10),   # 11: 位置
+    ]
+    cols_anom = [(x, w) for x, w, _ in cols_anom_def]
+    max_chars_anom = [mc for _, _, mc in cols_anom_def]
+    hdrs_anom = ["#","代码","名称","评分","票数","事件题材",
+                 "现价","支撑1","支撑2","压力1","压力2","位置"]
+
+    total_w = 18.0
+    ch = 0.60   # 行高（容纳多行换行）
+    hh = 0.52   # 表头高
+    gap = 0.7; title_h = 1.0; sub_h = 0.50
+
+    fig_h = title_h + sub_h + hh + n_main * ch + 0.8
+    if has_anomaly:
+        fig_h += gap + sub_h + hh + n_anomaly * ch
+    fig_w = total_w + 0.5
+
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    ax.set_xlim(-0.1, total_w + 0.3)
+    ax.set_ylim(0, fig_h)
+    ax.axis('off')
+    ax.invert_yaxis()
+
+    # ── 辅助函数 ──
+    def _pos_color(txt):
+        if any(k in txt for k in ['高位','超买','见顶','冲顶']):
+            return '#c0392b', fp10b
+        if any(k in txt for k in ['底部','低位','横盘','蓄势','整理','盘整']):
+            return '#1e8449', fp10b
+        return '#2471a3', fp10b
+
+    def _style_main(j, val):
+        if j in (7,8):  return '#1e8449', fp11b   # 支撑
+        if j in (9,10): return '#c0392b', fp11b    # 压力
+        if j == 6:  return '#2c3e50', fp11b        # 现价
+        if j == 13 and val: return '#c0392b', mkfp(8)  # 风控
+        if j == 12: return '#555555', mkfp(8)      # 投票来源
+        if j == 11: return _pos_color(val)         # 位置
+        if j == 3:  return '#2c3e50', mkfp(8.5)    # 板块/概念/ETF
+        if j == 4:
+            bv = int(val) if val.isdigit() else 0
+            c = '#196f3d' if bv>=40 else '#1a5276' if bv>=20 else '#7f8c8d'
+            return c, fp11b
+        if j == 5:
+            total_m = str(len(active_models)) if active_models else "3"
+            is_full = val.startswith(total_m + "/")
+            return ('#196f3d' if is_full else '#7f8c8d'), (fp11b if is_full else fp11)
+        return '#2c3e50', fp11
+
+    def _style_anom(j, val):
+        if j in (7,8):  return '#1e8449', fp11b
+        if j in (9,10): return '#c0392b', fp11b
+        if j == 6:  return '#2c3e50', fp11b
+        if j == 5:  return '#8e44ad', mkfp(9)   # 事件题材
+        if j == 3:  return '#e67e22', fp11b
+        if j == 4:  return '#2471a3', fp11b
+        if j == 11: return _pos_color(val)
+        return '#2c3e50', fp11
+
+    def _draw_hdr(y, cols, hdrs, bg='#1a5276'):
+        for j,(x,w) in enumerate(cols):
+            r = Rect((x,y),w,hh, facecolor=bg, edgecolor='#0e3d5a', linewidth=0.5)
+            ax.add_patch(r)
+            ax.text(x+w/2, y+hh/2, hdrs[j], fontproperties=fp11b,
+                    ha='center', va='center', color='white')
+
+    def _fmt_sr(d, key):
+        return f"{d[key]:.2f}" if key in d and d[key] else "-"
+
+    def _wrap_text(txt, max_ch):
+        """将长文本按 max_ch 字符截断并插入换行"""
+        if not txt or len(txt) <= max_ch:
+            return txt
+        lines = []
+        while txt:
+            lines.append(txt[:max_ch])
+            txt = txt[max_ch:]
+            if len(lines) >= 3:  # 最多3行
+                if txt:
+                    lines[-1] = lines[-1][:-1] + ".."
+                break
+        return "\n".join(lines)
+
+    def _draw_cell(x, y, w, h, text, color, fp_cell, bg, max_ch, ha='center'):
+        """绘制单元格，文字自动换行"""
+        r = Rect((x,y),w,h, facecolor=bg, edgecolor='#d5d8dc', linewidth=0.3)
+        ax.add_patch(r)
+        wrapped = _wrap_text(text, max_ch)
+        # 左对齐时加 padding
+        tx = x + 0.05 if ha == 'left' else x + w/2
+        ax.text(tx, y+h/2, wrapped, fontproperties=fp_cell,
+                ha=ha, va='center', color=color,
+                linespacing=1.15, clip_on=True)
+
+    # ── 标题 ──
+    ax.text(total_w/2, 0.2, "A股多智能体选股系统 — 推荐股 + 异动股 完整分析",
+            fontproperties=fp18b, ha='center', va='top', color='#1a5276')
+    subtitle = (f"{datetime.now().strftime('%Y-%m-%d')}  |  {models_str}  "
+                f"|  {llm_mode}  |  绿=支撑  红=压力")
+    ax.text(total_w/2, 0.58, subtitle,
+            fontproperties=fp10, ha='center', va='top', color='#7f8c8d')
+
+    # ── 表1: 推荐股 ──
+    y1 = title_h
+    ax.text(0.0, y1+0.06, f"  Borda融合推荐 TOP{n_main}（多模型共识选股）",
+            fontproperties=fp14b, color='#1a5276', va='top')
+    y1 += sub_h
+    _draw_hdr(y1, cols_main, hdrs_main)
+    y1 += hh
+
+    total_m = str(len(active_models)) if active_models else "3"
+    for i,(code,name,borda,cons,sector,risk,voters,pos) in enumerate(stocks_main):
+        y = y1 + i * ch
+        d = sr_main.get(code, {})
+        cells = [str(i+1),code,name,sector,str(borda),cons,
+                 _fmt_sr(d,'price'),_fmt_sr(d,'s1'),_fmt_sr(d,'s2'),
+                 _fmt_sr(d,'r1'),_fmt_sr(d,'r2'), pos, voters, risk]
+        full_cons = cons == f"{total_m}/{total_m}"
+        if risk: bg='#fef5f5'
+        elif full_cons: bg='#eafaf1'
+        else: bg='#f8f9fa' if i%2==0 else '#ffffff'
+
+        for j,(x,w) in enumerate(cols_main):
+            color, f = _style_main(j, cells[j])
+            ha = 'left' if j in (3,12,13) else 'center'  # 板块/投票/风控左对齐
+            _draw_cell(x, y, w, ch, cells[j], color, f, bg, max_chars_main[j], ha)
+
+    # ── 表2: 异动股 ──
+    if has_anomaly:
+        y2 = y1 + n_main * ch + gap * 0.3
+        ax.plot([0, total_w], [y2, y2], color='#bdc3c7', linewidth=1.5, linestyle='--')
+        y2 += gap * 0.2
+        ax.text(0.0, y2+0.06,
+                f"  异动爆发推荐 TOP{n_anomaly}（事件驱动短线）   仓位<=5%/只，严格止损",
+                fontproperties=fp14b, color='#8e44ad', va='top')
+        y2 += sub_h
+        _draw_hdr(y2, cols_anom, hdrs_anom, bg='#6c3483')
+        y2 += hh
+
+        for i,(code,name,score,votes,theme,pos) in enumerate(anomaly_rows):
+            y = y2 + i * ch
+            d = sr_anomaly.get(code, {})
+            cells = [str(i+1),code,name,str(score),f"{votes}/{total_m}",theme,
+                     _fmt_sr(d,'price'),_fmt_sr(d,'s1'),_fmt_sr(d,'s2'),
+                     _fmt_sr(d,'r1'),_fmt_sr(d,'r2'), pos]
+            bg = '#f3e8ff' if votes >= 2 else ('#faf5ff' if i%2==0 else '#ffffff')
+
+            for j,(x,w) in enumerate(cols_anom):
+                color, f = _style_anom(j, cells[j])
+                ha = 'left' if j == 5 else 'center'
+                _draw_cell(x, y, w, ch, cells[j], color, f, bg, max_chars_anom[j], ha)
+        footer_y = y2 + n_anomaly * ch + 0.15
+    else:
+        footer_y = y1 + n_main * ch + 0.15
+
+    # ── 页脚 ──
+    ax.text(0.0, footer_y,
+        "  绿底=强共识  红底=风控预警  紫底=双模型确认异动  "
+        "支撑1=MA20/近期低点  支撑2=MA60  压力1=20日高  压力2=60日高",
+        fontproperties=fp10, color='#7f8c8d')
+    ax.text(0.0, footer_y+0.3,
+        "  本表仅为AI分析参考，不构成投资建议。股市有风险，投资需谨慎。",
+        fontproperties=fp9, color='#aab7b8')
+
+    # ── 保存 ──
+    os.makedirs(output_dir, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M")
+    out_path = os.path.join(output_dir, f"总览分析_{ts}.png")
+    plt.savefig(out_path, dpi=150, bbox_inches='tight', facecolor='white', pad_inches=0.3)
+    plt.close()
+    return out_path
