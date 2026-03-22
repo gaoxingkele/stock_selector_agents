@@ -595,14 +595,19 @@ class LLMClient:
                 f"(effort={effort}, {len(prompt)}ch)...",
                 end="", flush=True,
             )
-            # 使用独立 httpx 客户端（不走 OpenAI SDK）
-            use_proxy = not via_cloubic and self.proxy
-            client_kwargs: Dict[str, Any] = {"timeout": timeout, "trust_env": False}
-            if use_proxy:
-                client_kwargs["proxy"] = self.proxy
-
-            with httpx.Client(**client_kwargs) as http:
-                resp = http.post(url, headers=headers, json=payload)
+            # 使用 requests 库（兼容性更好，避免 httpx SSL 问题）
+            import requests as _req
+            prov = self.config.providers.get("grok")
+            prov_use_proxy = getattr(prov, "use_proxy", True) if prov else True
+            use_proxy = not via_cloubic and self.proxy and prov_use_proxy
+            proxies = (
+                {"http": self.proxy, "https": self.proxy}
+                if use_proxy else None
+            )
+            resp = _req.post(
+                url, headers=headers, json=payload,
+                proxies=proxies, timeout=timeout,
+            )
 
             elapsed = round(time.time() - t_call, 2)
 

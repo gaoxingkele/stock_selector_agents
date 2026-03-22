@@ -3296,16 +3296,16 @@ class EventAnalyst:
             enhanced_map[title] = evt
 
         merged = []
+        used_enh_titles = set()
         for orig in original:
             orig_title = orig.get("event", "")
-            # 尝试匹配增强版
+            # 尝试匹配增强版（子串包含或前10字符重叠）
             matched_enh = None
             for enh_title, enh in enhanced_map.items():
-                # 简单关键词匹配
-                orig_words = set(w for w in orig_title if len(w) > 1)
-                enh_words = set(w for w in enh_title if len(w) > 1)
-                if orig_words & enh_words:
+                if (orig_title[:10] in enh_title or enh_title[:10] in orig_title
+                        or orig_title == enh_title):
                     matched_enh = enh
+                    used_enh_titles.add(enh_title)
                     break
 
             if matched_enh:
@@ -3340,15 +3340,9 @@ class EventAnalyst:
 
         # 添加增强版中发现的全新事件
         for enh_title, enh in enhanced_map.items():
-            is_new = True
-            for m in merged:
-                m_title = m.get("event", "")
-                m_words = set(w for w in m_title if len(w) > 1)
-                e_words = set(w for w in enh_title if len(w) > 1)
-                if m_words & e_words:
-                    is_new = False
-                    break
-            if is_new and enh.get("verified", True) and enh.get("certainty", 0) >= 50:
+            if enh_title in used_enh_titles:
+                continue  # 已合并，跳过
+            if enh.get("verified", True) and enh.get("certainty", 0) >= 50:
                 enh["source"] = "grok_deep_research"
                 merged.append(enh)
 
