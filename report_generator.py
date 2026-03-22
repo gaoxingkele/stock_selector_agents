@@ -1354,12 +1354,41 @@ def generate_overview_image(
         rec_by = fi.get("recommended_by", [])
         voters_str = ",".join(f"{r['model']}#{r['rank']}" for r in rec_by) if rec_by else ""
 
+        # 推荐理由：从 fusion all_reasonings 或 risk core_logic 提取
+        reasonings = fi.get("all_reasonings", [])
+        if reasonings:
+            # 取第一条理由，去掉 [model] 前缀
+            reason_text = str(reasonings[0])
+            if reason_text.startswith("[") and "]" in reason_text:
+                reason_text = reason_text[reason_text.index("]")+1:].strip()
+        else:
+            reason_text = s.get("core_logic", "")
+            if reason_text.startswith("[") and "]" in reason_text:
+                reason_text = reason_text[reason_text.index("]")+1:].strip()
+            # 截断到第一个分号（去掉后续模型理由）
+            if ";" in reason_text:
+                reason_text = reason_text[:reason_text.index(";")]
+
+        # 风险提示：从 risk_flags / risk_note / position_advice 组合
+        risk_parts = []
+        risk_flags = s.get("risk_flags", [])
+        if risk_flags:
+            risk_parts.append("；".join(str(f) for f in risk_flags[:2]))
         risk_note = s.get("risk_note", "")
         if not risk_note and code in code_set_excluded:
             for ex in soft_excluded:
                 if ex.get("code") == code:
-                    risk_note = ex.get("reason", "")[:50]
+                    risk_note = ex.get("reason", "")
                     break
+        if risk_note:
+            risk_parts.append(risk_note)
+        pos_advice = s.get("position_advice", "")
+        stop_loss = s.get("stop_loss", "")
+        if pos_advice:
+            risk_parts.append(pos_advice)
+        if stop_loss:
+            risk_parts.append(f"止损:{stop_loss}")
+        risk_text = " | ".join(risk_parts) if risk_parts else ""
 
         # 板块+概念+ETF
         sector_info = sector
@@ -1387,7 +1416,7 @@ def generate_overview_image(
         chg20 = _extract_profile_field(code, r"近20日=([+\-]?[\d.]+%)")
         position = f"20日{chg20}" if chg20 else ""
 
-        stocks_main.append((code, name, int(borda), consensus, sector_info, risk_note, voters_str, position))
+        stocks_main.append((code, name, int(borda), consensus, sector_info, reason_text, risk_text, position))
 
     # 构建异动股行数据
     anomaly_rows = []
@@ -1411,22 +1440,22 @@ def generate_overview_image(
         (0.00, 0.30, 3),    # 0: #
         (0.30, 0.75, 6),    # 1: 代码
         (1.05, 0.90, 5),    # 2: 名称
-        (1.95, 2.40, 16),   # 3: 板块/概念/ETF
-        (4.35, 0.50, 4),    # 4: Borda
-        (4.85, 0.45, 3),    # 5: 共识
-        (5.30, 0.80, 7),    # 6: 现价
-        (6.10, 0.75, 7),    # 7: 支撑1
-        (6.85, 0.75, 7),    # 8: 支撑2
-        (7.60, 0.75, 7),    # 9: 压力1
-        (8.35, 0.75, 7),    # 10: 压力2
-        (9.10, 1.15, 9),    # 11: 位置
-        (10.25,2.75, 18),   # 12: 投票来源
-        (13.00,5.00, 32),   # 13: 风控
+        (1.95, 1.80, 12),   # 3: 板块/概念/ETF
+        (3.75, 0.50, 4),    # 4: Borda
+        (4.25, 0.45, 3),    # 5: 共识
+        (4.70, 0.70, 6),    # 6: 现价
+        (5.40, 0.65, 6),    # 7: 支撑1
+        (6.05, 0.65, 6),    # 8: 支撑2
+        (6.70, 0.65, 6),    # 9: 压力1
+        (7.35, 0.65, 6),    # 10: 压力2
+        (8.00, 1.00, 8),    # 11: 位置
+        (9.00, 4.50, 30),   # 12: 推荐理由
+        (13.50,4.50, 30),   # 13: 风险提示
     ]
     cols_main = [(x, w) for x, w, _ in cols_main_def]
     max_chars_main = [mc for _, _, mc in cols_main_def]
     hdrs_main = ["#","代码","名称","板块/概念/ETF","Borda","共识",
-                 "现价","支撑1","支撑2","压力1","压力2","位置","投票来源","风控"]
+                 "现价","支撑1","支撑2","压力1","压力2","位置","推荐理由","风险提示"]
 
     cols_anom_def = [
         (0.00, 0.30, 3),    # 0: #
@@ -1448,7 +1477,7 @@ def generate_overview_image(
                  "现价","支撑1","支撑2","压力1","压力2","位置"]
 
     total_w = 18.0
-    ch = 0.60   # 行高（容纳多行换行）
+    ch = 0.80   # 行高（容纳推荐理由+风险提示多行）
     hh = 0.52   # 表头高
     gap = 0.7; title_h = 1.0; sub_h = 0.50
 
@@ -1475,8 +1504,8 @@ def generate_overview_image(
         if j in (7,8):  return '#1e8449', fp11b   # 支撑
         if j in (9,10): return '#c0392b', fp11b    # 压力
         if j == 6:  return '#2c3e50', fp11b        # 现价
-        if j == 13 and val: return '#c0392b', mkfp(8)  # 风控
-        if j == 12: return '#555555', mkfp(8)      # 投票来源
+        if j == 13 and val: return '#c0392b', mkfp(8)  # 风险提示
+        if j == 12: return '#2c3e50', mkfp(8)      # 推荐理由
         if j == 11: return _pos_color(val)         # 位置
         if j == 3:  return '#2c3e50', mkfp(8.5)    # 板块/概念/ETF
         if j == 4:
@@ -1551,14 +1580,14 @@ def generate_overview_image(
     y1 += hh
 
     total_m = str(len(active_models)) if active_models else "3"
-    for i,(code,name,borda,cons,sector,risk,voters,pos) in enumerate(stocks_main):
+    for i,(code,name,borda,cons,sector,reason,risk,pos) in enumerate(stocks_main):
         y = y1 + i * ch
         d = sr_main.get(code, {})
         cells = [str(i+1),code,name,sector,str(borda),cons,
                  _fmt_sr(d,'price'),_fmt_sr(d,'s1'),_fmt_sr(d,'s2'),
-                 _fmt_sr(d,'r1'),_fmt_sr(d,'r2'), pos, voters, risk]
+                 _fmt_sr(d,'r1'),_fmt_sr(d,'r2'), pos, reason, risk]
         full_cons = cons == f"{total_m}/{total_m}"
-        if risk: bg='#fef5f5'
+        if risk and any(k in risk for k in ['排除','ST','退市']): bg='#fef5f5'
         elif full_cons: bg='#eafaf1'
         else: bg='#f8f9fa' if i%2==0 else '#ffffff'
 
