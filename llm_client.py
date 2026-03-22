@@ -33,11 +33,11 @@ from config import (
 
 
 # 提供商优先级（面板选择顺序）
-# 默认4个: qwen(直连) + kimi(直连) + openai/gpt-5.4(Cloubic) + claude/opus-4-6(Cloubic)
+# 默认4个: minimax/M2.7(直连) + kimi(直连) + openai/gpt-5.4(Cloubic) + claude/opus-4-6(Cloubic)
 PANEL_PRIORITY = [
-    "qwen", "kimi", "openai", "claude",
-    "grok", "doubao", "gemini", "glm", "deepseek",
-    "minimax", "perplexity",
+    "minimax", "doubao", "openai", "claude",
+    "kimi", "qwen", "grok", "gemini", "glm", "deepseek",
+    "perplexity",
 ]
 
 

@@ -50,7 +50,7 @@ CLOUBIC_MODEL_MAP = {
     "minimax":   os.getenv("CLOUBIC_MINIMAX_MODEL", "MiniMax-M2.5").strip(),
     # 不在 Cloubic 的 provider，映射到 Cloubic 可用模型作为 fallback
     "kimi":      os.getenv("CLOUBIC_KIMI_MODEL", "deepseek-v3.2").strip(),
-    "glm":       os.getenv("CLOUBIC_GLM_MODEL", "deepseek-v3.2").strip(),
+    "glm":       os.getenv("CLOUBIC_GLM_MODEL", "glm-5").strip(),
     "perplexity": os.getenv("CLOUBIC_PERPLEXITY_MODEL", "deepseek-v3.2").strip(),
 }
 
@@ -64,6 +64,7 @@ CLOUBIC_REASONING_MODEL_MAP = {
     "qwen":      os.getenv("CLOUBIC_QWEN_REASONING_MODEL", "qwen3-max-2026-01-23").strip(),
     "doubao":    os.getenv("CLOUBIC_DOUBAO_REASONING_MODEL", "doubao-seed-1-6-251015").strip(),
     "minimax":   os.getenv("CLOUBIC_MINIMAX_REASONING_MODEL", "MiniMax-M2.5").strip(),
+    "glm":       os.getenv("CLOUBIC_GLM_REASONING_MODEL", "glm-5").strip(),
 }
 
 
@@ -163,7 +164,7 @@ def load_config() -> Config:
             "name": "grok",
             "key_env": "GROK_API_KEY",
             "model_env": "GROK_MODEL",
-            "default_model": "grok-4-1-fast-reasoning",
+            "default_model": "grok-4.20",
             "base_url": "https://api.x.ai/v1",
             "use_proxy": True,
         },
@@ -195,7 +196,7 @@ def load_config() -> Config:
             "name": "glm",
             "key_env": "GLM_API_KEY",
             "model_env": "GLM_MODEL",
-            "default_model": "glm-4-plus",
+            "default_model": "glm-5",
             "base_url": "https://open.bigmodel.cn/api/paas/v4",
             "use_proxy": False,
         },
@@ -219,7 +220,7 @@ def load_config() -> Config:
             "name": "minimax",
             "key_env": "MINIMAX_API_KEY",
             "model_env": "MINIMAX_MODEL",
-            "default_model": "MiniMax-M1",
+            "default_model": "MiniMax-M2.7",
             "base_url": "https://api.minimax.chat/v1",
             "use_proxy": False,
         },
