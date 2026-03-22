@@ -14,6 +14,7 @@ A股多智能体选股系统 - PDF投顾报告生成模块
 """
 
 import io
+import json
 import os
 import tempfile
 from datetime import datetime
@@ -1247,6 +1248,7 @@ def generate_overview_image(
     active_models: Optional[List[str]] = None,
     llm_mode: str = "direct",
     output_dir: str = ".",
+    model_results: Optional[List[Dict]] = None,
 ) -> str:
     """
     生成推荐股 + 异动股拼接总览图片（PNG）。
@@ -1273,6 +1275,30 @@ def generate_overview_image(
     stock_profiles = stock_profiles or {}
     fusion_result = fusion_result or []
     mr_result = mr_result or {}
+    model_results = model_results or []
+
+    # ── 构建辩论观点索引 {code: [{model, reasoning, experts, target, stop_loss}]} ──
+    debate_index: Dict[str, List[Dict]] = {}
+    for mr in model_results:
+        model_name = mr.get("model", "")
+        debate_log = mr.get("debate_log", "")
+        if not debate_log or not debate_log.strip().startswith("{"):
+            continue
+        try:
+            parsed_debate = json.loads(debate_log)
+            for dp in parsed_debate.get("picks", []):
+                code = dp.get("code", "")
+                if code:
+                    debate_index.setdefault(code, []).append({
+                        "model": model_name,
+                        "reasoning": dp.get("reasoning", ""),
+                        "experts": dp.get("recommended_by_experts", []),
+                        "target_prices": dp.get("target_prices", {}),
+                        "stop_loss_pct": dp.get("stop_loss_pct", 0),
+                        "score": dp.get("score", 0),
+                    })
+        except (json.JSONDecodeError, TypeError):
+            pass
 
     # ── 构建板块→概念阶段+ETF映射（from MR hype_predictions） ──
     sector_concept_map = {}  # sector_name → {"stage": ..., "etfs": [...]}
@@ -1354,58 +1380,94 @@ def generate_overview_image(
         rec_by = fi.get("recommended_by", [])
         voters_str = ",".join(f"{r['model']}#{r['rank']}" for r in rec_by) if rec_by else ""
 
-        # 推荐理由：从 fusion all_reasonings 或 risk core_logic 提取
-        reasonings = fi.get("all_reasonings", [])
-        if reasonings:
-            # 取第一条理由，去掉 [model] 前缀
-            reason_text = str(reasonings[0])
-            if reason_text.startswith("[") and "]" in reason_text:
-                reason_text = reason_text[reason_text.index("]")+1:].strip()
-        else:
-            reason_text = s.get("core_logic", "")
-            if reason_text.startswith("[") and "]" in reason_text:
-                reason_text = reason_text[reason_text.index("]")+1:].strip()
-            # 截断到第一个分号（去掉后续模型理由）
-            if ";" in reason_text:
-                reason_text = reason_text[:reason_text.index(";")]
-
-        # 风险提示：从 all_reasonings 中智能提取风险/看空句子
+        # ── 从辩论观点构建推荐理由和风险提示 ──
+        debates = debate_index.get(code, [])
         _RISK_KW = [
             "风险", "回调", "追高", "高估", "泡沫", "减持", "质押", "商誉",
             "亏损", "空方", "看空", "下跌", "见顶", "超买", "过热", "利空",
-            "不确定", "谨慎", "回撤", "波动", "拖累", "承压", "困境",
-            "流出", "偏高", "透支", "兑现", "获利了结", "利好出尽",
+            "谨慎", "回撤", "波动", "拖累", "承压", "困境", "流出", "偏高",
+            "透支", "兑现", "获利了结", "利好出尽", "负", "亏",
         ]
-        risk_parts = []
-        # 1) 从 risk_flags 提取（如果 LLM 给了个性化内容）
-        risk_flags = s.get("risk_flags", [])
-        if risk_flags:
-            risk_parts.extend(str(f) for f in risk_flags[:3])
-        # 2) 从 all_reasonings 提取包含风险关键词的句段
-        if not risk_parts:
-            for reason_str in reasonings:
-                r_clean = str(reason_str)
-                if r_clean.startswith("[") and "]" in r_clean:
-                    r_clean = r_clean[r_clean.index("]")+1:].strip()
-                # 按句号/逗号分割，找包含风险关键词的片段
-                for sep in ["。", "，", "；", "，但", "但"]:
-                    r_clean = r_clean.replace(sep, "|")
-                for frag in r_clean.split("|"):
-                    frag = frag.strip()
-                    if frag and any(kw in frag for kw in _RISK_KW):
-                        if frag not in risk_parts and len(frag) > 4:
+        if debates:
+            # 取评分最高模型的辩论观点
+            best = max(debates, key=lambda d: d.get("score", 0))
+            reasoning_full = best.get("reasoning", "")
+
+            # 专家共识 + 目标价
+            experts = best.get("experts", [])
+            expert_str = "+".join(experts) if experts else ""
+            tp = best.get("target_prices", {})
+            tp_base = tp.get("baseline") or tp.get("conservative") or 0
+            sl = best.get("stop_loss_pct", 0)
+
+            # 推荐理由 = 辩论综合观点（截取前半段正面部分）
+            # 策略：整段就是推荐理由，不做句级拆分（辩论结论本身就是综合观点）
+            reason_text = reasoning_full
+            suffix_parts = []
+            if expert_str:
+                suffix_parts.append(f"{expert_str}推荐")
+            if tp_base:
+                suffix_parts.append(f"目标{tp_base:.0f}")
+            if suffix_parts:
+                reason_text += f" ({', '.join(suffix_parts)})"
+
+            # 风险提示：从辩论理由中提取"但/虽"之后的转折句 + 其他模型的不同看法
+            risk_parts = []
+            # 1) 从本模型 reasoning 提取转折后的风险句
+            for marker in ["但", "虽", "不过", "需注意", "警惕"]:
+                idx = reasoning_full.find(marker)
+                if idx > 0:
+                    after = reasoning_full[idx:]
+                    # 截取到句号或末尾
+                    end = len(after)
+                    for sep in ["。", "；"]:
+                        si = after.find(sep)
+                        if si > 0:
+                            end = min(end, si)
+                    frag = after[:end].strip()
+                    if frag and len(frag) > 4 and frag not in risk_parts:
+                        risk_parts.append(frag)
+            # 2) 从其他模型补充不同看法
+            for d in debates:
+                if d["model"] == best["model"]:
+                    continue
+                other_r = d.get("reasoning", "")
+                for marker in ["但", "虽", "不过", "风险", "空方"]:
+                    idx = other_r.find(marker)
+                    if idx >= 0:
+                        after = other_r[idx:]
+                        end = len(after)
+                        for sep in ["。", "；"]:
+                            si = after.find(sep)
+                            if si > 0:
+                                end = min(end, si)
+                        frag = after[:end].strip()
+                        if frag and len(frag) > 4 and frag not in risk_parts:
                             risk_parts.append(frag)
-                if len(risk_parts) >= 2:
-                    break
-        # 3) 软排除原因
-        if code in code_set_excluded:
-            for ex in soft_excluded:
-                if ex.get("code") == code:
-                    reason = ex.get("reason", "")
-                    if reason and reason not in risk_parts:
-                        risk_parts.insert(0, reason)
-                    break
-        risk_text = "；".join(risk_parts[:3]) if risk_parts else ""
+                            break
+            # 3) 止损
+            if sl:
+                risk_parts.append(f"止损{sl}%")
+            risk_text = "；".join(risk_parts[:3]) if risk_parts else ""
+        else:
+            # 无辩论数据，从 all_reasonings 降级提取
+            reasonings = fi.get("all_reasonings", [])
+            if reasonings:
+                r0 = str(reasonings[0])
+                if r0.startswith("[") and "]" in r0:
+                    r0 = r0[r0.index("]")+1:].strip()
+                reason_text = r0
+            else:
+                reason_text = s.get("core_logic", "")
+                if ";" in reason_text:
+                    reason_text = reason_text[:reason_text.index(";")]
+            risk_text = ""
+            # 软排除原因
+            if code in code_set_excluded:
+                for ex in soft_excluded:
+                    if ex.get("code") == code:
+                        risk_text = ex.get("reason", "")
+                        break
 
         # 板块+概念+ETF
         sector_info = sector

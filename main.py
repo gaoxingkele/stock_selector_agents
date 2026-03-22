@@ -1348,6 +1348,7 @@ def run_full_pipeline(
             active_models=active_models,
             llm_mode=get_connection_mode_str(),
             output_dir=REPORTS_DIR,
+            model_results=model_results,
         )
         print(f"  [总览图片] {overview_img}")
     except Exception as e:
