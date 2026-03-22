@@ -1255,6 +1255,36 @@ def run_full_pipeline(
     except Exception as e:
         print(f"  [警告] Step 9 事件驱动分析失败: {e}")
 
+    # ── Step 9.5: Grok Multi-Agent 深度研究（事件驱动增强）─────────
+    if event_result.get("events") and "grok" in cfg.providers:
+        print_section("Step 9.5: Grok Multi-Agent 深度研究（事件验证+扩展）")
+        try:
+            t_step95 = time.time()
+            event_analyst_dr = EventAnalyst(llm, cfg)
+            event_result = event_analyst_dr.deep_research(
+                event_result=event_result,
+                agent_count=4,
+            )
+            if event_result.get("grok_enhanced"):
+                enhanced_events = event_result.get("events", [])
+                print(f"\n  增强后事件（{len(enhanced_events)} 个）:")
+                for evt in enhanced_events:
+                    verified_tag = "✓" if evt.get("verified", True) else "✗"
+                    sentiment = evt.get("social_sentiment", "")
+                    sentiment_tag = f" | 情绪={sentiment}" if sentiment else ""
+                    risks = evt.get("risks", "")
+                    risk_tag = f"\n      风险: {risks[:50]}" if risks else ""
+                    print(f"    {verified_tag} {evt.get('event','')[:40]}")
+                    print(f"      确定性: {evt.get('certainty',0)}%  时效: {evt.get('timeframe','')}{sentiment_tag}")
+                    for b in evt.get("beneficiaries", [])[:5]:
+                        src = " [新发现]" if b.get("source") == "grok_deep_research" else ""
+                        print(f"      → {b.get('code','')} {b.get('name','')} ({b.get('logic','')[:30]}){src}")
+                    print(risk_tag, end="")
+                print()
+            print(f"  ✓ Step 9.5 完成，耗时 {(time.time()-t_step95)/60:.1f} 分钟")
+        except Exception as e:
+            print(f"  [警告] Step 9.5 Grok深度研究失败（降级使用原始EA结果）: {e}")
+
     # ── Step 10: 异动爆发股扫描 ───────────────────────────────────
     print_section("Step 10: 异动爆发股扫描（涨停/放量突破）")
     breakout_result = {"picks": []}

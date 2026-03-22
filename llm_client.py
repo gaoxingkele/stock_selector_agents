@@ -533,6 +533,121 @@ class LLMClient:
             return None
 
     # ------------------------------------------------------------------ #
+    #  Grok Multi-Agent (Responses API)                                  #
+    # ------------------------------------------------------------------ #
+
+    def call_grok_multi_agent(
+        self,
+        prompt: str,
+        agent_count: int = 4,
+        timeout: float = 300.0,
+    ) -> Optional[str]:
+        """
+        调用 Grok Multi-Agent API（/v1/responses 端点）。
+        多个子agent协同深度研究，内置 web_search + x_search。
+
+        agent_count: 4（快速）或 16（深度）
+        返回 leader agent 的最终综合文本，失败返回 None。
+        """
+        # 确定 grok 的 API Key 和 base_url
+        via_cloubic = should_route_via_cloubic("grok")
+        if via_cloubic:
+            api_key = CLOUBIC_API_KEY
+            base_url = CLOUBIC_BASE_URL.rstrip("/")
+        else:
+            prov = self.config.providers.get("grok")
+            if not prov:
+                print("  [Grok MA] grok 未配置，跳过")
+                return None
+            api_key = prov.api_key
+            base_url = prov.base_url.rstrip("/")
+
+        # Responses API 需要直接 HTTP 调用（OpenAI SDK 不支持）
+        url = f"{base_url}/responses"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+        # 根据 agent_count 映射 reasoning.effort
+        effort_map = {4: "low", 8: "medium", 16: "high"}
+        effort = effort_map.get(agent_count, "medium")
+
+        payload = {
+            "model": "grok-4.20-multi-agent",
+            "input": prompt,
+            "reasoning": {"effort": effort},
+        }
+
+        t_call = time.time()
+        log_entry: Dict = {
+            "ts": datetime.now().isoformat(),
+            "provider": "grok",
+            "model": "grok-4.20-multi-agent",
+            "via_cloubic": via_cloubic,
+            "agent_count": agent_count,
+            "input_chars": len(prompt),
+        }
+
+        try:
+            print(
+                f"  [Grok MA] > grok-4.20-multi-agent "
+                f"(effort={effort}, {len(prompt)}ch)...",
+                end="", flush=True,
+            )
+            # 使用独立 httpx 客户端（不走 OpenAI SDK）
+            use_proxy = not via_cloubic and self.proxy
+            client_kwargs: Dict[str, Any] = {"timeout": timeout, "trust_env": False}
+            if use_proxy:
+                client_kwargs["proxy"] = self.proxy
+
+            with httpx.Client(**client_kwargs) as http:
+                resp = http.post(url, headers=headers, json=payload)
+
+            elapsed = round(time.time() - t_call, 2)
+
+            if resp.status_code != 200:
+                err = resp.text[:200]
+                log_entry.update({"status": "fail", "elapsed": elapsed, "error": err})
+                _llm_call_logger.write(log_entry)
+                print(f" FAIL {elapsed:.1f}s HTTP {resp.status_code}: {err[:100]}")
+                return None
+
+            data = resp.json()
+
+            # 提取 output_text（Responses API 格式）
+            output_text = data.get("output_text", "")
+            if not output_text:
+                # fallback: 尝试从 output 数组中提取
+                for item in data.get("output", []):
+                    if item.get("type") == "message":
+                        for block in item.get("content", []):
+                            if block.get("type") == "output_text":
+                                output_text = block.get("text", "")
+                                break
+
+            usage = data.get("usage", {})
+            log_entry.update({
+                "status": "ok",
+                "elapsed": elapsed,
+                "output_chars": len(output_text),
+                "input_tokens": usage.get("input_tokens"),
+                "output_tokens": usage.get("output_tokens"),
+                "total_tokens": usage.get("total_tokens"),
+            })
+            _llm_call_logger.write(log_entry)
+            print(f" OK {elapsed:.1f}s {len(output_text)}ch")
+            return output_text.strip() if output_text else None
+
+        except Exception as exc:
+            elapsed = round(time.time() - t_call, 2)
+            err_str = str(exc)[:300]
+            log_entry.update({"status": "fail", "elapsed": elapsed, "error": err_str})
+            _llm_call_logger.write(log_entry)
+            print(f" FAIL {elapsed:.1f}s: {err_str[:120]}")
+            return None
+
+    # ------------------------------------------------------------------ #
     #  面板多模型调用                                                      #
     # ------------------------------------------------------------------ #
 

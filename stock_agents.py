@@ -3195,6 +3195,165 @@ class EventAnalyst:
             merged, key=lambda e: (-e.get("model_votes", 0), -e.get("certainty", 0))
         )[:5]
 
+    # ------------------------------------------------------------------ #
+    #  Grok Multi-Agent 深度研究（Step 9.5）                               #
+    # ------------------------------------------------------------------ #
+
+    def deep_research(self, event_result: Dict, agent_count: int = 4) -> Dict:
+        """
+        用 Grok Multi-Agent 对 EA 发现的事件做二次深挖。
+        利用内置 web_search + x_search 验证真实性、搜索细节、发现遗漏受益股。
+        失败时返回原始 event_result（降级兜底）。
+        """
+        events = event_result.get("events", [])
+        if not events:
+            return event_result
+
+        # 构建种子事件摘要
+        seed_lines = []
+        for i, evt in enumerate(events[:5], 1):
+            bens = ", ".join(
+                f"{b.get('code','')}{b.get('name','')}"
+                for b in evt.get("beneficiaries", [])[:5]
+            )
+            seed_lines.append(
+                f"{i}. 【{evt.get('event','')}】\n"
+                f"   因果链: {evt.get('causal_chain','')}\n"
+                f"   确定性: {evt.get('certainty',0)}%  时效: {evt.get('timeframe','')}\n"
+                f"   初步受益股: {bens}"
+            )
+
+        prompt = f"""你是A股事件驱动深度研究员。以下是初步分析发现的{len(events)}个事件：
+
+{chr(10).join(seed_lines)}
+
+请用你的搜索能力（web搜索+社交媒体搜索）对每个事件进行深度验证和扩展：
+
+1. **真实性验证**：搜索最新新闻，确认事件是否属实，有无被辟谣或修正
+2. **细节补充**：搜索政策原文、公告细节、时间节点
+3. **市场情绪**：搜索社交媒体讨论热度和情绪倾向（看多/看空/争议）
+4. **遗漏受益股**：基于更完整的信息，补充可能遗漏的A股受益标的
+5. **风险预警**：搜索是否存在利空因素或"利好出尽"风险
+
+返回JSON格式：
+{{
+  "enhanced_events": [
+    {{
+      "event": "事件标题",
+      "verified": true,
+      "verification_note": "搜索验证说明",
+      "causal_chain": "更完整的因果链",
+      "certainty": 85,
+      "timeframe": "即时|中期|长期",
+      "social_sentiment": "热议看多|分歧|冷淡",
+      "beneficiaries": [
+        {{"code": "688295", "name": "中复神鹰", "logic": "碳纤维量产受益", "score": 90}}
+      ],
+      "risks": "可能的风险点",
+      "action": "提前埋伏|低吸|观望"
+    }}
+  ]
+}}
+仅保留verified=true且certainty>=50的事件。"""
+
+        print(f"\n  [Grok MA] 深度研究 {len(events)} 个事件...")
+        result_text = self.llm.call_grok_multi_agent(
+            prompt=prompt,
+            agent_count=agent_count,
+            timeout=300.0,
+        )
+
+        if not result_text:
+            print("  [Grok MA] 深度研究失败，使用原始EA结果（降级）")
+            return event_result
+
+        # 解析增强结果
+        parsed = LLMClient.parse_json(result_text)
+        if not parsed or "enhanced_events" not in parsed:
+            print("  [Grok MA] 解析失败，使用原始EA结果（降级）")
+            return event_result
+
+        enhanced = parsed["enhanced_events"]
+        print(f"  [Grok MA] 深度研究完成: {len(enhanced)} 个验证事件")
+
+        # 合并增强信息回原始事件
+        merged_events = self._merge_enhanced(events, enhanced)
+
+        return {
+            "events": merged_events,
+            "model_count": event_result.get("model_count", 0),
+            "grok_enhanced": True,
+            "enhanced_count": len(enhanced),
+            "raw_grok_text": result_text[:2000],
+        }
+
+    def _merge_enhanced(self, original: list, enhanced: list) -> list:
+        """将 Grok 深度研究结果合并回原始事件列表"""
+        # 建立增强事件索引（按标题关键词匹配）
+        enhanced_map: Dict[str, Dict] = {}
+        for evt in enhanced:
+            title = evt.get("event", "")
+            enhanced_map[title] = evt
+
+        merged = []
+        for orig in original:
+            orig_title = orig.get("event", "")
+            # 尝试匹配增强版
+            matched_enh = None
+            for enh_title, enh in enhanced_map.items():
+                # 简单关键词匹配
+                orig_words = set(w for w in orig_title if len(w) > 1)
+                enh_words = set(w for w in enh_title if len(w) > 1)
+                if orig_words & enh_words:
+                    matched_enh = enh
+                    break
+
+            if matched_enh:
+                # 合并：用增强版覆盖，但保留原始投票信息
+                merged_evt = {**orig}
+                if matched_enh.get("verified") is False:
+                    # 事件被辟谣，标记但保留
+                    merged_evt["verified"] = False
+                    merged_evt["verification_note"] = matched_enh.get("verification_note", "")
+                    merged_evt["certainty"] = max(0, merged_evt.get("certainty", 0) - 30)
+                else:
+                    merged_evt["verified"] = True
+                    merged_evt["verification_note"] = matched_enh.get("verification_note", "")
+                    merged_evt["social_sentiment"] = matched_enh.get("social_sentiment", "")
+                    merged_evt["risks"] = matched_enh.get("risks", "")
+                    # 更新因果链（如果增强版更完整）
+                    enh_chain = matched_enh.get("causal_chain", "")
+                    if len(enh_chain) > len(merged_evt.get("causal_chain", "")):
+                        merged_evt["causal_chain"] = enh_chain
+                    # 补充遗漏的受益股
+                    existing_codes = {
+                        b.get("code") for b in merged_evt.get("beneficiaries", [])
+                    }
+                    for b in matched_enh.get("beneficiaries", []):
+                        if b.get("code") and b["code"] not in existing_codes:
+                            b["source"] = "grok_deep_research"
+                            merged_evt.setdefault("beneficiaries", []).append(b)
+                            existing_codes.add(b["code"])
+                merged.append(merged_evt)
+            else:
+                merged.append(orig)
+
+        # 添加增强版中发现的全新事件
+        for enh_title, enh in enhanced_map.items():
+            is_new = True
+            for m in merged:
+                m_title = m.get("event", "")
+                m_words = set(w for w in m_title if len(w) > 1)
+                e_words = set(w for w in enh_title if len(w) > 1)
+                if m_words & e_words:
+                    is_new = False
+                    break
+            if is_new and enh.get("verified", True) and enh.get("certainty", 0) >= 50:
+                enh["source"] = "grok_deep_research"
+                merged.append(enh)
+
+        return merged
+
 
 # ===================================================================== #
 #  BreakoutAnalyst: 异动爆发股快速分析师                                  #
