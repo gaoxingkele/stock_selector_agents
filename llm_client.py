@@ -604,10 +604,10 @@ class LLMClient:
                 {"http": self.proxy, "https": self.proxy}
                 if use_proxy else None
             )
-            # timeout=(connect, read)：connect 给 60s 防代理不稳定，read 按参数
+            # timeout=(connect, read)：connect 给 300s 防代理不稳定，read 按参数
             resp = _req.post(
                 url, headers=headers, json=payload,
-                proxies=proxies, timeout=(60, timeout),
+                proxies=proxies, timeout=(300, timeout),
             )
 
             elapsed = round(time.time() - t_call, 2)
