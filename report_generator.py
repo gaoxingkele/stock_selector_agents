@@ -1369,26 +1369,43 @@ def generate_overview_image(
             if ";" in reason_text:
                 reason_text = reason_text[:reason_text.index(";")]
 
-        # 风险提示：从 risk_flags / risk_note / position_advice 组合
+        # 风险提示：从 all_reasonings 中智能提取风险/看空句子
+        _RISK_KW = [
+            "风险", "回调", "追高", "高估", "泡沫", "减持", "质押", "商誉",
+            "亏损", "空方", "看空", "下跌", "见顶", "超买", "过热", "利空",
+            "不确定", "谨慎", "回撤", "波动", "拖累", "承压", "困境",
+            "流出", "偏高", "透支", "兑现", "获利了结", "利好出尽",
+        ]
         risk_parts = []
+        # 1) 从 risk_flags 提取（如果 LLM 给了个性化内容）
         risk_flags = s.get("risk_flags", [])
         if risk_flags:
-            risk_parts.append("；".join(str(f) for f in risk_flags[:2]))
-        risk_note = s.get("risk_note", "")
-        if not risk_note and code in code_set_excluded:
+            risk_parts.extend(str(f) for f in risk_flags[:3])
+        # 2) 从 all_reasonings 提取包含风险关键词的句段
+        if not risk_parts:
+            for reason_str in reasonings:
+                r_clean = str(reason_str)
+                if r_clean.startswith("[") and "]" in r_clean:
+                    r_clean = r_clean[r_clean.index("]")+1:].strip()
+                # 按句号/逗号分割，找包含风险关键词的片段
+                for sep in ["。", "，", "；", "，但", "但"]:
+                    r_clean = r_clean.replace(sep, "|")
+                for frag in r_clean.split("|"):
+                    frag = frag.strip()
+                    if frag and any(kw in frag for kw in _RISK_KW):
+                        if frag not in risk_parts and len(frag) > 4:
+                            risk_parts.append(frag)
+                if len(risk_parts) >= 2:
+                    break
+        # 3) 软排除原因
+        if code in code_set_excluded:
             for ex in soft_excluded:
                 if ex.get("code") == code:
-                    risk_note = ex.get("reason", "")
+                    reason = ex.get("reason", "")
+                    if reason and reason not in risk_parts:
+                        risk_parts.insert(0, reason)
                     break
-        if risk_note:
-            risk_parts.append(risk_note)
-        pos_advice = s.get("position_advice", "")
-        stop_loss = s.get("stop_loss", "")
-        if pos_advice:
-            risk_parts.append(pos_advice)
-        if stop_loss:
-            risk_parts.append(f"止损:{stop_loss}")
-        risk_text = " | ".join(risk_parts) if risk_parts else ""
+        risk_text = "；".join(risk_parts[:3]) if risk_parts else ""
 
         # 板块+概念+ETF
         sector_info = sector
