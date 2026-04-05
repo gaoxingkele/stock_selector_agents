@@ -7,12 +7,16 @@ A股多智能体选股系统 - 跨模型融合模块
 并为每支推荐股票标注推荐来源模型。
 """
 
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 
-def borda_fusion(model_results: List[Dict], top_n: int = 10) -> List[Dict]:
+def borda_fusion(
+    model_results: List[Dict],
+    top_n: int = 10,
+    model_weights: Optional[Dict[str, float]] = None,
+) -> List[Dict]:
     """
-    Borda Count 跨模型融合。
+    Borda Count 跨模型融合（支持自适应模型权重）。
 
     输入:
         model_results : [
@@ -22,9 +26,11 @@ def borda_fusion(model_results: List[Dict], top_n: int = 10) -> List[Dict]:
                            "sector": str, "score": float, ...}]
             }
         ]
+        model_weights : 可选，模型Borda乘数 {"grok": 1.2, "claude": 0.8, ...}
+                        准确率高的模型乘数>1，差的<1。None时所有模型等权。
 
     算法:
-        每模型排名第 i 的股票得 (21 - i) 分
+        每模型排名第 i 的股票得 (21 - i) × model_weight 分
         （第1名=20分，第20名=1分，第21名及以后=0分）
 
     输出:
@@ -33,17 +39,21 @@ def borda_fusion(model_results: List[Dict], top_n: int = 10) -> List[Dict]:
             code          : 股票代码
             name          : 股票名称
             sector        : 所属板块
-            borda_score   : 总 Borda 分
+            borda_score   : 总 Borda 分（加权后）
             avg_score     : 各模型给出的平均 score
             model_count   : 推荐该股票的模型数量
             recommended_by: [{"model": str, "rank": int, "score": float}]
             all_reasonings: 各模型给出的理由（最多3条）
     """
+    if model_weights is None:
+        model_weights = {}
+
     stock_data: Dict[str, Dict] = {}
 
     for model_result in model_results:
         model_name = model_result.get("model", "unknown")
         picks = model_result.get("picks", [])
+        weight = model_weights.get(model_name, 1.0)
 
         for pick in picks:
             if not isinstance(pick, dict):
@@ -53,7 +63,7 @@ def borda_fusion(model_results: List[Dict], top_n: int = 10) -> List[Dict]:
                 continue
 
             rank = int(pick.get("rank", 99))
-            borda_pts = max(0, 21 - rank)   # 第1名=20，第20名=1，第21+名=0
+            borda_pts = max(0, 21 - rank) * weight  # 加权 Borda 分
             score = float(pick.get("score", 70))
 
             if code not in stock_data:

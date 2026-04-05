@@ -801,6 +801,11 @@ def run_link_b_pipeline(
         print("\n  [错误] 无可用LLM模型！")
         return {}
 
+    # ── 加载自适应权重 ─────────────────────────────────────────
+    if cfg.load_adaptive_weights() and cfg.model_weights:
+        mw_str = ", ".join(f"{m}=×{w:.2f}" for m, w in sorted(cfg.model_weights.items(), key=lambda x: -x[1]))
+        print(f"  [自适应] 模型权重: {mw_str}")
+
     # ── MR2: 精简市场雷达 ─────────────────────────────────────────
     print_section("MR2: 精简市场雷达")
     t_mr2 = time.time()
@@ -959,7 +964,7 @@ def run_link_b_pipeline(
     print_section("Borda: 跨模型融合")
     t_borda = time.time()
     print(f"\n  ── 参与融合 {len(model_results_for_borda)} 个模型的排序结果...")
-    final_top10 = borda_fusion(model_results_for_borda, top_n=25)
+    final_top10 = borda_fusion(model_results_for_borda, top_n=25, model_weights=cfg.model_weights or None)
 
     print(f"\n  融合结果 Top {len(final_top10)}:")
     for pick in final_top10:
@@ -1066,6 +1071,17 @@ def run_link_b_pipeline(
         )
     except Exception as e:
         print(f"  [警告] 总览图片生成失败: {e}")
+
+    # ── 绩效追踪 ──────────────────────────────────────────────
+    try:
+        from perf_tracker import PerformanceTracker
+        tracker = PerformanceTracker()
+        evaluated = tracker.evaluate_all()
+        if evaluated:
+            weights = tracker.compute_adaptive_weights()
+            print(f"  [绩效] 自适应权重已更新（{weights.get('data_points',0)}个数据点）")
+    except Exception as e:
+        print(f"  [绩效] {e}")
 
     # ── 完成 ──────────────────────────────────────────────────
     total_time = (time.time() - start_time) / 60
@@ -1320,6 +1336,17 @@ def run_full_pipeline(
         print()
 
     llm.set_active_models(active_models)
+
+    # ── 加载自适应权重（绩效追踪模块输出）──────────────────────────
+    if cfg.load_adaptive_weights():
+        mw = cfg.model_weights
+        if mw:
+            mw_str = ", ".join(f"{m}=×{w:.2f}" for m, w in sorted(mw.items(), key=lambda x: -x[1]))
+            print(f"  [自适应] 模型权重已加载: {mw_str}")
+        else:
+            print(f"  [自适应] 专家权重已加载（模型等权）")
+    else:
+        print(f"  [自适应] 使用默认权重（无历史绩效数据）")
 
     # ── Step 0: 市场雷达（大盘+情绪+概念炒作预判+ETF）────────────
     # 非个股直选模式时执行，为后续板块优选提供市场环境上下文
@@ -1812,7 +1839,7 @@ def run_full_pipeline(
     t_step5 = time.time()
     logger.log("fusion_start", detail={"model_count": len(model_results_for_borda)})
 
-    final_top10 = borda_fusion(model_results_for_borda, top_n=25)
+    final_top10 = borda_fusion(model_results_for_borda, top_n=25, model_weights=cfg.model_weights or None)
 
     logger.log("fusion_done", detail={"top_n": len(final_top10)})
 
@@ -2039,6 +2066,37 @@ def run_full_pipeline(
 
     logger.log("pipeline_done", detail={"message": "完整流程结束"})
 
+    # ── 绩效追踪：回测历史推荐 + 更新自适应权重 ──────────────────
+    try:
+        from perf_tracker import PerformanceTracker
+        print_section("绩效追踪（回测历史推荐 + 自适应权重更新）")
+        tracker = PerformanceTracker()
+        # 评估所有有数据但未评估的历史推荐
+        evaluated = tracker.evaluate_all()
+        if evaluated:
+            # 输出最近一次的 T+5 汇总
+            latest = max(evaluated, key=lambda x: x.get("rec_date", ""))
+            s5 = latest.get("summary_t5", {})
+            if s5:
+                print(f"  [绩效] 最近回测({latest['rec_date']}): "
+                      f"T+5胜率={s5['win_rate']:.1f}% 均收益={s5['avg_return']:+.2f}%")
+            # 计算并保存自适应权重
+            weights = tracker.compute_adaptive_weights()
+            mw = weights.get("model_weights", {})
+            if mw:
+                print(f"  [自适应] 权重已更新（{weights['data_points']}个数据点）")
+                for m, w in sorted(mw.items(), key=lambda x: -x[1]):
+                    print(f"    {m}: ×{w:.3f}")
+            be = weights.get("borda_effectiveness")
+            if be:
+                print(f"  [Borda有效性] 高分胜率={be['high_borda_win_rate']:.1f}% "
+                      f"低分胜率={be['low_borda_win_rate']:.1f}% "
+                      f"差值={be['spread']:+.1f}pp")
+        else:
+            print(f"  [绩效] 无可评估的历史推荐或T+5尚未到期")
+    except Exception as e:
+        print(f"  [绩效] 追踪失败（不影响主流程）: {e}")
+
     elapsed = time.time() - start_time
     print(f"\n  [完成] 总耗时: {elapsed/60:.1f} 分钟")
     print(f"  [文本报告] {report_path}")
@@ -2163,6 +2221,11 @@ def main():
         choices=["a", "b", "both"],
         help="选择链路: a=链路A(原有MR→SP→GX→E1-E7), b=链路B(MR2→L1→L2→L3), both=两条都跑",
     )
+    parser.add_argument(
+        "--perf",
+        action="store_true",
+        help="运行绩效追踪（回测历史推荐+输出自适应权重），不运行选股流程",
+    )
 
     args = parser.parse_args()
 
@@ -2194,6 +2257,14 @@ def main():
                 tag = " [代理]" if prov.use_proxy else " [直连]"
             vision_str = f" | vision={prov.vision_model}" if prov.vision_model else ""
             print(f"    {name}: {prov.model}{tag}{vision_str}")
+        return
+
+    # 绩效追踪模式
+    if args.perf:
+        from perf_tracker import PerformanceTracker
+        tracker = PerformanceTracker()
+        tracker.evaluate_all()
+        tracker.print_report()
         return
 
     # 演示模式

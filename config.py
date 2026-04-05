@@ -131,6 +131,30 @@ class Config:
         "E6": 0.10,  # 事件催化型
     })
 
+    # 模型 Borda 权重乘数（由 perf_tracker 自适应计算）
+    # 准确率高的模型 >1.0，差的 <1.0，默认空=等权
+    model_weights: Dict[str, float] = field(default_factory=dict)
+
+    def load_adaptive_weights(self) -> bool:
+        """
+        从 perf_tracker 输出的自适应权重文件加载 expert_weights 和 model_weights。
+        返回 True 表示成功加载，False 表示使用默认。
+        """
+        try:
+            from perf_tracker import PerformanceTracker
+            data = PerformanceTracker.load_adaptive_weights()
+            if data and data.get("source") == "adaptive":
+                ew = data.get("expert_weights")
+                if ew:
+                    self.expert_weights = ew
+                mw = data.get("model_weights")
+                if mw:
+                    self.model_weights = mw
+                return True
+        except Exception:
+            pass
+        return False
+
     def get_available_providers(self) -> List[str]:
         return list(self.providers.keys())
 

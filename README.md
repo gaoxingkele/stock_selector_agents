@@ -378,6 +378,11 @@ python main.py --link both                         # 先跑A再跑B
 python run_l1.py                                   # 仅运行L1量化过滤
 python run_b_from_l2.py                            # 从L2结果继续（复用已有L2数据）
 
+# ── 绩效追踪 ────────────────────────────────────────────────
+python main.py --perf                              # 回测所有历史推荐+输出绩效报告
+python perf_tracker.py --report                    # 独立绩效报告+自适应权重建议
+python backtest.py --date 20260320                 # 回测指定日期推荐
+
 # ── 通用选项 ────────────────────────────────────────────────
 python main.py --cloubic                           # 强制 Cloubic 路由
 python main.py --direct                            # 强制全部直连
@@ -399,6 +404,7 @@ python main.py --config                            # 查看当前配置
 | `--max-stocks` / `-m` | `25` | 每板块最多分析股票数 |
 | `--no-parallel` | 关闭 | 关闭模型并行，改为顺序执行 |
 | `--no-confirm` | 关闭 | 跳过手动确认（链路B的L2→L3衔接处） |
+| `--perf` | — | 运行绩效追踪（回测历史+输出自适应权重），不运行选股 |
 | `--strategist` | 禁用 | 启用首席策略师（Step 5.5，仅链路A） |
 | `--cloubic` | — | 强制启用 Cloubic 路由 |
 | `--direct` | — | 强制全部直连 |
@@ -420,6 +426,7 @@ stock_selector_agents/
 ├── fusion.py             # Borda Count 跨模型融合（归一化 + 多级排序）
 ├── work_logger.py        # JSONL结构化日志 + 控制台输出
 ├── report_generator.py   # PDF投研报告 + L3看图判定表 + 总览图片生成
+├── perf_tracker.py       # 绩效追踪（T+3/5/8回测+自适应权重+per-model统计）
 ├── memory.py             # 决策记忆系统（存储/检索/反思）
 ├── Ashare.py             # Ashare数据源接口
 ├── requirements.txt      # Python依赖
@@ -492,6 +499,12 @@ stock_selector_agents/
 - **L2 缠论+波浪双重确认**：分型/笔段/买点识别 + Elliott波浪量价齐升信号
 - **L3 多模型看图投票**：K线图+指标图自动生成，多LLM并行看图，Borda融合共识
 - **独立脚本**：`run_l1.py` / `run_b_from_l2.py` 支持分步运行和断点续接
+
+### 绩效闭环
+- **T+3/T+5/T+8 多周期回测**：自动追踪历史推荐的实际涨幅，存入绩效数据库
+- **Per-model 绩效统计**：追踪每个LLM模型的推荐准确率（胜率/均收益/盈亏比）
+- **自适应模型权重**：根据近30天绩效自动调整Borda融合中的模型乘数（准的加权，差的降权）
+- **Borda 有效性检验**：验证高Borda分股票是否确实比低分股票表现更好
 
 ### 共用基础设施
 - **Preflight 连通性预检**：启动前并行测试所有数据源和LLM模型的连通性
