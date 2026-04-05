@@ -1068,9 +1068,13 @@ top5 数量恰好为5个，按综合评分从高到低排列。"""
                     f"  模型=[{', '.join(s['models'])}]"
                 )
 
+        # all_sectors: 完整排名（供多样性约束补充用）
+        all_sector_names = [s["sector_name"] for s in ranked]
+
         return {
             "top5_sectors": top5,
             "sector_names": sector_names,
+            "all_sectors": all_sector_names,
             "vote_detail": vote_map,
             "raw_results": raw_results,
             "total_models_voted": len(raw_results),
@@ -1730,40 +1734,37 @@ class GrowthExpert(BaseAgent):
     EXPERT_NAME = "成长估值型专家"
 
     def _system_prompt(self) -> str:
-        return """你是A股成长估值型选股专家（代号E2），从中线视角寻找兼具成长性和安全边际的股票。
+        return """你是A股成长估值型选股专家（代号E2），从短线视角寻找基本面无硬伤且技术面启动的股票。
 
-【核心逻辑】："好赛道 + 好业绩 + 合理估值 = 安全边际 + 弹性空间"
+【核心逻辑】："技术启动 + 基本面无雷 + 资金共振 = 短线安全边际"
 
 【分析框架】
-1. 成长指标（权重40%）
-   - 最近一季度营收同比增长 > 15%（核心指标）
-   - 净利润增长 > 10%，且方向向上
-   - ROE > 12%（盈利质量好）
-   - 毛利率稳定或提升（护城河信号）
+1. 技术确认（权重50%）★★★ 最重要
+   - 日线上升趋势（MA5/MA10向上，价格站上MA10）
+   - 5日量能放大（量比>1.2），量价配合
+   - MACD金叉或零轴上方红柱放大
+   - 近5日主力净流入为正或转正
 
-2. 估值弹性（权重30%）
-   - 总市值在50-500亿（弹性区间，非巨无霸）
-   - PE处于行业合理区间（非极端高估）
-   - PEG < 1.5（成长匹配估值）
-   - PB < 5（非恶意溢价）
+2. 基本面底线（权重25%）★★ 排雷用
+   - 最近一期净利润为正（不亏损即可）
+   - 资产负债率<70%（排除高杠杆）
+   - 无商誉爆雷风险（商誉占净资产<30%）
+   - 无重要股东大规模减持
 
-3. 技术确认（权重30%）
-   - 日线上升趋势（MA20向上，价格>MA20）
-   - 量能适度放大（非暴量）
-   - 月线和周线同向（三线共振更佳）
-   - 近20日主力净流入为正或转正
+3. 估值弹性（权重25%）
+   - 总市值在30-500亿（弹性区间）
+   - PE不极端高估（不超同行业3倍）
+   - 流通盘适中，利于短线资金进出
 
 【排除信号】
-- 营收连续2期下滑
 - 净利润由正转负
-- 商誉占净资产>30%（商誉雷风险）
-- 资产负债率>70%（高杠杆）
+- 资产负债率>70%
 - 大股东质押率>80%
-- 近期有减持公告（重要股东大规模）
+- 近期有重要股东大规模减持
 
 【持仓策略】
-- 持有周期：10-30个交易日
-- 止损：跌破MA20均线或最高点回撤-10%""" + _RESEARCH_INSTRUCTION
+- 持有周期：3-8个交易日
+- 止损：跌破MA5均线或最高点回撤-7%""" + _RESEARCH_INSTRUCTION
 
 
 # ===================================================================== #
@@ -1777,29 +1778,28 @@ class MultiFactorExpert(BaseAgent):
     EXPERT_NAME = "多因子平衡型专家"
 
     def _system_prompt(self) -> str:
-        return """你是A股多因子平衡型选股专家（代号E3），通过综合打分模型选出最稳健的强势股。
+        return """你是A股多因子平衡型选股专家（代号E3），通过综合打分模型选出短线最具爆发力的强势股。
 
-【核心逻辑】："不选最强，选最稳的强——质量×动量×流动性三维平衡"
+【核心逻辑】："动量为王，量价共振，基本面排雷——短线三维平衡"
 
 【综合评分模型（满分100分）】
-1. 质量因子（35分）
-   - ROE ≥ 15%：+10分；10%-15%：+6分；<10%：+2分
-   - 毛利率 ≥ 30%：+8分；20%-30%：+5分；<20%：+2分
-   - 净利率 ≥ 10%：+8分；5%-10%：+5分；<5%：+2分
-   - 资产负债率 < 50%：+5分；50%-70%：+3分；>70%：0分
-   - 近两期净利润持续增长：+4分
-
-2. 动量因子（35分）
+1. 动量因子（40分）★★★ 最重要
    - 20日涨幅排名前10%：+12分；前30%：+8分；前50%：+4分
-   - 5日涨幅>3%且<15%：+8分（动量好但未过热）
-   - 日线均线多头排列（MA5>MA10>MA20）：+8分
-   - MACD零轴上方金叉：+5分；金叉在零轴下方：+3分
+   - 5日涨幅>3%且<15%：+10分（动量好但未过热）
+   - 日线均线多头排列（MA5>MA10>MA20）：+10分
+   - MACD零轴上方金叉：+6分；金叉在零轴下方：+3分
    - ⚠️ 5日涨幅>20%：扣10分（过热惩罚）
 
-3. 流动性因子（30分）
-   - 20日日均成交额>1亿：+10分；>5000万：+6分
-   - 近5日换手率/60日均值：1.2-2.5倍得+10分；2.5-4倍得+5分；>4倍得0分
+2. 流动性因子（40分）★★★
+   - 20日日均成交额>1亿：+12分；>5000万：+8分
+   - 近5日换手率/60日均值：1.2-2.5倍得+12分；2.5-4倍得+6分；>4倍得0分
    - 量价配合良好（放量上涨/缩量回调）：+10分
+   - 近5日主力资金净流入为正：+6分
+
+3. 质量底线（20分）★ 排雷用
+   - 净利润为正（不亏损）：+8分
+   - 资产负债率 < 70%：+6分
+   - ROE > 5%：+6分
 
 【特殊规则】
 - S级（90+分）：重点推荐
@@ -1808,8 +1808,8 @@ class MultiFactorExpert(BaseAgent):
 - C级及以下：不推荐
 
 【持仓策略】
-- 持有周期：5-20个交易日
-- 止损：跌破MA10均线或-8%""" + _RESEARCH_INSTRUCTION
+- 持有周期：3-8个交易日
+- 止损：跌破MA5均线或-7%""" + _RESEARCH_INSTRUCTION
 
 
 # ===================================================================== #
@@ -3827,3 +3827,242 @@ picks 数量：选出15-25支，按信心度从高到低排名。如候选池不
             }
             for i, s in enumerate(sorted_pool[:20])
         ]
+
+
+# ===================================================================== #
+#  MarketRadarLite (MR2): 精简市场雷达 — 链路B专用                        #
+# ===================================================================== #
+
+class MarketRadarLite:
+    """
+    MR2 — 精简版市场雷达（链路B专用）。
+
+    只输出:
+    1. 大盘环境（偏多/震荡/偏空）
+    2. 情绪温度（亢奋/正常/冷淡）
+    3. 仓位建议
+
+    不调用 SP/GX 全面板投票，开销小。
+    """
+
+    SYSTEM_PROMPT = """你是A股市场环境分析师（代号MR2），只需快速判断三点：
+
+【大盘环境】
+- "偏多"：均线多头排列或指数站上MA5/MA10
+- "震荡"：指数在均线附近反复穿越
+- "偏空"：均线空头排列或指数跌破MA5/MA10
+
+【情绪温度】
+- "亢奋"：涨停>80只 or 最高板≥5
+- "正常"：涨停40-80只
+- "冷淡"：涨停<40只
+
+【仓位建议】
+- 偏多：7-8成
+- 震荡：4-5成
+- 偏空：2-3成
+
+返回JSON：
+{
+  "trend": "偏多/震荡/偏空",
+  "reason": "判断依据（50字以内）",
+  "sentiment": "亢奋/正常/冷淡",
+  "position_hint": "7-8成/4-5成/2-3成"
+}"""
+
+    def __init__(self, llm: LLMClient, config: Config):
+        self.llm = llm
+        self.config = config
+
+    def run(self, market_indices: Dict, sentiment: Dict) -> Dict:
+        """运行精简市场雷达"""
+        # 构建输入文本
+        lines = ["【大盘指数】"]
+        for name, info in market_indices.items():
+            changes = info.get("changes", {})
+            ma = info.get("ma", {})
+            chg_str = " | ".join(f"{k}={v}%" for k, v in changes.items())
+            ma_str = " ".join(f"{k}={v}" for k, v in ma.items())
+            lines.append(f"  {name}: {chg_str} | 均线: {ma_str}")
+
+        lines.append("\n【情绪指标】")
+        lines.append(f"  涨停: {sentiment.get('zt_count', 'N/A')}只")
+        lines.append(f"  连板最高: {sentiment.get('max_lianban', 'N/A')}板")
+        lines.append(f"  炸板率: {sentiment.get('zha_ban_rate', 'N/A')}")
+
+        text = "\n".join(lines)
+
+        msgs = [
+            {"role": "system", "content": self.SYSTEM_PROMPT},
+            {"role": "user", "content": f"{text}\n\n请分析上述数据，给出JSON判断："},
+        ]
+        provider = self.config.primary_provider or "qwen"
+        resp = self.llm.call(provider, msgs, temperature=0.3)
+        parsed = self.llm.parse_json(resp) if resp else {}
+        return {
+            "trend": parsed.get("trend", "震荡"),
+            "reason": parsed.get("reason", ""),
+            "sentiment": parsed.get("sentiment", "正常"),
+            "position_hint": parsed.get("position_hint", "4-5成"),
+            "raw": parsed,
+        }
+
+
+# ===================================================================== #
+#  ChartAnalyst: L3 K线图分析师 — 链路B专用                             #
+# ===================================================================== #
+
+class ChartAnalyst:
+    """
+    L3 — K线图分析师（链路B专用）。
+
+    对 L2 输出的候选股（已生成K线图截图），调用多模型并行看图判定，
+    选出最终推荐股票。
+    """
+
+    SYSTEM_PROMPT = """你是A股技术图表分析师，擅长通过K线形态和指标判断买卖时机。
+
+【图表阅读顺序】
+1. 先看K线整体形态：趋势方向、近期走势特征
+2. 再看均线：MA5/MA10/MA20 排列（多头/空头/纠缠）
+3. 再看MACD：是否在零轴上方、DIF与DEA交叉方向、柱线颜色与长度变化
+4. 再看KDJ：是否超买超卖区、J值方向、KD金叉死叉
+5. 再看RSI：当前RSI值所处区间（<30低估/30-70正常/>70高估）
+
+【评判标准】
+- K线在均线多头排列上方 + MACD零轴上金叉 + KDJ低位金叉 = 强买入信号
+- K线在均线下方 + MACD零轴下死叉 + KDJ高位死叉 = 强卖出信号
+- 各指标方向不一致 = 震荡观望，不参与
+
+【输出格式】
+请返回JSON：
+{
+  "picks": [
+    {
+      "code": "股票代码",
+      "name": "名称",
+      "signal": "强买入/买入/观望/卖出",
+      "key_reasons": ["理由1", "理由2"],
+      "risk_notes": ["风险1"]
+    }
+  ]
+}
+仅保留signal为"强买入"或"买入"的，按signal强度和K线质量排序。"""
+
+    def __init__(self, llm: LLMClient, config: Config):
+        self.llm = llm
+        self.config = config
+
+    def analyze(self, candidates: List[Dict], chart_paths: Dict[str, Dict[str, str]],
+               providers: List[str], panel_size: int = 4) -> Dict:
+        """
+        多模型并行看图判定。
+
+        参数:
+            candidates: L2 输出的候选股列表
+            chart_paths: {code: {"chart": path}}
+            providers: 并行调用的模型列表
+            panel_size: 最大并行模型数
+
+        返回:
+            {"picks": [...], "model_results": [...]}
+        """
+        if not candidates:
+            return {"picks": [], "model_results": []}
+
+        # 构建输入文本
+        lines = ["【候选股票K线图路径】"]
+        for stock in candidates:
+            code = stock["code"]
+            name = stock["name"]
+            path = chart_paths.get(code, {}).get("chart", "（图表未生成）")
+            ma_ok = stock.get("ma_ok", True)
+            vol_ok = stock.get("vol_ok", True)
+            chan_signal = stock.get("chan_buy_detail", "")
+            wave_signal = stock.get("wave_bull_detail", "")
+
+            # 简要形态描述
+            signals = []
+            if chan_signal: signals.append(chan_signal)
+            if wave_signal: signals.append(wave_signal)
+            signal_str = " | ".join(signals) if signals else "待图表确认"
+
+            lines.append(
+                f"  {code} {name} | 图表: {path} | "
+                f"形态信号: {signal_str}"
+            )
+
+        text = "\n".join(lines)
+
+        # 多模型并行调用
+        import concurrent.futures
+
+        def _call_model(provider: str) -> Dict:
+            msgs = [
+                {"role": "system", "content": self.SYSTEM_PROMPT},
+                {"role": "user", "content": f"{text}\n\n请仔细分析上述股票的图表，输出JSON："},
+            ]
+            resp = self.llm.call(provider, msgs, temperature=0.3)
+            parsed = self.llm.parse_json(resp) if resp else {}
+            return {
+                "model": provider,
+                "picks": parsed.get("picks", []),
+                "raw": resp or "",
+            }
+
+        results = []
+        active = providers[:panel_size]
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(active)) as executor:
+            futures = {executor.submit(_call_model, p): p for p in active}
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    results.append(future.result())
+                except Exception as e:
+                    provider = futures[future]
+                    results.append({"model": provider, "picks": [], "error": str(e)})
+
+        # 汇总各模型推荐
+        all_picks: Dict[str, Dict] = {}
+        for res in results:
+            for pick in res.get("picks", []):
+                code = str(pick.get("code", "")).strip()
+                if not code:
+                    continue
+                signal = str(pick.get("signal", ""))
+                if code not in all_picks:
+                    all_picks[code] = {
+                        "code": code,
+                        "name": str(pick.get("name", "")),
+                        "signal": signal,
+                        "signal_score": 3 if signal == "强买入" else (2 if signal == "买入" else 1),
+                        "reasons": pick.get("key_reasons", []),
+                        "models": [],
+                    }
+                all_picks[code]["models"].append(res["model"])
+
+        # 按信号强度 × 推荐模型数量排序
+        sorted_picks = sorted(
+            all_picks.values(),
+            key=lambda x: (x["signal_score"], len(x["models"])),
+            reverse=True,
+        )
+
+        final_picks = []
+        for i, p in enumerate(sorted_picks):
+            final_picks.append({
+                "rank": i + 1,
+                "code": p["code"],
+                "name": p["name"],
+                "signal": p["signal"],
+                "score": p["signal_score"] * 20 + len(p["models"]) * 5,
+                "reasoning": " | ".join(p["reasons"][:2]) if p["reasons"] else "",
+                "model_count": len(p["models"]),
+                "recommended_by": p["models"],
+            })
+
+        return {
+            "picks": final_picks,
+            "model_results": results,
+        }
+

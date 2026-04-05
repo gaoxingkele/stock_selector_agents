@@ -28,12 +28,7 @@ env/
 .env/
 
 # Output directories (generated files)
-output/data/
-output/logs/
-output/charts/
-# Keep reports directory but ignore generated files
-output/reports/*.pdf
-output/reports/*.txt
+output/
 
 # IDE & editor
 .vscode/
@@ -46,6 +41,9 @@ output/reports/*.txt
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# External repos
+chan/
 
 # Claude internal
 .claude/

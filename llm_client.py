@@ -315,6 +315,90 @@ class LLMClient:
         self._clients.clear()
 
     # ------------------------------------------------------------------ #
+    #  启动前连通性预检                                                    #
+    # ------------------------------------------------------------------ #
+
+    def preflight_check(
+        self,
+        providers: Optional[List[str]] = None,
+        connect_timeout: float = 10.0,
+    ) -> List[Dict]:
+        """
+        并行测试所有 provider 的连通性（GET /models，仅测 connect）。
+
+        返回按 PANEL_PRIORITY 排序的结果列表:
+        [{"name", "model", "route", "latency", "ok", "error"}, ...]
+        """
+        import concurrent.futures
+
+        if providers is None:
+            # 按 PANEL_PRIORITY 排序，补充不在优先级列表中的
+            providers = [p for p in PANEL_PRIORITY if p in self.config.providers]
+            for p in self.config.providers:
+                if p not in providers:
+                    providers.append(p)
+
+        def _test_one(name: str) -> Dict:
+            prov = self.config.providers[name]
+            via_cloubic = should_route_via_cloubic(name)
+            if via_cloubic:
+                base_url = CLOUBIC_BASE_URL
+                api_key = CLOUBIC_API_KEY
+                model = CLOUBIC_MODEL_MAP.get(name, prov.model)
+                route = "Cloubic"
+            else:
+                base_url = prov.base_url
+                api_key = prov.api_key
+                model = prov.model
+                route = "Proxy" if prov.use_proxy else "Direct"
+
+            test_url = base_url.rstrip("/") + "/models"
+            use_proxy = (not via_cloubic) and prov.use_proxy and self.proxy
+
+            # 严格超时：connect + read 均限制在 connect_timeout 内
+            _timeout = httpx.Timeout(connect_timeout, connect=connect_timeout)
+
+            t = time.time()
+            try:
+                if use_proxy:
+                    client = httpx.Client(proxy=self.proxy, timeout=_timeout)
+                else:
+                    client = httpx.Client(timeout=_timeout, trust_env=False)
+                r = client.get(
+                    test_url,
+                    headers={"Authorization": f"Bearer {api_key[:8]}..."},
+                )
+                latency = round(time.time() - t, 2)
+                client.close()
+                # 任何 HTTP 响应（包括 401/404）都说明网络连通
+                return {
+                    "name": name, "model": model, "route": route,
+                    "latency": latency, "ok": True, "error": "",
+                }
+            except Exception as e:
+                latency = round(time.time() - t, 2)
+                try:
+                    client.close()
+                except Exception:
+                    pass
+                return {
+                    "name": name, "model": model, "route": route,
+                    "latency": latency, "ok": False,
+                    "error": str(e)[:80],
+                }
+
+        # 并行测试所有 provider
+        results_map: Dict[str, Dict] = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(providers)) as executor:
+            futures = {executor.submit(_test_one, name): name for name in providers}
+            for future in concurrent.futures.as_completed(futures):
+                name = futures[future]
+                results_map[name] = future.result()
+
+        # 按 providers 顺序（即 PANEL_PRIORITY 顺序）返回
+        return [results_map[name] for name in providers]
+
+    # ------------------------------------------------------------------ #
     #  单模型调用                                                          #
     # ------------------------------------------------------------------ #
 

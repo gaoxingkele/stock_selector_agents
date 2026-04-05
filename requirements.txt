@@ -15,3 +15,9 @@ requests>=2.31.0
 reportlab>=4.0.0
 matplotlib>=3.7.0
 mplfinance>=0.12.9
+# 链路B量化依赖
+chan>=1.0.0
+pandas-ta>=0.3.14b
+# TA-Lib: 需要先安装 C 库，再 pip install TA-Lib
+# Windows 二进制: https://github.com/cgohlke/talib-build/releases
+# 或使用 conda: conda install -c conda-forge ta-lib

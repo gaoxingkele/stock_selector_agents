@@ -51,6 +51,8 @@ from stock_agents import (
     RiskController,
     EventAnalyst,
     BreakoutAnalyst,
+    MarketRadarLite,
+    ChartAnalyst,
 )
 from fusion import borda_fusion
 from work_logger import WorkLogger
@@ -290,6 +292,128 @@ def fusion_to_arb_result(final_top: List[Dict]) -> Dict:
         "candidate_pool": {},
         "total_candidates": len(final_top),
     }
+
+
+class _NoOpLogger:
+    """无操作 logger，self.logger 为 None 时使用"""
+    def log(self, *args, **kwargs): pass
+
+def run_expert_debate_after_borda(
+    borda_top: List[Dict],
+    stock_packages: Dict,
+    llm,
+    cfg,
+    active_models: List[str],
+    n_top: int = 15,
+    verbose: bool = True,
+) -> List[Dict]:
+    """
+    在 Borda 融合之后运行 E1-E7 专家辩论，对 top N 股票进行深度逻辑验证。
+    使用单个最优先模型运行完整 E1→E7 + 多空辩论流程。
+
+    返回: enriched picks列表，每项含 extra_warnings, expert_reasoning, expert_debate_log
+    """
+    from stock_agents import ModelTask
+
+    if not borda_top:
+        return []
+
+    top_stocks = borda_top[:n_top]
+    codes = [p["code"] for p in top_stocks]
+    if verbose:
+        print(f"\n  [E1-E7辩论] 对 Borda Top {len(top_stocks)} 只进行专家辩论验证...")
+
+    # 构建 minimal stock_profiles（供 E1-E7 使用）
+    stock_profiles: Dict[str, str] = {}
+    for code in codes:
+        pkg = stock_packages.get(code, {})
+        rt = pkg.get("realtime", {})
+        name = rt.get("名称", rt.get("name", code))
+        pe = rt.get("市盈率-动态", rt.get("市盈率", "N/A"))
+        pb = rt.get("市净率", "N/A")
+        mktcap = rt.get("总市值", "N/A")
+        # 从 Borda 结果找评分
+        borda_score = next((p["borda_score"] for p in borda_top if p["code"] == code), 0)
+        profile = (
+            f"{name}({code}) | 板块={next((p['sector'] for p in borda_top if p['code'] == code), '')} "
+            f"| PE={pe} PB={pb} 市值={mktcap} | Borda={borda_score:.0f}分"
+        )
+        stock_profiles[code] = profile
+
+    # 使用最优模型运行完整 E1-E7 + 辩论
+    primary_model = active_models[0] if active_models else "openai"
+    if verbose:
+        print(f"  [E1-E7辩论] 使用模型: {primary_model}")
+
+    task = ModelTask(
+        provider_name=primary_model,
+        llm_client=llm,
+        config=cfg,
+        logger=_NoOpLogger(),
+        stock_profiles=stock_profiles,
+        stock_packages={code: stock_packages.get(code, {}) for code in codes},
+    )
+    t_debate = time.time()
+    try:
+        result = task.run()
+    except Exception as e:
+        if verbose:
+            print(f"  [E1-E7辩论] 失败: {e}")
+        return []
+
+    elapsed = time.time() - t_debate
+    if verbose:
+        print(f"  [E1-E7辩论] 完成，耗时 {elapsed/60:.1f} 分钟")
+
+    # 解析辩论结果，构建 warning 和 reasoning
+    debate_warnings: Dict[str, List[str]] = {}
+    debate_reasoning: Dict[str, str] = {}
+
+    try:
+        debate_log = result.get("debate_log", "")
+        if debate_log and debate_log.strip().startswith("{"):
+            parsed = json.loads(debate_log)
+            # Bear warnings
+            for w in parsed.get("bear_warnings", []):
+                c = w.get("code", "")
+                risk_pts = w.get("risk_points", [])
+                verdict = w.get("verdict", "")
+                if verdict in ("降级", "淘汰") and risk_pts:
+                    debate_warnings.setdefault(c, []).extend(risk_pts[:2])
+            # Bull picks reasoning
+            for p in parsed.get("bull_picks", []):
+                c = p.get("code", "")
+                reasons = p.get("buy_reasons", [])
+                debate_reasoning[c] = " | ".join(reasons[:2]) if reasons else ""
+    except (json.JSONDecodeError, Exception):
+        pass
+
+    # 构建 expert_logs 摘要（供 expert_summary PDF 使用）
+    expert_logs_summary: Dict[str, Dict] = result.get("expert_logs", {})
+
+    # 将辩论结果合并到原始 Borda picks
+    enriched = []
+    for pick in borda_top:
+        code = pick["code"]
+        extra_warns = debate_warnings.get(code, [])
+        reasoning = debate_reasoning.get(code, "")
+        all_reasonings = pick.get("all_reasonings", [])
+        if reasoning and reasoning not in all_reasonings:
+            all_reasonings = [reasoning] + all_reasonings
+        enriched.append({
+            **pick,
+            "warnings": list(pick.get("warnings", [])) + extra_warns,
+            "expert_reasoning": reasoning,
+            "all_reasonings": all_reasonings,
+            "expert_logs": expert_logs_summary,
+        })
+
+    # 打印辩论结果摘要
+    if verbose and debate_warnings:
+        warned_codes = list(debate_warnings.keys())
+        print(f"  [E1-E7辩论] 风险提示: {', '.join(warned_codes)}")
+
+    return enriched
 
 
 def build_expert_summary(model_results: List[Dict]) -> Dict:
@@ -627,6 +751,351 @@ def format_final_report(
 
 
 # ===================================================================== #
+#  链路B: MR2 → L1 → L2 → L3 → Borda → 风控 → 报告                   #
+# ===================================================================== #
+
+def run_link_b_pipeline(
+    cfg: Config,
+    panel_size: int = 4,
+    parallel_models: bool = True,
+    verbose: bool = True,
+    models: Optional[List[str]] = None,
+    no_confirm: bool = False,
+) -> Dict:
+    """
+    链路B — 量化选股链路：
+    MR2（精简市场雷达）→ L1（量化过滤）→ L2（缠论+波浪）→ L3（K线图+指标）→ Borda → 风控 → 报告
+    """
+    print_banner()
+    print("\n  [链路B] MR2 → L1 → L2 → L3 → Borda → 风控 → 报告")
+    start_time = time.time()
+
+    # ── Step 0: 初始化 ───────────────────────────────────────────────
+    print_section("初始化系统组件（链路B）")
+    print(f"  连接模式: {get_connection_mode_str()}")
+    llm = LLMClient(cfg)
+    engine = DataEngine(tushare_token=cfg.tushare_token, tdx_dir=cfg.tdx_dir)
+    logger = WorkLogger(log_dir=LOGS_DIR)
+
+    if not cfg.providers:
+        print("\n  [错误] 未配置任何LLM提供商！请检查 .env 文件中的 API Key。")
+        return {}
+
+    # ── 连通性预检 ─────────────────────────────────────────────────
+    print(f"\n  正在并行测试数据源和模型连通性...")
+    import concurrent.futures as _cf
+    with _cf.ThreadPoolExecutor(max_workers=2) as _pool:
+        _fut_data = _pool.submit(engine.preflight_data_check)
+        _fut_llm = _pool.submit(llm.preflight_check, None)
+        data_check_results = _fut_data.result()
+        check_results = _fut_llm.result()
+
+    # 打印数据源结果
+    data_ok = sum(1 for r in data_check_results if r["ok"])
+    print(f"\n  数据源: {data_ok}/{len(data_check_results)} 可用")
+
+    # 打印 LLM 结果
+    ok_providers = [r["name"] for r in check_results if r["ok"]]
+    print(f"  LLM可用模型: {ok_providers}")
+    if not ok_providers:
+        print("\n  [错误] 无可用LLM模型！")
+        return {}
+
+    # ── MR2: 精简市场雷达 ─────────────────────────────────────────
+    print_section("MR2: 精简市场雷达")
+    t_mr2 = time.time()
+
+    # 采集大盘数据
+    market_indices = engine.fetch_market_indices()
+    sentiment = engine.fetch_market_sentiment()
+
+    mr2 = MarketRadarLite(llm, cfg)
+    mr2_result = mr2.run(market_indices, sentiment)
+
+    print(f"  [MR2] 大盘趋势: {mr2_result['trend']}")
+    print(f"  [MR2] {mr2_result['reason']}")
+    print(f"  [MR2] 情绪: {mr2_result['sentiment']}")
+    print(f"  [MR2] 仓位建议: {mr2_result['position_hint']}")
+    print(f"  ✓ MR2 完成，耗时 {time.time()-t_mr2:.1f}s")
+
+    # ── L1: 量化过滤 ─────────────────────────────────────────────
+    print_section("L1: 量化过滤（全市场扫描）")
+    t_l1 = time.time()
+    l1_candidates = engine.L1_quant_filter(verbose=verbose)
+    print(f"\n  ✓ L1 完成，耗时 {time.time()-t_l1:.1f}s")
+    save_result({"L1_candidates": l1_candidates}, f"L1_candidates_{TODAY}.json")
+
+    if not l1_candidates:
+        print("\n  [警告] L1 无候选股，链路B终止")
+        return {}
+
+    print(f"\n  ── L1 通过 {len(l1_candidates)} 只:")
+    for i, c in enumerate(l1_candidates, 1):
+        pe = c.get("PE")
+        pe_str = f"{pe:.1f}" if pe is not None else "空"
+        mv = c.get("总市值亿", 0)
+        vol_str = c.get("放量幅度", 0)
+        print(f"    {i:2d}. {c.get('code','')} {c.get('name','?'):<8} "
+              f"市值={mv:>8.0f}亿  PE={pe_str:>6}  放量={vol_str:>5.1f}%")
+
+    # ── L2: 形态过滤 ─────────────────────────────────────────────
+    print_section("L2: 形态过滤（缠论+波浪）")
+    t_l2 = time.time()
+    l2_candidates = engine.L2_chan_wave_filter(l1_candidates, verbose=verbose)
+    print(f"\n  ✓ L2 完成，耗时 {time.time()-t_l2:.1f}s")
+    save_result({"L2_candidates": l2_candidates}, f"L2_candidates_{TODAY}.json")
+
+    if not l2_candidates:
+        print("\n  [警告] L2 无候选股，链路B终止")
+        return {}
+
+    print(f"\n  ── L2 通过 {len(l2_candidates)} 只:")
+    for i, c in enumerate(l2_candidates, 1):
+        chan = c.get("chan_buy_detail", "")
+        wave = c.get("wave_bull_detail", "")
+        sigs = []
+        if chan and chan not in ("无", "neutral", ""):
+            sigs.append(f"缠:{chan}")
+        if wave and wave not in ("无", "neutral", ""):
+            sigs.append(f"浪:{wave}")
+        sig_str = " ".join(sigs) if sigs else "无明确信号"
+        mv = c.get("总市值亿", 0)
+        pe = c.get("PE")
+        pe_str = f"{pe:.1f}" if pe is not None else "空"
+        print(f"    {i:2d}. {c.get('code','')} {c.get('name','?'):<8} "
+              f"市值={mv:>8.0f}亿  PE={pe_str:>6}  {sig_str}")
+
+    # ── L2 → L3 确认 ─────────────────────────────────────────────
+    print_section("L2 → L3 确认")
+    print(f"\n  L2 候选股共 {len(l2_candidates)} 只，已列出如上。")
+
+    if not no_confirm:
+        print(f"\n  即将进入 L3（K线图生成 + 多模型看图判定）...")
+        try:
+            user_input = input("  确认进入 L3？(y/n，默认y): ").strip().lower()
+            if user_input in ("n", "no", "否"):
+                print("  用户取消，链路B终止")
+                return {}
+        except (EOFError, KeyboardInterrupt):
+            print("\n  继续执行...")
+    else:
+        print(f"\n  [auto] --no-confirm 模式，自动进入 L3")
+
+    # ── L3: K线图 + 多模型看图判定 ────────────────────────────────
+    # L2 候选过多时截断，避免 LLM 超时
+    MAX_L3 = 20
+    if len(l2_candidates) > MAX_L3:
+        print(f"\n  [截断] L2 候选 {len(l2_candidates)} 只，取前 {MAX_L3} 只进入 L3")
+        l2_candidates = l2_candidates[:MAX_L3]
+
+    print_section("L3: K线图 + 指标 + 多模型看图判定")
+    t_l3 = time.time()
+
+    # L3.1 生成图表
+    print(f"\n  ── L3.1: K线图生成（{len(l2_candidates)} 只）")
+    chart_dir = os.path.join(OUTPUT_DIR, "charts", TODAY)
+    t_chart = time.time()
+    chart_paths = engine.L3_generate_charts(l2_candidates, output_dir=chart_dir, verbose=verbose)
+    print(f"  ✓ L3.1 图表生成完成，耗时 {time.time()-t_chart:.1f}s")
+
+    # L3.2 多模型并行看图
+    active_models = models if models else ok_providers[:panel_size]
+    if not active_models:
+        active_models = ok_providers[:panel_size]
+
+    print(f"\n  ── L3.2: 多模型并行看图判定（{len(active_models)} 模型）")
+    t_analyze = time.time()
+
+    chart_analyst = ChartAnalyst(llm, cfg)
+    l3_result = chart_analyst.analyze(
+        candidates=l2_candidates,
+        chart_paths=chart_paths,
+        providers=active_models,
+        panel_size=panel_size,
+    )
+
+    l3_picks = l3_result.get("picks", [])
+    print(f"\n  ✓ L3.2 模型判定完成，耗时 {time.time()-t_analyze:.1f}s")
+    print(f"\n  [L3] 推荐 {len(l3_picks)} 只:")
+    for p in l3_picks[:10]:
+        print(
+            f"    {p['code']} {p['name']:<8}  "
+            f"信号={p['signal']}  评分={p['score']}  "
+            f"票={p['model_count']}模型"
+        )
+    print(f"  ✓ L3 完成，总耗时 {time.time()-t_l3:.1f}s")
+    save_result({"L3_result": l3_result}, f"L3_result_{TODAY}.json")
+
+    # ── Borda 融合 ────────────────────────────────────────────────
+    # L3 结果转换为 model_results 格式供 Borda 融合
+    model_results_for_borda = []
+    for res in l3_result.get("model_results", []):
+        picks = res.get("picks", [])
+        ranked_picks = []
+        for i, p in enumerate(picks):
+            ranked_picks.append({
+                "rank": p.get("rank", i + 1),
+                "code": p.get("code", ""),
+                "name": p.get("name", ""),
+                "sector": p.get("sector", "L3量化"),
+                "score": float(p.get("score", p.get("signal_score", 70))),
+            })
+        model_results_for_borda.append({
+            "model": res.get("model", "unknown"),
+            "picks": ranked_picks,
+        })
+
+    # 如果没有model_results（图表生成失败），用L3 picks直接构建
+    if not model_results_for_borda:
+        model_results_for_borda = [{
+            "model": "chart_analyst",
+            "picks": [
+                {"rank": p["rank"], "code": p["code"], "name": p["name"],
+                 "sector": "L3量化", "score": float(p["score"])}
+                for p in l3_picks
+            ]
+        }]
+
+    print_section("Borda: 跨模型融合")
+    t_borda = time.time()
+    print(f"\n  ── 参与融合 {len(model_results_for_borda)} 个模型的排序结果...")
+    final_top10 = borda_fusion(model_results_for_borda, top_n=25)
+
+    print(f"\n  融合结果 Top {len(final_top10)}:")
+    for pick in final_top10:
+        models_str = ", ".join(
+            f"{r['model']}(#{r['rank']})" for r in pick["recommended_by"]
+        )
+        print(
+            f"    {pick['rank']}. {pick['code']} {pick['name']}"
+            f"  Borda={pick['borda_score']:.0f}"
+            f"  [{models_str}]"
+        )
+    print(f"  ✓ Borda 完成，耗时 {time.time()-t_borda:.1f}s")
+    save_result({"final_top10": final_top10}, f"fusion_result_linkb_{TODAY}.json")
+
+    # ── E1-E7 专家辩论（接 Borda 之后，判图验证后做逻辑确认）────────
+    enriched = run_expert_debate_after_borda(
+        borda_top=final_top10,
+        stock_packages={},
+        llm=llm,
+        cfg=cfg,
+        active_models=active_models,
+        n_top=15,
+        verbose=verbose,
+    )
+    if enriched:
+        # 用 enriched 结果替换 final_top10（含专家辩论warnings）
+        final_top10 = enriched
+
+    # ── 风控审查 ─────────────────────────────────────────────────
+    print_section("风控审查")
+    t_risk = time.time()
+    arb_result = fusion_to_arb_result(final_top10)
+    approved = arb_result.get("approved", [])
+    print(f"\n  ── 待审查 {len(approved)} 只，送入风控模型...")
+    risk_ctrl = RiskController(llm, cfg)
+    # 从 L2 候选构建简化版 stock_packages（含日线+PE/PB/市值）
+    stock_packages: Dict = {}
+    basics_file = os.path.join(OUTPUT_DIR, "stock_basics.json")
+    _basics_cache: Dict = {}
+    if os.path.exists(basics_file):
+        try:
+            with open(basics_file, "r", encoding="utf-8") as _bf:
+                _basics_cache = json.load(_bf).get("data", {})
+        except Exception:
+            pass
+    for _cand in l2_candidates:
+        _code = _cand.get("code", "")
+        if not _code:
+            continue
+        _df = _cand.get("df")
+        if isinstance(_df, str):
+            try:
+                import io as _io
+                _df = pd.read_csv(_io.StringIO(_df), sep=r"\s+")
+            except Exception:
+                _df = None
+        _b = _basics_cache.get(_code, {})
+        stock_packages[_code] = {
+            "daily": _df if _df is not None and hasattr(_df, "iloc") else None,
+            "realtime": {
+                "市盈率-动态": _b.get("pe", "N/A"),
+                "市净率": _b.get("pb", "N/A"),
+                "总市值": f"{_b['mktcap']:.0f}亿" if _b.get("mktcap") else "N/A",
+            },
+        }
+    risk_result = risk_ctrl.filter(
+        arbitration_result=arb_result,
+        stock_packages=stock_packages,
+        verbose=verbose,
+    )
+    risk_approved = risk_result.get("approved", [])
+    risk_soft = risk_result.get("soft_excluded", [])
+    print(f"\n  ── 风控通过 {len(risk_approved)} 只，软过滤 {len(risk_soft)} 只")
+    print(f"  ✓ 风控完成，耗时 {time.time()-t_risk:.1f}s")
+    save_result(risk_result, f"risk_result_linkb_{TODAY}.json")
+
+    # ── 报告生成 ────────────────────────────────────────────────
+    print_section("生成报告")
+    expert_summary = {}  # 链路B无专家链
+    pdf_path = ""
+    try:
+        pdf_path = generate_report(
+            risk_result=risk_result,
+            arb_result=arb_result,
+            expert_summary=expert_summary,
+            stock_packages=stock_packages,
+            top_sectors=[],
+            n_models=len(active_models),
+            output_dir=REPORTS_DIR,
+        )
+    except Exception as e:
+        print(f"  [警告] PDF生成失败: {e}")
+
+    # 生成总览图片
+    img_path = ""
+    try:
+        img_path = generate_overview_image(
+            risk_result=risk_result,
+            fusion_result=final_top10,
+            breakout_result={"picks": []},
+            mr_result=mr2_result if mr2_result else None,
+            active_models=active_models,
+            output_dir=REPORTS_DIR,
+        )
+    except Exception as e:
+        print(f"  [警告] 总览图片生成失败: {e}")
+
+    # ── 完成 ──────────────────────────────────────────────────
+    total_time = (time.time() - start_time) / 60
+    print(f"\n{'='*70}")
+    print(f"  [完成] 链路B总耗时: {total_time:.1f} 分钟")
+    print(f"  [L1通过] {len(l1_candidates)} 只 → [L2通过] {len(l2_candidates)} 只 → [L3推荐] {len(l3_picks)} 只 → [Borda] {len(final_top10)} 只")
+    print(f"  [PDF报告] {pdf_path or '生成失败'}")
+    print(f"  [总览图片] {img_path or '生成失败'}")
+    print(f"{'='*70}")
+    logger.log("link_b_done", detail={
+        "total_min": round(total_time, 1),
+        "L1": len(l1_candidates),
+        "L2": len(l2_candidates),
+        "L3": len(l3_picks),
+        "final": len(final_top10),
+    })
+
+    return {
+        "pipeline": "link_b",
+        "mr2_result": mr2_result,
+        "l1_candidates": l1_candidates,
+        "l2_candidates": l2_candidates,
+        "l3_picks": l3_picks,
+        "final_top10": final_top10,
+        "risk_result": risk_result,
+        "total_time_min": total_time,
+    }
+
+
+# ===================================================================== #
 #  演示模式（模拟数据）                                                  #
 # ===================================================================== #
 
@@ -752,6 +1221,7 @@ def run_full_pipeline(
     verbose: bool = True,
     models: Optional[List[str]] = None,
     stock_codes: Optional[List[str]] = None,
+    no_confirm: bool = False,
 ) -> Dict:
     """
     完整选股流程（模型纵向并行版）:
@@ -767,36 +1237,89 @@ def run_full_pipeline(
     engine = DataEngine(tushare_token=cfg.tushare_token, tdx_dir=cfg.tdx_dir)
     logger = WorkLogger(log_dir=LOGS_DIR)
 
-    available_providers = list(cfg.providers.keys())
-    if models:
-        valid = [m for m in models if m in cfg.providers]
-        active_models = valid if valid else llm.get_panel(max_models=panel_size)
-    else:
-        active_models = llm.get_panel(max_models=panel_size)
-    # 设置全局模型约束，确保 MR/SP/GX 等所有步骤都使用相同的模型列表
-    llm.set_active_models(active_models)
-    # 回显模型面板表格
-    from config import should_route_via_cloubic, CLOUBIC_MODEL_MAP
-    print(f"\n  {'='*60}")
-    print(f"  {'#':<4}{'Provider':<12}{'Model':<35}{'Route':<10}")
-    print(f"  {'-'*60}")
-    for i, name in enumerate(active_models, 1):
-        via = should_route_via_cloubic(name)
-        if via:
-            model = CLOUBIC_MODEL_MAP.get(name, '?')
-            route = 'Cloubic'
-        else:
-            prov = cfg.providers.get(name)
-            model = prov.model if prov else '?'
-            route = 'Direct'
-        print(f"  {i:<4}{name:<12}{model:<35}{route:<10}")
-    print(f"  {'='*60}")
-    print(f"  Risk Control: claude -> claude-opus-4-6 (Cloubic)")
-    print(f"  {'='*60}\n")
-
-    if not available_providers:
+    if not cfg.providers:
         print("\n  [错误] 未配置任何LLM提供商！请检查 .env 文件中的 API Key。")
         return {}
+
+    # ── 连通性预检（数据源 + LLM 并行测试）─────────────────────────
+    print(f"\n  正在并行测试数据源和模型连通性...")
+
+    # 并行：数据源预检 + LLM 预检
+    test_providers = None
+    if models:
+        test_providers = [m for m in models if m in cfg.providers]
+
+    import concurrent.futures as _cf
+    with _cf.ThreadPoolExecutor(max_workers=2) as _pool:
+        _fut_data = _pool.submit(engine.preflight_data_check)
+        _fut_llm = _pool.submit(llm.preflight_check, test_providers)
+        data_check_results = _fut_data.result()
+        check_results = _fut_llm.result()
+
+    # ── 打印数据源预检结果 ──
+    print(f"\n  {'='*78}")
+    print(f"  数据源连通性测试")
+    print(f"  {'-'*78}")
+    print(f"  {'#':<4}{'数据源':<10}{'接口':<24}{'延迟':>8}  {'状态':<8}{'详情'}")
+    print(f"  {'-'*78}")
+    data_ok = 0
+    data_fail = 0
+    for i, r in enumerate(data_check_results, 1):
+        latency_str = f"{r['latency']:.2f}s" if r['latency'] > 0 else "—"
+        if r["ok"]:
+            status = "OK"
+            data_ok += 1
+        else:
+            status = "FAIL"
+            data_fail += 1
+        detail = r.get("detail", "") or r.get("error", "")
+        print(f"  {i:<4}{r['source']:<10}{r['name']:<24}{latency_str:>8}  {status:<8}{detail[:30]}")
+    print(f"  {'-'*78}")
+    print(f"  数据源: {data_ok} 可用 / {data_fail} 不可用")
+    print(f"  {'='*78}")
+
+    # ── 打印 LLM 预检结果 ──
+    print(f"\n  {'='*78}")
+    print(f"  LLM模型连通性测试")
+    print(f"  {'-'*78}")
+    print(f"  {'#':<4}{'Provider':<12}{'Model':<32}{'Route':<9}{'Latency':>8}  {'Status'}")
+    print(f"  {'-'*78}")
+    for i, r in enumerate(check_results, 1):
+        latency_str = f"{r['latency']:.2f}s" if r["ok"] else "—"
+        status = "OK" if r["ok"] else f"FAIL: {r['error'][:30]}"
+        print(f"  {i:<4}{r['name']:<12}{r['model']:<32}{r['route']:<9}{latency_str:>8}  {status}")
+    print(f"  {'='*78}")
+
+    ok_names = [r["name"] for r in check_results if r["ok"]]
+    fail_names = [r["name"] for r in check_results if not r["ok"]]
+
+    if fail_names:
+        print(f"\n  [预检] 不可用模型: {', '.join(fail_names)}（已自动跳过）")
+
+    if not ok_names:
+        print("\n  [错误] 所有模型均不可用！请检查网络和代理设置。")
+        return {}
+
+    # 从可用模型中按优先级选够 panel_size 个
+    active_models = ok_names[:panel_size]
+
+    print(f"\n  [面板] 将启用 {len(active_models)} 个模型: {', '.join(active_models)}")
+    from config import should_route_via_cloubic, CLOUBIC_MODEL_MAP
+    print(f"  Risk Control: claude -> claude-opus-4-6 (Cloubic)")
+
+    # ── 手动确认 ──
+    if not no_confirm:
+        print()
+        try:
+            answer = input("  >>> 预检完成，是否继续运行? [Y/n] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = "n"
+        if answer in ("n", "no"):
+            print("\n  已取消运行。")
+            return {}
+        print()
+
+    llm.set_active_models(active_models)
 
     # ── Step 0: 市场雷达（大盘+情绪+概念炒作预判+ETF）────────────
     # 非个股直选模式时执行，为后续板块优选提供市场环境上下文
@@ -1010,6 +1533,54 @@ def run_full_pipeline(
                 print(f"\n  [GX] 无补充板块（已选板块覆盖或未达多数同意）")
             print(f"  ✓ Step 1.5 完成，耗时 {(time.time()-t_step15)/60:.1f} 分钟")
 
+        # ── 板块多样性约束：同一大类最多2个，剩余名额留给其他类 ────
+        _SECTOR_CATEGORY = {
+            # 能源电力类
+            "电力": "能源电力", "电网设备": "能源电力", "光伏设备": "能源电力",
+            "风电设备": "能源电力", "储能": "能源电力", "新能源": "能源电力",
+            "绿色电力": "能源电力", "火电": "能源电力", "核电": "能源电力",
+            # 环保类
+            "环境治理": "环保", "环保": "环保", "水务": "环保",
+            # 军工类
+            "国防军工": "军工", "航天航空": "军工", "地面兵装": "军工",
+            # 医药类
+            "化学制药": "医药", "创新药": "医药", "医疗服务": "医药",
+            "医疗器械": "医药", "中药": "医药", "生物制品": "医药",
+            # 科技类
+            "人工智能": "科技", "半导体": "科技", "芯片": "科技",
+            "消费电子": "科技", "通信设备": "科技", "计算机设备": "科技",
+            # 制造类
+            "机器人": "制造", "通用设备": "制造", "专业工程": "制造",
+            "工业金属": "制造", "汽车": "制造",
+        }
+        MAX_PER_CATEGORY = 2
+        category_count: Dict[str, int] = {}
+        diverse_sectors: List[str] = []
+        overflow_sectors: List[str] = []
+        for s in top_sectors:
+            cat = _SECTOR_CATEGORY.get(s, s)  # 未映射的板块自成一类
+            if category_count.get(cat, 0) < MAX_PER_CATEGORY:
+                diverse_sectors.append(s)
+                category_count[cat] = category_count.get(cat, 0) + 1
+            else:
+                overflow_sectors.append(s)
+
+        if overflow_sectors:
+            print(f"\n  [多样性] 同类超限，移除: {overflow_sectors}")
+            print(f"  [多样性] 保留板块: {diverse_sectors}")
+            # 从 SP 的备选中补充不同大类的板块
+            sp_all = pick_result.get("all_sectors", []) if not sectors else []
+            for s in sp_all:
+                if s not in diverse_sectors:
+                    cat = _SECTOR_CATEGORY.get(s, s)
+                    if category_count.get(cat, 0) < MAX_PER_CATEGORY:
+                        diverse_sectors.append(s)
+                        category_count[cat] = category_count.get(cat, 0) + 1
+                        print(f"  [多样性] 补充板块: {s} ({cat})")
+                if len(diverse_sectors) >= len(top_sectors):
+                    break
+            top_sectors = diverse_sectors
+
         print(f"\n  最终目标板块: {top_sectors}")
 
         # ── Step 2: 数据采集 ─────────────────────────────────────────
@@ -1071,6 +1642,75 @@ def run_full_pipeline(
     reflection_text = mem.get_reflection_prompt(memory_env, mr_result)
     if reflection_text:
         print(f"\n  [记忆] 检索到历史决策参考，已注入提示词")
+
+    # ── Step 3.5: L3 图表分析（K线图 + 多模型视觉判定）──────────────
+    # 在专家链（E1-E7）之前，先用图表进行视觉层面的初步过滤
+    print_section("Step 3.5: L3 K线图表生成 + 多模型看图判定")
+    t_l3 = time.time()
+
+    # 构建 L2 格式候选股（从 stock_packages 提取日线数据）
+    import pandas as pd
+    l3_candidates = []
+    for code, pkg in stock_packages.items():
+        name = name_map.get(code, pkg.get("realtime", {}).get("名称", code))
+        sector = next((s for s, stocks in data_result.get("sector_components", {}).items()
+                       if any(str(sc.get("代码", sc.get("stock_code", ""))).strip() == code for sc in stocks)), "")
+        df_daily = pkg.get("daily")
+        if df_daily is not None and len(df_daily) >= 20:
+            l3_candidates.append({
+                "code": code,
+                "name": name,
+                "sector": sector,
+                "df": df_daily,
+            })
+
+    # 限制最多 50 只（避免图表生成时间过长）
+    MAX_L3_CANDIDATES = 50
+    if len(l3_candidates) > MAX_L3_CANDIDATES:
+        print(f"  [L3] 候选 {len(l3_candidates)} 只，截取前 {MAX_L3_CANDIDATES} 只")
+        l3_candidates = l3_candidates[:MAX_L3_CANDIDATES]
+
+    print(f"  ── L3.1: K线图生成（{len(l3_candidates)} 只）")
+    chart_dir = os.path.join(OUTPUT_DIR, "charts", f"pipeline_a_{TODAY}")
+    chart_paths = engine.L3_generate_charts(l3_candidates, output_dir=chart_dir, verbose=verbose)
+
+    print(f"\n  ── L3.2: 多模型看图判定（{len(active_models)} 模型）")
+    t_l32 = time.time()
+    from stock_agents import ChartAnalyst
+    chart_analyst = ChartAnalyst(llm, cfg)
+    l3_result = chart_analyst.analyze(
+        candidates=l3_candidates,
+        chart_paths=chart_paths,
+        providers=active_models,
+        panel_size=panel_size,
+    )
+    l3_picks = l3_result.get("picks", [])
+    print(f"  ✓ L3.2 完成，耗时 {time.time()-t_l32:.1f}s")
+    print(f"  [L3] 看图判定推荐 {len(l3_picks)} 只")
+    for p in l3_picks[:5]:
+        print(f"    {p['code']} {p.get('name',''):<8} 信号={p['signal']} 评分={p['score']}")
+    print(f"  ✓ Step 3.5 L3 完成，耗时 {time.time()-t_l3:.1f}s")
+    save_result({"L3_result": l3_result}, f"L3_result_{TODAY}.json")
+
+    # 将 L3 结果加入 model_results_for_borda（与 Step 4 的 per-model E1-E7 结果一同融合）
+    l3_model_results = []
+    for res in l3_result.get("model_results", []):
+        picks = res.get("picks", [])
+        ranked_picks = []
+        for i, p in enumerate(picks):
+            ranked_picks.append({
+                "rank": p.get("rank", i + 1),
+                "code": p.get("code", ""),
+                "name": p.get("name", ""),
+                "sector": p.get("sector", "L3图表"),
+                "score": float(p.get("score", p.get("signal_score", 70))),
+            })
+        l3_model_results.append({
+            "model": f"L3_{res.get('model', 'unknown')}",
+            "picks": ranked_picks,
+        })
+    if l3_model_results:
+        print(f"  [L3] 已将 {len(l3_model_results)} 个模型的图表判定结果并入融合池")
 
     # ── Step 4: N模型并行（每模型内E1→E7顺序执行 + intra-model辩论）──
     print_section(
@@ -1160,12 +1800,19 @@ def run_full_pipeline(
     print(f"\n  ✓ Step 4 完成，{len(model_results)}个模型，总耗时 {(time.time()-t_step4)/60:.1f} 分钟")
     save_result({"model_results": model_results}, f"model_results_{TODAY}.json")
 
+    # ── 合并 L3 图表判定结果到融合池 ─────────────────────────────────
+    if l3_model_results:
+        model_results_for_borda = model_results + l3_model_results
+        print(f"  [L3] 合并后融合池共 {len(model_results_for_borda)} 个模型（原始 {len(model_results)} + L3图表 {len(l3_model_results)}）")
+    else:
+        model_results_for_borda = model_results
+
     # ── Step 5: Borda Count 跨模型融合 ──────────────────────────────
     print_section("Step 5: Borda Count 跨模型融合（输出 Top25）")
     t_step5 = time.time()
-    logger.log("fusion_start", detail={"model_count": len(model_results)})
+    logger.log("fusion_start", detail={"model_count": len(model_results_for_borda)})
 
-    final_top10 = borda_fusion(model_results, top_n=25)
+    final_top10 = borda_fusion(model_results_for_borda, top_n=25)
 
     logger.log("fusion_done", detail={"top_n": len(final_top10)})
 
@@ -1182,6 +1829,25 @@ def run_full_pipeline(
     print(f"  ✓ Step 5 完成，耗时 {time.time()-t_step5:.1f}s")
 
     save_result({"final_top10": final_top10}, f"fusion_result_{TODAY}.json")
+
+    # ── Step 5.3: E1-E7 专家辩论（接 Borda 之后，判图验证后做逻辑确认）──
+    print_section("Step 5.3: E1-E7 专家辩论（最终逻辑验证）")
+    t_step53 = time.time()
+    enriched = run_expert_debate_after_borda(
+        borda_top=final_top10,
+        stock_packages=stock_packages,
+        llm=llm,
+        cfg=cfg,
+        active_models=active_models,
+        n_top=15,
+        verbose=verbose,
+    )
+    if enriched:
+        final_top10 = enriched
+        print(f"  ✓ E1-E7 辩论完成，已合并专家warnings到 {len(enriched)} 只")
+    else:
+        print("  [跳过] E1-E7 辩论无结果")
+    print(f"  ✓ Step 5.3 完成，耗时 {time.time()-t_step53:.1f}s")
 
     # ── Step 5.5: 首席策略师综合判断（默认禁用，--strategist 开启）─────
     # 注意：首席策略师会用单一LLM主观调整Borda排名，可能干扰多模型投票的客观性
@@ -1477,6 +2143,11 @@ def main():
         help="启用首席策略师（Step 5.5，默认禁用，会用单一LLM主观调整Borda排名）",
     )
     parser.add_argument(
+        "--no-confirm",
+        action="store_true",
+        help="跳过预检后的手动确认（直接运行）",
+    )
+    parser.add_argument(
         "--cloubic",
         action="store_true",
         help="强制启用 Cloubic 路由（覆盖 .env.cloubic 中的 CLOUBIC_ENABLED）",
@@ -1485,6 +2156,12 @@ def main():
         "--direct",
         action="store_true",
         help="强制全部直连（禁用 Cloubic 路由）",
+    )
+    parser.add_argument(
+        "--link",
+        type=str, default="a",
+        choices=["a", "b", "both"],
+        help="选择链路: a=链路A(原有MR→SP→GX→E1-E7), b=链路B(MR2→L1→L2→L3), both=两条都跑",
     )
 
     args = parser.parse_args()
@@ -1537,18 +2214,56 @@ def main():
     # 解析个股列表
     stock_codes = [c.strip() for c in args.stocks.split(",") if c.strip()] if args.stocks else None
 
-    # 运行完整流程
-    run_full_pipeline(
-        cfg=cfg,
-        sectors=sectors,
-        panel_size=args.panel,
-        debate_rounds=args.debate,
-        max_stocks_per_sector=args.max_stocks,
-        parallel_models=not args.no_parallel,
-        verbose=verbose,
-        models=models_list,
-        stock_codes=stock_codes,
-    )
+    # 链路路由
+    if args.link == "a":
+        run_full_pipeline(
+            cfg=cfg,
+            sectors=sectors,
+            panel_size=args.panel,
+            debate_rounds=args.debate,
+            max_stocks_per_sector=args.max_stocks,
+            parallel_models=not args.no_parallel,
+            verbose=verbose,
+            models=models_list,
+            stock_codes=stock_codes,
+            no_confirm=args.no_confirm,
+        )
+    elif args.link == "b":
+        run_link_b_pipeline(
+            cfg=cfg,
+            panel_size=args.panel,
+            parallel_models=not args.no_parallel,
+            verbose=verbose,
+            models=models_list,
+            no_confirm=args.no_confirm,
+        )
+    elif args.link == "both":
+        print("\n" + "="*60)
+        print("  【链路A】MR → SP → GX → E1-E7 → Borda → 风控 → 报告")
+        print("="*60)
+        run_full_pipeline(
+            cfg=cfg,
+            sectors=sectors,
+            panel_size=args.panel,
+            debate_rounds=args.debate,
+            max_stocks_per_sector=args.max_stocks,
+            parallel_models=not args.no_parallel,
+            verbose=verbose,
+            models=models_list,
+            stock_codes=stock_codes,
+            no_confirm=args.no_confirm,
+        )
+        print("\n" + "="*60)
+        print("  【链路B】MR2 → L1量化 → L2形态 → L3看图 → Borda → 风控 → 报告")
+        print("="*60)
+        run_link_b_pipeline(
+            cfg=cfg,
+            panel_size=args.panel,
+            parallel_models=not args.no_parallel,
+            verbose=verbose,
+            models=models_list,
+            no_confirm=args.no_confirm,
+        )
 
 
 if __name__ == "__main__":

@@ -697,6 +697,134 @@ class ReportGenerator:
 
         return elems
 
+    # ── L3 多模型看图判定结果表 ──────────────────────────────────
+    def _build_l3_table(self, approved: List[Dict], soft_excluded: List[Dict],
+                        l3_result: Dict) -> List:
+        """展示 L3 多模型看图判定结果：最终推荐 → 风控排除"""
+        S = self.styles
+        elems = [PageBreak(), Paragraph("L3 多模型看图判定结果", S["h1"])]
+        elems.append(HRFlowable(width="100%", thickness=2, color=GOLD, spaceAfter=10))
+
+        if not l3_result:
+            elems.append(Paragraph("（无 L3 判定数据）", S["body"]))
+            return elems
+
+        # 构建 L3 index: code → pick data
+        l3_picks = l3_result.get("picks", [])
+        model_results = l3_result.get("model_results", [])
+        l3_index: Dict[str, Dict] = {}
+        for p in l3_picks:
+            l3_index[p.get("code", "")] = p
+
+        # 构建 model → code 投票索引
+        model_votes: Dict[str, set] = {}
+        for res in model_results:
+            m = res.get("model", "")
+            for p in res.get("picks", []):
+                c = p.get("code", "")
+                model_votes.setdefault(m, set()).add(c)
+
+        all_models = list(model_votes.keys())
+        n_models = len(all_models)
+
+        # 合并 approved + soft_excluded，保持 Borda 顺序
+        all_items = []
+        for stk in approved:
+            all_items.append({"data": stk, "is_excluded": False})
+        for se in soft_excluded:
+            all_items.append({"data": se, "is_excluded": True})
+
+        # 分组：推荐 vs 排除
+        approved_items = [it for it in all_items if not it["is_excluded"]]
+        excluded_items = [it for it in all_items if it["is_excluded"]]
+
+        def _build_group(items: List[Dict], group_label: str,
+                         header_color) -> List:
+            out = []
+            out.append(Paragraph(group_label, S["h2"]))
+            W = self.PAGE_W - self.MARGIN_L - self.MARGIN_R
+            col_w = [0.5*cm, 1.6*cm, 2.2*cm, 2.0*cm, 1.5*cm, 1.2*cm,
+                     (W - 0.5 - 1.6 - 2.2 - 2.0 - 1.5 - 1.2 - 0.8 - 1.8)*cm, 0.8*cm, 1.8*cm]
+            headers = ["#", "代码", "名称", "L3信号", "L3评分", "投票数",
+                       "推荐理由", "模型投票"]
+            rows = [[Paragraph(h, S["th"]) for h in headers]]
+
+            for rank_i, item in enumerate(items, 1):
+                stk = item["data"]
+                code = stk.get("code", "")
+                name = stk.get("name", "")
+                l3 = l3_index.get(code, {})
+
+                signal = l3.get("signal", "—")
+                score_l3 = l3.get("score", 0)
+                reasoning = l3.get("reasoning", "")
+                mc = l3.get("model_count", 0)
+
+                # 信号颜色
+                sig_color = C_GREEN
+                if "强买入" in signal:
+                    sig_color = C_GREEN
+                elif "买入" in signal:
+                    sig_color = NAVY
+                elif "卖出" in signal:
+                    sig_color = C_RED
+
+                # 找出哪些模型投了该股
+                voted_models = []
+                for m, codes in model_votes.items():
+                    if code in codes:
+                        voted_models.append(m[:6])  # 截断模型名
+
+                # 评分星级
+                star = "★★★" if score_l3 >= 75 else ("★★" if score_l3 >= 50 else "★")
+
+                row = [
+                    Paragraph(str(rank_i), S["td"]),
+                    Paragraph(code, S["td"]),
+                    Paragraph(name, S["td_l"]),
+                    Paragraph(f'<font color="{sig_color.hexval()}">{signal}</font>'
+                              if hasattr(sig_color, "hexval") else signal,
+                              S["td"]),
+                    Paragraph(f"{star}{float(score_l3):.0f}" if score_l3 else "—", S["td"]),
+                    Paragraph(f"{mc}/{n_models}票", S["td"]),
+                    Paragraph(reasoning[:60] + "..." if len(reasoning) > 60 else reasoning,
+                              S["body_s"]),
+                    Paragraph(",".join(voted_models) if voted_models else "—",
+                              S["body_s"]),
+                ]
+                rows.append(row)
+
+            tbl = Table(rows, colWidths=col_w, repeatRows=1)
+            ts = TableStyle([
+                ("BACKGROUND",    (0, 0), (-1, 0), header_color),
+                ("FONTNAME",      (0, 0), (-1, 0), F_BOLD),
+                ("TEXTCOLOR",     (0, 0), (-1, 0), C_WHITE),
+                ("ALIGN",         (0, 0), (-1, -1), "CENTER"),
+                ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+                ("FONTNAME",      (0, 1), (-1, -1), F_BODY),
+                ("FONTSIZE",      (0, 1), (-1, -1), 8),
+                ("TOPPADDING",    (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                ("LEFTPADDING",   (0, 0), (-1, -1), 3),
+                ("RIGHTPADDING",  (0, 0), (-1, -1), 3),
+                ("GRID",          (0, 0), (-1, -1), 0.4, BORDER),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, BG_ALT]),
+            ])
+            tbl.setStyle(ts)
+            out.append(tbl)
+            out.append(Spacer(1, 0.3 * cm))
+            return out
+
+        # 最终推荐（绿色表头）
+        if approved_items:
+            elems.extend(_build_group(approved_items, "✅ 最终推荐股票（L3 + 风控）",
+                                       colors.HexColor("#059669")))
+        # 风控排除（红色表头）
+        if excluded_items:
+            elems.extend(_build_group(excluded_items, "⚠ 风控排除股票（L3通过但风控提示）",
+                                       colors.HexColor("#DC2626")))
+        return elems
+
     # ── 推荐总览表 ───────────────────────────────────────────────
     def _build_recommendation_table(self, approved: List[Dict], soft_excluded: List[Dict] = None) -> List:
         S = self.styles
@@ -1057,6 +1185,7 @@ class ReportGenerator:
         top_sectors: List[str],
         n_models: int = 4,
         output_filename: Optional[str] = None,
+        l3_result: Optional[Dict] = None,
     ) -> str:
         """
         生成完整 PDF 投顾报告。
@@ -1119,6 +1248,10 @@ class ReportGenerator:
         # 3. 推荐总览表（按Borda评分排序，含风控提示股票）
         story.extend(self._build_recommendation_table(approved, soft_excluded))
 
+        # 3b. L3 多模型看图判定结果
+        if l3_result:
+            story.extend(self._build_l3_table(approved, soft_excluded, l3_result))
+
         # 4. 个股详情 — 按Borda评分排序，统一展示
         # 合并并排序
         all_stock_items = []
@@ -1170,6 +1303,7 @@ def generate_report(
     n_models: int = 4,
     output_dir: str = ".",
     output_filename: Optional[str] = None,
+    l3_result: Optional[Dict] = None,
 ) -> str:
     """
     一键生成 PDF 投顾报告。
@@ -1183,6 +1317,7 @@ def generate_report(
         n_models        参与分析的模型数量
         output_dir      输出目录
         output_filename 指定PDF文件名（可选）
+        l3_result       L3多模型看图判定结果（可选）
 
     返回: PDF文件路径
     """
@@ -1195,6 +1330,7 @@ def generate_report(
         top_sectors=top_sectors,
         n_models=n_models,
         output_filename=output_filename,
+        l3_result=l3_result,
     )
 
 

@@ -8,16 +8,6 @@ A股多智能体选股系统 - 数据引擎模块
   2. 多周期 K 线采集（月线/周线/日线）
   3. 技术指标计算（MA、MACD、RSI、KDJ、布林带）
   4. 个股资金流向数据
-  5. 财务基本面数据
-  6. 市场热点（涨停、龙虎榜、北向资金）
-  7. 融资融券数据
-  8. 综合股票画像生成（供LLM分析用）
-  9. 大盘指数行情（上证/深证/创业板趋势判断）
-  10. 市场情绪指标（连板高度/炸板率/情绪周期）
-  11. 概念炒作信号（概念异动/5日资金流/板块涨幅排名）
-  12. ETF行情与板块匹配（热门ETF + 板块→ETF映射）
-
-数据源: TDX本地通达信（主）/ akshare（备）/ tushare（末）
 """
 
 import concurrent.futures
@@ -27,6 +17,7 @@ import threading
 import time
 import warnings
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -93,6 +84,49 @@ except Exception:
 os.environ["NO_PROXY"] = "*"
 os.environ["no_proxy"] = "*"
 
+# 6) DNS 修复：代理软件可能劫持国内域名解析到虚假 IP（如 198.18.x.x），
+#    导致 akshare/东方财富等国内接口连不上。用公共DNS(114.114.114.114)
+#    解析国内域名，替换 getaddrinfo 返回真实 IP 但保留原始地址族信息。
+import socket as _socket
+
+_PUBLIC_DNS = "114.114.114.114"
+_DOMESTIC_SUFFIXES = (
+    ".eastmoney.com", ".sina.com.cn", ".sinajs.cn", ".mairui.club",
+    ".10jqka.com.cn", ".ssec.com.cn", ".szse.cn", ".sse.com.cn",
+    ".cninfo.com.cn", ".csrc.gov.cn", ".csindex.com.cn",
+    ".tushare.pro", ".waditu.com", ".akshare.xyz", ".gtimg.cn",
+)
+_dns_cache: dict = {}
+_orig_getaddrinfo = _socket.getaddrinfo
+
+def _resolve_via_public_dns(host: str) -> str:
+    """用公共DNS解析域名，返回真实IP"""
+    if host in _dns_cache:
+        return _dns_cache[host]
+    try:
+        import dns.resolver
+        resolver = dns.resolver.Resolver(configure=False)
+        resolver.nameservers = [_PUBLIC_DNS]
+        resolver.lifetime = 5
+        answers = resolver.resolve(host, "A")
+        real_ip = str(answers[0])
+        _dns_cache[host] = real_ip
+        return real_ip
+    except Exception:
+        return ""
+
+def _patched_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    if isinstance(host, str) and any(host.endswith(s) for s in _DOMESTIC_SUFFIXES):
+        real_ip = _resolve_via_public_dns(host)
+        if real_ip:
+            # 返回 IPv4 地址信息，保留端口和其他参数
+            return [(_socket.AF_INET, _socket.SOCK_STREAM, 6, '', (real_ip, port))]
+    return _orig_getaddrinfo(host, port, family, type, proto, flags)
+
+_socket.getaddrinfo = _patched_getaddrinfo
+
+_socket.getaddrinfo = _patched_getaddrinfo
+
 # ── 导入数据库 ───────────────────────────────────────────────────────
 
 try:
@@ -123,6 +157,12 @@ try:
     _BAOSTOCK_AVAILABLE = True
 except ImportError:
     _BAOSTOCK_AVAILABLE = False
+
+try:
+    from Ashare import get_price as ashare_get_price
+    _ASHARE_AVAILABLE = True
+except ImportError:
+    _ASHARE_AVAILABLE = False
 
 # 6) 恢复 LLM 代理环境变量（供 llm_client.py 的 httpx 使用）
 for _k, _v in _SAVED_PROXY.items():
@@ -555,7 +595,8 @@ class DataEngine:
         from http.client import RemoteDisconnected
         from requests.exceptions import ReadTimeout
         _conn_errors = (RemoteDisconnected, ConnectionError, ConnectionAbortedError,
-                        ConnectionResetError, ReadTimeout, OSError)
+                        ConnectionResetError, ReadTimeout, OSError,
+                        IndexError, KeyError, ValueError)
         try:
             return primary_fn()
         except _conn_errors as e:
@@ -576,6 +617,27 @@ class DataEngine:
                 return None
 
     # ------------------------------------------------------------------ #
+    #  板块列表降级数据源                                                   #
+    # ------------------------------------------------------------------ #
+
+    def _tushare_industry_list(self) -> Optional[pd.DataFrame]:
+        """tushare 获取申万行业板块列表（降级数据源）"""
+        if not self._pro:
+            return None
+        df = self._pro.index_basic(market="SW")
+        if df is None or df.empty:
+            return None
+        # 取一级行业（与东财申万行业对齐）
+        df1 = df[df["category"].str.contains("一级", na=False)].copy()
+        if df1.empty:
+            df1 = df.copy()
+        # 统一列名，与 akshare stock_board_industry_name_em() 对齐
+        df1 = df1.rename(columns={"name": "板块名称", "ts_code": "板块代码"})
+        # 去掉 "(申万)" 后缀
+        df1["板块名称"] = df1["板块名称"].str.replace(r"\(申万\)|（申万）", "", regex=True).str.strip()
+        return df1
+
+    # ------------------------------------------------------------------ #
     #  板块总览                                                            #
     # ------------------------------------------------------------------ #
 
@@ -587,10 +649,12 @@ class DataEngine:
         print("[数据] 采集板块总览数据...")
         data: Dict = {}
 
-        # 申万行业板块行情
+        # 申万行业板块行情（akshare → tushare → adata 三级降级）
         try:
             df = self._call_with_fallback(
-                lambda: ak.stock_board_industry_name_em(), label="申万行业")
+                lambda: ak.stock_board_industry_name_em(),
+                fallback_fn=lambda: self._tushare_industry_list(),
+                label="申万行业")
             if df is not None and len(df) > 0:
                 data["sw_industry"] = df.to_dict("records")
                 print(f"  申万行业: {len(df)} 个板块")
@@ -988,7 +1052,7 @@ class DataEngine:
         获取单只股票 K 线数据。
         period: "monthly" | "weekly" | "daily"
         n_bars: 目标 K 线条数
-        数据源优先级: TDX本地（1）→ akshare（2）→ tushare（3）→ 腾讯K线（3.5）→ adata（4）→ baostock（5）
+        数据源优先级: TDX本地（1）→ akshare（2）→ tushare（3）→ Ashare（3.5）→ 腾讯K线（3.75）→ adata（4）→ baostock（5）
         """
         period_map = {"monthly": "monthly", "weekly": "weekly", "daily": "daily"}
         ak_period = period_map.get(period, "daily")
@@ -1040,7 +1104,32 @@ class DataEngine:
             except Exception as e:
                 print(f"  [tushare] {code} {period} K线失败: {e}")
 
-        # ── Priority 3.5: 腾讯K线（push2.eastmoney.com不可用时的备用）──
+        # ── Priority 3.5: Ashare（新浪+腾讯双源）───────────────────
+        if _ASHARE_AVAILABLE:
+            try:
+                freq_map_ashare = {"daily": "1d", "weekly": "1w", "monthly": "1M"}
+                ashare_freq = freq_map_ashare.get(period, "1d")
+                # 上海: 6开头; 深圳: 0/3开头
+                ashare_code = f"sh{code}" if code.startswith("6") else f"sz{code}"
+                df = ashare_get_price(ashare_code, count=n_bars, frequency=ashare_freq)
+                if df is not None and len(df) > 0:
+                    df = df.reset_index()
+                    df.columns = [c.lower() if c != '' else 'date' for c in df.columns]
+                    # Ashare返回的index是日期，reset后第一列为日期
+                    first_col = df.columns[0]
+                    if first_col != 'date':
+                        df = df.rename(columns={first_col: 'date'})
+                    df['date'] = pd.to_datetime(df['date'])
+                    for col in ['open', 'high', 'low', 'close', 'volume']:
+                        if col in df.columns:
+                            df[col] = pd.to_numeric(df[col], errors='coerce')
+                    df = df.dropna(subset=['close'])
+                    df = df.sort_values('date').reset_index(drop=True)
+                    return df.tail(n_bars)
+            except Exception as e:
+                print(f"  [Ashare] {code} {period} K线失败: {e}")
+
+        # ── Priority 3.75: 腾讯K线（push2.eastmoney.com不可用时的备用）──
         if period == "daily":
             df = self._tencent_kline(code, period, n_bars)
             if df is not None and len(df) >= min_bars:
@@ -1169,7 +1258,7 @@ class DataEngine:
             batch = market_codes[i:i + 50]
             code_list = ",".join(batch)
             try:
-                resp = _req.get(f"https://qt.gtimg.cn/q={code_list}", timeout=10)
+                resp = _req.get(f"https://qt.gtimg.cn/q={code_list}", timeout=8)
                 resp.encoding = "gbk"
                 text = resp.text
                 for line in text.strip().split(";"):
@@ -2291,15 +2380,25 @@ class DataEngine:
         # 远程 API 并发信号量：TDX本地读取不计入
         # 使用信号量而非降低 max_workers，这样 TDX 命中时仍能全速并行
         _api_sem = threading.Semaphore(3)
+        _PER_STOCK_TIMEOUT = 60  # 单只股票数据采集超时（秒）
+
+        def _call_with_timeout(fn, *args, timeout_sec=30, default=None):
+            """在子线程中执行 fn，超时返回 default（防止底层I/O卡死）"""
+            with concurrent.futures.ThreadPoolExecutor(1) as _ex:
+                _f = _ex.submit(fn, *args)
+                try:
+                    return _f.result(timeout=timeout_sec)
+                except (concurrent.futures.TimeoutError, Exception):
+                    return default
 
         def _fetch_kline_with_sem(code: str, period: str, n_bars: int):
             """先尝试 TDX（不占信号量），TDX失败再用远程 API（占信号量）"""
-            df = self._tdx_kline(code, period, n_bars)
+            df = _call_with_timeout(self._tdx_kline, code, period, n_bars, timeout_sec=15)
             if df is not None and len(df) > 0:
                 return df
             # TDX 未命中，走远程（AKShare → Tushare）
             with _api_sem:
-                return self.fetch_kline(code, period, n_bars)
+                return _call_with_timeout(self.fetch_kline, code, period, n_bars, timeout_sec=30)
 
         def _fetch_one(code: str) -> None:
             rt_info = realtime.get(code, {})
@@ -2307,10 +2406,25 @@ class DataEngine:
             sector = (sector_map or {}).get(code, "")
             t_s = time.time()
 
+            def _check_timeout(stage: str = "") -> bool:
+                """检查单只股票是否超时（60s），超时则跳过"""
+                if time.time() - t_s > _PER_STOCK_TIMEOUT:
+                    with _cnt_lock:
+                        _skip[0] += 1
+                        n = _done[0] + _skip[0]
+                    print(
+                        f"  [{n:3d}/{total}] {code} {name:<6} ✗ 超时{_PER_STOCK_TIMEOUT}s({stage})，跳过",
+                        flush=True,
+                    )
+                    return True
+                return False
+
             pkg: Dict = {"code": code, "sector": sector, "realtime": rt_info}
 
             # ── 日线（有多少拿多少，新股K线少也保留）───────────────
             df_d = _fetch_kline_with_sem(code, "daily", 120)
+            if _check_timeout("日线"):
+                return
             if df_d is None or len(df_d) == 0:
                 with _cnt_lock:
                     _skip[0] += 1
@@ -2345,29 +2459,32 @@ class DataEngine:
 
             # ── 周线（有多少拿多少）─────────────────────────────────
             df_w = _fetch_kline_with_sem(code, "weekly", 52)
+            if _check_timeout("周线"):
+                return
             if df_w is not None and len(df_w) > 0:
                 pkg["weekly"] = compute_indicators(df_w)
 
             # ── 月线（有多少拿多少）─────────────────────────────────
             df_m = _fetch_kline_with_sem(code, "monthly", 24)
+            if _check_timeout("月线"):
+                return
             if df_m is not None and len(df_m) > 0:
                 pkg["monthly"] = compute_indicators(df_m)
 
             # ── 资金流向 + 财务（远程 API，受信号量控速）────────────
-            with _api_sem:
-                pkg["fund_flow"] = self.fetch_fund_flow(code)
-            with _api_sem:
-                pkg["financial"] = self.fetch_financial(code)
-            with _api_sem:
-                pkg["profit_forecast"] = self.fetch_profit_forecast(code)
-            with _api_sem:
-                pkg["holder_num"] = self.fetch_holder_num(code)
-            with _api_sem:
-                pkg["goodwill_pledge"] = self.fetch_goodwill_pledge(code)
-            with _api_sem:
-                pkg["block_trade"] = self.fetch_block_trade(code)
-            with _api_sem:
-                pkg["margin_history"] = self.fetch_margin_history(code)
+            for fetch_name, fetch_fn, pkg_key in [
+                ("资金流", self.fetch_fund_flow, "fund_flow"),
+                ("财务", self.fetch_financial, "financial"),
+                ("盈利预测", self.fetch_profit_forecast, "profit_forecast"),
+                ("股东数", self.fetch_holder_num, "holder_num"),
+                ("商誉质押", self.fetch_goodwill_pledge, "goodwill_pledge"),
+                ("大宗交易", self.fetch_block_trade, "block_trade"),
+                ("融资融券", self.fetch_margin_history, "margin_history"),
+            ]:
+                if _check_timeout(fetch_name):
+                    return
+                with _api_sem:
+                    pkg[pkg_key] = fetch_fn(code)
 
             # ── 筹码分布（日线计算 + efinance资金流）─────────────────
             chip = self.fetch_chip_distribution(code, pkg.get("daily"))
@@ -2394,7 +2511,7 @@ class DataEngine:
             max_workers=max_workers, thread_name_prefix="DataFetch"
         ) as executor:
             futures = [executor.submit(_fetch_one, code) for code in codes]
-            # 等待所有完成，传播未捕获异常
+            # _fetch_one 内部有 _PER_STOCK_TIMEOUT 超时自退出，这里只需等全部返回
             for fut in concurrent.futures.as_completed(futures):
                 try:
                     fut.result()
@@ -2957,3 +3074,946 @@ class DataEngine:
             result["stock_packages"] = self.build_stock_data_package(all_codes, sector_map)
 
         return result
+
+    # ------------------------------------------------------------------ #
+    #  启动前数据源连通性预检                                               #
+    # ------------------------------------------------------------------ #
+
+    def preflight_data_check(self) -> List[Dict]:
+        """
+        并行测试所有数据源的连通性和延迟。
+        测试顺序/优先级: TDX本地 → akshare → tushare → 其他(adata/baostock)
+
+        返回:
+        [{"name", "source", "latency", "ok", "error", "detail"}, ...]
+        """
+        results: List[Dict] = []
+
+        # 计算最近交易日（回退到最近的工作日，避免非交易日空数据误报）
+        def _last_trade_date() -> str:
+            from datetime import datetime, timedelta
+            d = datetime.now()
+            # 如果当前时间在15:05之前，用前一个工作日
+            if d.hour < 15 or (d.hour == 15 and d.minute < 5):
+                d -= timedelta(days=1)
+            # 跳过周末
+            while d.weekday() >= 5:
+                d -= timedelta(days=1)
+            return d.strftime("%Y%m%d")
+
+        last_td = _last_trade_date()
+        last_td_dash = f"{last_td[:4]}-{last_td[4:6]}-{last_td[6:]}"  # baostock用
+
+        _TEST_TIMEOUT = 15  # 每个测试最多15秒
+
+        def _test(name: str, source: str, fn) -> Dict:
+            t = time.time()
+            try:
+                _ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                fut = _ex.submit(fn)
+                try:
+                    r = fut.result(timeout=_TEST_TIMEOUT)
+                except concurrent.futures.TimeoutError:
+                    # 不等待底层线程结束，立即返回超时结果
+                    _ex.shutdown(wait=False, cancel_futures=True)
+                    latency = round(time.time() - t, 2)
+                    return {"name": name, "source": source, "latency": latency,
+                            "ok": False, "error": f"超时({_TEST_TIMEOUT}s)", "detail": ""}
+                finally:
+                    _ex.shutdown(wait=False, cancel_futures=True)
+                latency = round(time.time() - t, 2)
+                ok = r is not None and (not isinstance(r, pd.DataFrame) or not r.empty)
+                detail = ""
+                if isinstance(r, pd.DataFrame):
+                    detail = f"{len(r)}行"
+                elif isinstance(r, (list, dict)):
+                    detail = f"{len(r)}条" if isinstance(r, list) else f"{len(r)}字段"
+                return {"name": name, "source": source, "latency": latency,
+                        "ok": ok, "error": "" if ok else "返回空数据", "detail": detail}
+            except Exception as e:
+                latency = round(time.time() - t, 2)
+                return {"name": name, "source": source, "latency": latency,
+                        "ok": False, "error": str(e)[:80], "detail": ""}
+
+        # ── 定义测试用例 ──
+        tests = []
+
+        # 1) TDX 本地数据
+        if self._tdx:
+            tests.append(("TDX日线(000001)", "TDX本地",
+                          lambda: self._tdx.daily(symbol='000001')))
+            tests.append(("TDX日线(600519)", "TDX本地",
+                          lambda: self._tdx.daily(symbol='600519')))
+        else:
+            results.append({"name": "TDX本地数据", "source": "TDX本地",
+                            "latency": 0, "ok": False,
+                            "error": "未安装mootdx或TDX目录不存在", "detail": ""})
+
+        # 2) akshare 接口
+        if ak:
+            tests.append(("行业板块列表", "akshare",
+                          lambda: ak.stock_board_industry_name_em()))
+        # 行业板块列表降级源（独立测试，不管 akshare 是否可用）
+        if self._pro:
+            tests.append(("行业列表(降级)", "tushare",
+                          lambda: self._tushare_industry_list()))
+            tests.append(("A股实时行情", "akshare",
+                          lambda: ak.stock_zh_a_spot_em()))
+            tests.append(("大盘指数快照", "akshare",
+                          lambda: ak.stock_zh_index_spot_em()))
+            tests.append(("涨停股池", "akshare",
+                          lambda: ak.stock_zt_pool_em(date=last_td)))
+            tests.append(("个股日K(000001)", "akshare",
+                          lambda: ak.stock_zh_a_hist(symbol="000001", period="daily",
+                                                     start_date=last_td, end_date=last_td,
+                                                     adjust="qfq")))
+        else:
+            results.append({"name": "akshare", "source": "akshare",
+                            "latency": 0, "ok": False,
+                            "error": "未安装akshare", "detail": ""})
+
+        # 3) tushare 接口
+        if self._pro:
+            tests.append(("交易日历", "tushare",
+                          lambda: self._pro.trade_cal(exchange='SSE', start_date=TODAY,
+                                                      end_date=TODAY)))
+            tests.append(("指数日线(000001.SH)", "tushare",
+                          lambda: self._pro.index_daily(ts_code='000001.SH',
+                                                        start_date=last_td, end_date=last_td)))
+        else:
+            results.append({"name": "tushare", "source": "tushare",
+                            "latency": 0, "ok": False,
+                            "error": "未配置token或未安装", "detail": ""})
+
+        # 4) 其他数据源
+        if _ADATA_AVAILABLE:
+            tests.append(("adata行情", "adata",
+                          lambda: adata.stock.market.get_market(stock_code='000001')))
+        else:
+            results.append({"name": "adata", "source": "adata",
+                            "latency": 0, "ok": False,
+                            "error": "未安装adata", "detail": ""})
+
+        if _BAOSTOCK_AVAILABLE:
+            def _test_baostock():
+                lg = bs.login()
+                if lg.error_code != '0':
+                    raise RuntimeError(f"login失败: {lg.error_msg}")
+                rs = bs.query_history_k_data_plus(
+                    "sh.000001", "date,close",
+                    start_date=last_td_dash, end_date=last_td_dash)
+                data_list = []
+                while rs.next():
+                    data_list.append(rs.get_row_data())
+                bs.logout()
+                return data_list or None
+            tests.append(("baostock行情", "baostock", _test_baostock))
+        else:
+            results.append({"name": "baostock", "source": "baostock",
+                            "latency": 0, "ok": False,
+                            "error": "未安装baostock", "detail": ""})
+
+        # ── 并行执行所有测试 ──
+        if tests:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(tests), 8)) as executor:
+                futures = {
+                    executor.submit(_test, name, source, fn): (name, source)
+                    for name, source, fn in tests
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    results.append(future.result())
+
+        # ── 按数据源优先级排序：TDX → akshare → tushare → 其他 ──
+        source_order = {"TDX本地": 0, "akshare": 1, "tushare": 2, "adata": 3, "baostock": 4}
+        results.sort(key=lambda r: (source_order.get(r["source"], 99), r["name"]))
+
+        return results
+
+    # =================================================================== #
+    #  L1: 量化预筛层 — 全市场扫描                                         #
+    # =================================================================== #
+
+    def L1_quant_filter(self, verbose: bool = True) -> List[Dict]:
+        """
+        L1 量化过滤：全市场扫描，筛选出符合量化条件的候选股。
+
+        先淘汰明显看空形态（三连阴、阴包阳、昨日大阴线）
+
+        通过条件（OR，任一满足即可）：
+          a. 近3日成交量逐日递增且总增量 > 50%
+          b. 近2日收盘价 > MA5 且 > MA10
+          c. MA5拐头向上 AND MA10拐头向上 AND (MA20走平 OR MA20向上)
+
+        市值 ≤ 500亿，PE < 50 或为空
+        """
+        if verbose:
+            print("\n[数据] L1: 全市场量化扫描...")
+            print("  ① 仅使用TDX本地数据（PE/市值过滤在个股日线中检查）...")
+
+        # Step 1: 生成A股代码列表
+        # 优先从 stock_list.json 读取真实股票清单（新浪接口获取的公开数据）
+        # 若文件不存在则回退到代码范围扫描
+        # 加载本地PE/市值缓存（stock_basics.json）
+        basics_file = Path(__file__).parent / "output" / "stock_basics.json"
+        basics_cache: Dict[str, Dict] = {}
+        if basics_file.exists():
+            try:
+                basics_data = json.loads(basics_file.read_text(encoding="utf-8"))
+                basics_cache = basics_data.get("data", {})
+                if verbose:
+                    print(f"  basics缓存: {len(basics_cache)} 只（日期: {basics_data.get('date', '未知')}）")
+            except Exception:
+                pass
+
+        stock_list_file = Path(__file__).parent / "output" / "stock_list.json"
+        if stock_list_file.exists():
+            try:
+                sl_data = json.loads(stock_list_file.read_text(encoding="utf-8"))
+                all_codes = list(sl_data.get("data", {}).keys())
+                if verbose:
+                    sl_date = sl_data.get("date", "未知")
+                    print(f"  股票清单: {len(all_codes)} 只（来源: stock_list.json, 日期: {sl_date}）")
+            except Exception:
+                all_codes = None
+        else:
+            all_codes = None
+
+        if all_codes is None:
+            # 回退：按代码范围生成
+            all_codes = []
+            for code in range(600000, 602000):
+                all_codes.append(f"{code:06d}")
+            for code in range(688000, 688300):
+                all_codes.append(f"{code:06d}")
+            for code in range(1, 2000):
+                all_codes.append(f"{code:06d}")
+            for code in range(300001, 302000):
+                all_codes.append(f"{code:06d}")
+            if verbose:
+                print(f"  代码范围: 约{len(all_codes)}只（沪市主板+科创板+深市主板+创业板，无stock_list.json）")
+        elif verbose:
+            print(f"  代码范围: 约{len(all_codes)}只")
+
+        # Step 2: 直接进入日线扫描，在个股循环内做所有过滤
+        codes = all_codes
+        candidate_results = []
+        checked = 0
+        failed = 0
+        eliminated_bear = 0  # 被预筛淘汰的看空形态
+        eliminated_pe_mcap = 0  # PE/市值不合格
+        eliminated_limitup = 0  # 涨停股
+        eliminated_liquidity = 0  # 流动性枯竭
+        eliminated空头 = 0  # 均线空头排列
+        eliminated无量空跌 = 0  # 无量空跌
+        _l1_start = time.time()
+
+        for code in codes:
+            checked += 1
+            if verbose and checked % 100 == 0:
+                elapsed = time.time() - _l1_start
+                rate = checked / elapsed if elapsed > 0 else 0
+                eta = (len(codes) - checked) / rate if rate > 0 else 0
+                print(f"\r  [L1] 进度 {checked}/{len(codes)} 只 ({rate:.0f}只/秒, 剩余约{eta:.0f}秒)", end="", flush=True)
+
+            df = self._tdx_daily_only(code, days=35)
+            if df is None or len(df) < 20:
+                failed += 1
+                continue
+
+            df = df.tail(35).reset_index(drop=True)
+
+            _c = "close" if "close" in df.columns else "收盘"
+            _o = "open" if "open" in df.columns else "开盘"
+            _h = "high" if "high" in df.columns else "最高"
+            _l = "low" if "low" in df.columns else "最低"
+            _v = "volume" if "volume" in df.columns else ("vol" if "vol" in df.columns else "成交量")
+
+            close_arr = df[_c].astype(float).values
+            open_arr = df[_o].astype(float).values
+            high_arr = df[_h].astype(float).values
+            low_arr = df[_l].astype(float).values
+            vol_arr = df[_v].astype(float).values
+
+            # ── 预筛：淘汰明显看空形态（基于已完成的最近交易日，不含今日）────
+            # df 已按时间升序排列，index -1=今日(可能未完成), -2=昨日(最近已完成)
+            n = len(close_arr)
+            if n < 3:
+                failed += 1
+                continue
+
+            # 最新完成的交易日(昨日): index -2
+            # 前一完成的交易日(前日): index -3
+            y_open = open_arr[-2]   # 昨日开盘
+            y_close = close_arr[-2]  # 昨日收盘
+            y_high = high_arr[-2]
+            y_low = low_arr[-2]
+            d_open = open_arr[-3]   # 前日开盘
+            d_close = close_arr[-3]  # 前日收盘
+
+            # ① 日线跌幅>5%（昨日收盘相比前日收盘）
+            decline_rate = (y_close - d_close) / d_close if d_close > 0 else 0
+            too_bearish = decline_rate < -0.05  # 跌幅超5%
+
+            # ② 昨日阴线（收盘<开盘）
+            is_bearish = y_close < y_open
+
+            # ③ 阴包阳：昨日阴线实体覆盖前日阳线实体
+            # 条件：昨日阴线 + 前日阳线 + 昨日开盘>前日收盘 + 昨日收盘<前日开盘
+            d_bullish = d_close > d_open  # 前日阳线
+            y_engulfs_d = (is_bearish and d_bullish and
+                            y_open > d_close and
+                            y_close < d_open)
+
+            # ④ 连续三天阴线：最近3个已完成交易日都是阴线
+            if n >= 4:
+                d1_bearish = close_arr[-2] < open_arr[-2]   # 昨日阴线
+                d2_bearish = close_arr[-3] < open_arr[-3]   # 前日阴线
+                d3_bearish = close_arr[-4] < open_arr[-4]   # 大前日阴线
+                three_consecutive_bearish = d1_bearish and d2_bearish and d3_bearish
+            else:
+                three_consecutive_bearish = False
+
+            if too_bearish or is_bearish or y_engulfs_d or three_consecutive_bearish:
+                eliminated_bear += 1
+                continue
+
+            # ── 预筛：PE/市值/换手率/涨停/均线/无量空跌 ───────────────
+            # 先计算均线（后续多个过滤器共享）
+            ma5_series = self._calc_sma(pd.Series(close_arr), 5)
+            ma10_series = self._calc_sma(pd.Series(close_arr), 10)
+            ma20_series = self._calc_sma(pd.Series(close_arr), 20)
+            ma5 = ma5_series.iloc[-1]
+            ma10 = ma10_series.iloc[-1]
+            ma20 = ma20_series.iloc[-1]
+
+            # ① PE>60 OR PE<10 OR 市值>500亿 → 淘汰
+            if code in basics_cache:
+                b = basics_cache[code]
+                pe = b.get("pe")
+                mktcap = b.get("mktcap")
+                if (pe is not None and (pe > 60 or pe < 10)) or \
+                   (mktcap is not None and mktcap > 500):
+                    eliminated_pe_mcap += 1
+                    continue
+
+            # ② 今日涨停（沪深10%，科创/创业板20%，ST 5%）→ 淘汰
+            # 今日数据（index -1）若为涨停则排除（最后结果不含涨停股）
+            today_close = close_arr[-1]
+            today_high = high_arr[-1]
+            y_close = close_arr[-2]   # 昨日收盘（已验证为已完成）
+            if y_close > 0:
+                # 判断涨停：收盘≈最高价 且 涨幅≈±10%（普通股）
+                gain_today = (today_close - y_close) / y_close
+                is_limitup = (abs(today_close - today_high) < 0.01) and (gain_today > 0.099)
+                if is_limitup:
+                    eliminated_limitup += 1
+                    continue
+
+            # ③ 换手率<0.5% OR 成交额<1亿 → 淘汰
+            # TDX日线无换手率字段，通过成交量估算
+            # 成交额 ≈ 成交量(手)×收盘价×100 → 亿元
+            if y_close > 0 and y_close < 10000:  # 排除极端价格
+                estimated_amount = vol_arr[-2] * y_close * 100 / 1e8  # 亿元
+                # 流通市值估算
+                if code in basics_cache:
+                    float_shares = basics_cache[code].get("float_shares")  # 万股
+                    if float_shares and float_shares > 0:
+                        float_mktcap = float_shares * y_close / 10000  # 万股×元→亿元
+                        if float_mktcap > 0:
+                            estimated_turnover_rate = (vol_arr[-2] / (float_shares * 100)) * 100  # %
+                            if estimated_turnover_rate < 0.5 or estimated_amount < 1:
+                                eliminated_liquidity += 1
+                                continue
+
+            # ④ 均线空头排列 MA5<MA10<MA20 → 淘汰
+            if ma5 < ma10 < ma20:
+                eliminated空头 += 1
+                continue
+
+            # ⑤ 无量空跌：近3日（已完成）连续下跌且成交量萎缩
+            # 使用 index -2(昨日), -3(前日), -4(大前日) —— 不含今日未完成数据
+            if n >= 4:
+                c1 = close_arr[-2]   # 昨日收盘
+                c2 = close_arr[-3]   # 前日收盘
+                c3 = close_arr[-4]   # 大前日收盘
+                v1 = vol_arr[-2]     # 昨日成交量
+                v2 = vol_arr[-3]     # 前日成交量
+                v3 = vol_arr[-4]     # 大前日成交量
+                # 连续3天下跌：c1<c2<c3（指数越小越低）
+                down_3 = (c1 < c2) and (c2 < c3)
+                # 成交量萎缩：v1<v2 and v2<v3
+                vol_shrink = (v1 < v2) and (v2 < v3)
+                if down_3 and vol_shrink:
+                    eliminated无量空跌 += 1
+                    continue
+
+            # ── 条件 a：近3日成交量逐日递增且总增量 > 50% ─────────
+            v1, v2, v3 = vol_arr[-3], vol_arr[-2], vol_arr[-1]
+            vol_increasing = (v2 > v1) and (v3 > v2)
+            ma_vol_10 = vol_arr[-10:-3].mean() if len(vol_arr) >= 10 else vol_arr.mean()
+            vol_increase = ((v3 - v1) / max(ma_vol_10, 1)) if ma_vol_10 > 0 else 0
+            cond_a = vol_increasing and (vol_increase > 0.50)
+
+            # ── 条件 b：近2日收盘价 > MA5 且 > MA10 ───────────────
+            cond_b = (close_arr[-2] > ma5) and (close_arr[-1] > ma5) and \
+                     (close_arr[-2] > ma10) and (close_arr[-1] > ma10)
+
+            # ── 条件 c：MA5/MA10拐头向上，MA20走平或向上 ──────────
+            # 对比前5日均值与当前值判断趋势
+            ma5_prev = ma5_series.iloc[-6] if len(ma5_series) >= 6 else ma5_series.iloc[0]
+            ma10_prev = ma10_series.iloc[-6] if len(ma10_series) >= 6 else ma10_series.iloc[0]
+            ma20_prev = ma20_series.iloc[-11] if len(ma20_series) >= 11 else ma20_series.iloc[0]
+            ma5_up = ma5 > ma5_prev
+            ma10_up = ma10 > ma10_prev
+            # MA20走平：|斜率|小，或方向向上
+            ma20_up = ma20 > ma20_prev
+            ma20_flat = abs(ma20 - ma20_prev) / max(ma20_prev, 1) < 0.005
+            cond_c = ma5_up and ma10_up and (ma20_up or ma20_flat)
+
+            if cond_a or cond_b or cond_c:
+                candidate_results.append({
+                    "code": code,
+                    "name": code,  # TDX无名称，用代码代替
+                    "放量幅度": round(vol_increase * 100, 1),
+                    "close": close_arr[-1],
+                    "MA5": round(ma5, 2),
+                    "MA10": round(ma10, 2),
+                    "MA20": round(ma20, 2),
+                    "cond_a": cond_a,
+                    "cond_b": cond_b,
+                    "cond_c": cond_c,
+                    "df": df,
+                })
+
+        if verbose:
+            elapsed = time.time() - _l1_start
+            print(f"\n  [L1] ✓ 完成：{len(candidate_results)} 只通过全量筛选，耗时 {elapsed:.1f}秒")
+            print(f"       检查 {checked} 只 | 看空淘汰 {eliminated_bear} 只 | 数据不足 {failed} 只")
+            print(f"       PE/市值淘汰 {eliminated_pe_mcap} | 涨停淘汰 {eliminated_limitup} | "
+                  f"流动性淘汰 {eliminated_liquidity} | 空头排列 {eliminated空头} | 无量空跌 {eliminated无量空跌}")
+
+        return candidate_results
+
+    # ------------------------------------------------------------------ #
+    #  L2: 形态过滤层 — 缠论 + 波浪                                       #
+    # ------------------------------------------------------------------ #
+
+    def L2_chan_wave_filter(self, candidates: List[Dict], verbose: bool = True) -> List[Dict]:
+        """
+        L2 形态过滤：对 L1 候选股进行缠论 + 波浪分析。
+
+        通过条件 = （缠买点 OR 波浪上涨预期）AND NOT（缠卖点 OR 波浪下跌形态）
+        """
+        if verbose:
+            print(f"\n[数据] L2: 形态过滤（缠论+波浪）...")
+            print(f"  输入: {len(candidates)} 只")
+
+        if len(candidates) == 0:
+            return []
+
+        passed = []
+        chan_pass = 0
+        wave_pass = 0
+        both_pass = 0
+        chan_reject = 0
+        wave_reject = 0
+        no_signal = 0
+        chan_error = 0
+
+        # 延迟导入缠论库（可选依赖）
+        Chan = None
+        try:
+            import sys as _sys
+            _aicoding_parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # D:/BaiduSyncdisk/aicoding
+            if _aicoding_parent not in _sys.path:
+                _sys.path.insert(0, _aicoding_parent)
+            from chan.Chan import CChan as _Chan
+            Chan = _Chan
+        except ImportError:
+            if verbose:
+                print("  [L2] chan.py 未安装，跳过缠论分析，仅用波浪")
+            Chan = None
+
+        _l2_start = time.time()
+        _l2_idx = 0
+        for stock in candidates:
+            _l2_idx += 1
+            if verbose and _l2_idx % 50 == 0:
+                elapsed = time.time() - _l2_start
+                rate = _l2_idx / elapsed if elapsed > 0 else 0
+                eta = (len(candidates) - _l2_idx) / rate if rate > 0 else 0
+                print(f"\r  [L2] 进度 {_l2_idx}/{len(candidates)} 只 (缠论约{rate:.0f}只/秒, 剩余约{eta:.0f}秒)", end="", flush=True)
+            df = stock.get("df")
+            if df is None or len(df) < 30:
+                no_signal += 1
+                continue
+
+            code = stock["code"]
+            name = stock["name"]
+
+            # 缠论分析
+            chan_bi = None
+            chan_sell = False
+            chan_buy = False
+            chan_signal = ""
+
+            if Chan is not None:
+                try:
+                    from chan.Common.CEnum import AUTYPE, BSP_TYPE, DATA_SRC, KL_TYPE, DATA_FIELD
+                    from chan.Common.CTime import CTime
+                    from chan.KLine.KLine_Unit import CKLine_Unit
+                    from chan.Common.func_util import str2float
+
+                    # 缠论需要250+根K线，L1传入的df只有35根，重新从TDX获取
+                    df_for_chan = self._tdx_daily_only(code, days=300)
+                    if df_for_chan is None or len(df_for_chan) < 20:
+                        raise ValueError("TDX缠论数据不足")
+                    klu_list = []
+                    df_kline = df_for_chan.tail(250)
+                    # 处理日期列：优先用"日期"/"date"列，否则从索引获取
+                    has_date_col = "日期" in df_kline.columns or "date" in df_kline.columns
+
+                    for idx in range(len(df_kline)):
+                        row = df_kline.iloc[idx]
+                        # 获取日期
+                        if has_date_col:
+                            date_val = str(row.get("日期", row.get("date", "")))
+                        else:
+                            # 日期在索引中（TDX返回的DataFrame）
+                            date_idx = df_kline.index[idx]
+                            if hasattr(date_idx, 'strftime'):
+                                date_val = date_idx.strftime("%Y-%m-%d")
+                            else:
+                                date_val = str(date_idx)[:10]
+                        if len(date_val) != 10:
+                            continue
+                        year, month, day = int(date_val[:4]), int(date_val[5:7]), int(date_val[8:10])
+
+                        # 获取OHLC（支持中英文列名和TDX格式）
+                        o = str2float(row.get("开盘", row.get("open", row.get("开盘价", 0))))
+                        h = str2float(row.get("最高", row.get("high", row.get("最高价", 0))))
+                        l = str2float(row.get("最低", row.get("low", row.get("最低价", 0))))
+                        c = str2float(row.get("收盘", row.get("close", row.get("收盘价", 0))))
+                        # 缠论要求 high >= max(open, close) 且 low <= min(open, close)
+                        h = max(o, c, h)
+                        l = min(o, c, l)
+
+                        item = {
+                            DATA_FIELD.FIELD_TIME: CTime(year, month, day, 0, 0, auto=False),
+                            DATA_FIELD.FIELD_OPEN: o,
+                            DATA_FIELD.FIELD_HIGH: h,
+                            DATA_FIELD.FIELD_LOW: l,
+                            DATA_FIELD.FIELD_CLOSE: c,
+                        }
+                        vol_val = row.get("成交量", row.get("volume", None))
+                        if vol_val is not None:
+                            item[DATA_FIELD.FIELD_VOLUME] = str2float(vol_val)
+                        klu = CKLine_Unit(item)
+                        klu_list.append(klu)
+
+                    if len(klu_list) < 20:
+                        no_signal += 1
+                        continue
+
+                    # 创建缠论实例并加载数据
+                    # trigger_step=True 防止__init__自动调用load()加载BaoStock数据
+                    from chan.ChanConfig import CChanConfig
+                    config = CChanConfig()
+                    config.trigger_step = True
+                    config.print_warning = False
+                    config.print_err_time = False
+                    ch = Chan(
+                        code=code,
+                        begin_time=None,
+                        end_time=None,
+                        data_src=DATA_SRC.BAO_STOCK,
+                        lv_list=[KL_TYPE.K_DAY],
+                        config=config,
+                        autype=AUTYPE.QFQ,
+                    )
+                    ch.trigger_load({KL_TYPE.K_DAY: klu_list})
+
+                    # 获取买卖点（使用正确的缠论 API）
+                    chan_data = ch[0]
+                    bsp_list = chan_data.bs_point_lst.get_latest_bsp(number=0)
+                    # bsp_list: 所有笔端点形成的买卖点(含1类/2类/3类)
+                    for bsp in bsp_list:
+                        # 只看1类买卖点(T1=1买/1卖, T1P=1类强力型)
+                        if BSP_TYPE.T1 in bsp.type or BSP_TYPE.T1P in bsp.type:
+                            if bsp.is_buy:
+                                chan_buy = True
+                                chan_signal += f"买({bsp.type2str()});"
+                            else:
+                                chan_sell = True
+                                chan_signal += f"卖({bsp.type2str()});"
+                except Exception as e:
+                    # 缠论分析失败时跳过（静默）
+                    if chan_error == 0:
+                        print(f"\n  [L2] 缠论异常（仅显示首个）: {type(e).__name__}: {e}")
+                    chan_error += 1
+
+            # 波浪分析（使用 ta-lib）
+            wave_bull = False
+            wave_bear = False
+            wave_signal = ""
+            try:
+                import talib
+                _c = "close" if "close" in df.columns else "收盘"
+                _h = "high" if "high" in df.columns else "最高"
+                _l = "low" if "low" in df.columns else "最低"
+                close = df[_c].astype(float).values
+                high = df[_h].astype(float).values
+                low = df[_l].astype(float).values
+                volume = df["volume"].astype(float).values if "volume" in df.columns else (df["成交量"].astype(float).values if "成交量" in df.columns else None)
+
+                # RSI 背离检测（简化版）
+                rsi = talib.RSI(close, timeperiod=14)
+                rsi_last = rsi[-5:]  # 最近5个RSI值
+
+                # 检测最近的高低点
+                recent_high_idx = np.argmax(high[-20:])  # 近20日高点
+                recent_low_idx = np.argmin(low[-20:])   # 近20日低点
+                recent_high_val = high[-20:][recent_high_idx]
+                recent_low_val = low[-20:][recent_low_idx]
+                price_high = close[-1] > recent_low_val  # 当前价格在低点上方
+
+                # 2浪底：回调幅度在0.382-0.786之间，且RSI未创新低
+                if recent_high_idx > recent_low_idx:  # 刚经历一波上涨后的回调
+                    # 计算从高点到当前回调幅度
+                    price_drop = (recent_high_val - close[-1]) / max(recent_high_val, 1)
+                    if 0.3 < price_drop < 0.6:  # 回调38%-60%区间
+                        wave_bull = True
+                        wave_signal += "2浪底;"
+                    elif price_drop >= 0.6:  # 回调太深可能是3浪下跌
+                        wave_bear = True
+                        wave_signal += "3浪下跌中;"
+
+                # 检测MACD背离
+                macd, signal, hist = talib.MACD(close, fastperiod=12, slowperiod=26, signalperiod=9)
+                if len(macd) >= 10:
+                    macd_recent = macd[-10:]
+                    price_recent = close[-10:]
+                    # 价格新低但MACD未新低 = 底背离（上涨信号）
+                    if (close[-1] < np.min(price_recent[:-1]) and
+                        macd[-1] > np.min(macd_recent[:-1])):
+                        wave_bull = True
+                        wave_signal += "MACD底背离;"
+                    # 价格新高但MACD未新高 = 顶背离（下跌信号）
+                    elif (close[-1] > np.max(price_recent[:-1]) and
+                          macd[-1] < np.max(macd_recent[:-1])):
+                        wave_bear = True
+                        wave_signal += "MACD顶背离;"
+
+                # 5浪完成检测（5浪后往往下跌）
+                # 简化：用ZigZag近似
+                try:
+                    zigzag = talib.ZIGZAG(close, penetration=0.05)
+                    # 检测最近是否有连续5波
+                    zz_diff = np.diff(zigzag)
+                    # 找拐点
+                except Exception:
+                    pass
+
+                # 成交量放大确认上涨趋势
+                if volume is not None:
+                    vol_ma5 = np.mean(volume[-5:])
+                    vol_ma20 = np.mean(volume[-20:])
+                    if vol_ma5 > vol_ma20 * 1.5 and close[-1] > close[-5]:
+                        if not wave_bull:
+                            wave_bull = True
+                            wave_signal += "量价齐升;"
+                        if wave_bear:
+                            wave_bear = False  # 量能充足时取消下跌信号
+
+            except ImportError:
+                if verbose:
+                    print(f"  [L2] ta-lib 未安装，跳过波浪分析")
+            except Exception:
+                pass
+
+            # 综合判定
+            has_buy_signal = chan_buy or wave_bull
+            has_sell_signal = chan_sell or wave_bear
+
+            if has_sell_signal:
+                # 卖点一票否决
+                if chan_sell:
+                    chan_reject += 1
+                if wave_bear:
+                    wave_reject += 1
+                continue
+
+            if has_buy_signal:
+                passed.append({
+                    **stock,
+                    "chan_buy": chan_signal or (chan_buy and "买点" not in chan_signal),
+                    "wave_bull": wave_signal or (wave_bull and "波浪" not in wave_signal),
+                    "chan_buy_detail": chan_signal,
+                    "wave_bull_detail": wave_signal,
+                })
+                if chan_buy and wave_bull:
+                    both_pass += 1
+                elif chan_buy:
+                    chan_pass += 1
+                else:
+                    wave_pass += 1
+            else:
+                no_signal += 1
+
+        if verbose:
+            elapsed = time.time() - _l2_start
+            print(f"\n  [L2] ✓ 通过: {len(passed)} 只，耗时 {elapsed:.1f}秒")
+            print(f"       缠论买点: {chan_pass} | 波浪上涨: {wave_pass} | 两者都有: {both_pass}")
+            print(f"       缠论卖点排除: {chan_reject} | 波浪下跌排除: {wave_reject} | 无信号: {no_signal} | 缠论异常: {chan_error}")
+
+        return passed
+
+    # ------------------------------------------------------------------ #
+    #  L3: K线图 + 指标生成                                               #
+    # ------------------------------------------------------------------ #
+
+    def L3_generate_charts(self, candidates: List[Dict],
+                           output_dir: str = "output/charts",
+                           verbose: bool = True) -> Dict[str, str]:
+        """
+        L3: 为候选股票生成 K线图 + MACD + KDJ + RSI 截图。
+
+        返回: {code: {"kline": path, "macd": path, "kdj": path, "rsi": path}}
+        """
+        os.makedirs(output_dir, exist_ok=True)
+
+        if verbose:
+            print(f"\n[数据] L3: 生成K线图+指标图...")
+            print(f"  生成 {len(candidates)} 只股票的图表...")
+
+        chart_paths: Dict[str, Dict[str, str]] = {}
+
+        for i, stock in enumerate(candidates):
+            code = stock["code"]
+            name = stock["name"]
+            df = stock.get("df")
+
+            if df is None or len(df) < 20:
+                continue
+
+            stock_dir = os.path.join(output_dir, code)
+            os.makedirs(stock_dir, exist_ok=True)
+            chart_paths[code] = {}
+
+            try:
+                import matplotlib
+                matplotlib.use("Agg")  # 无头模式，不弹出窗口
+                import matplotlib.pyplot as plt
+                import matplotlib.gridspec as gridspec
+                from matplotlib import font_manager
+
+                # 设置中文字体
+                font_paths = [
+                    "C:/Windows/Fonts/simhei.ttf",
+                    "C:/Windows/Fonts/msyh.ttc",
+                    "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+                ]
+                for fp in font_paths:
+                    if os.path.exists(fp):
+                        plt.rcParams["font.sans-serif"] = [
+                            font_manager.FontProperties(fname=fp).get_name()
+                        ]
+                        break
+                plt.rcParams["axes.unicode_minus"] = False
+
+                _c = "close" if "close" in df.columns else "收盘"
+                _h = "high" if "high" in df.columns else "最高"
+                _l = "low" if "low" in df.columns else "最低"
+                _o = "open" if "open" in df.columns else "开盘"
+                close = df[_c].astype(float).values
+                high = df[_h].astype(float).values
+                low = df[_l].astype(float).values
+                open_col = df[_o].astype(float).values
+                volume = None
+                for vc in ["成交量", "vol", "volume"]:
+                    if vc in df.columns:
+                        volume = df[vc].astype(float).values
+                        break
+
+                # 计算指标
+                import talib
+                ma5 = talib.SMA(np.array(close), timeperiod=5)
+                ma10 = talib.SMA(np.array(close), timeperiod=10)
+                ma20 = talib.SMA(np.array(close), timeperiod=20)
+                macd, macd_sig, macd_hist = talib.MACD(np.array(close))
+                k, d = talib.STOCH(high, low, close)
+                rsi = talib.RSI(np.array(close), timeperiod=14)
+
+                # 绘图：K线 + 均线（主图）
+                n = min(60, len(df))  # 最近60根K线
+                x = range(n)
+                closes_n = close[-n:]
+                highs_n = high[-n:]
+                lows_n = low[-n:]
+                opens_n = open_col[-n:]
+
+                fig = plt.figure(figsize=(14, 10))
+                gs = gridspec.GridSpec(4, 1, height_ratios=[3, 1, 1, 1], hspace=0.1)
+
+                # 1. K线 + 均线
+                ax1 = fig.add_subplot(gs[0])
+                for j in range(n):
+                    c = closes_n[j]
+                    o = opens_n[j]
+                    h = highs_n[j]
+                    l = lows_n[j]
+                    color = "#e74c3c" if c >= o else "#27ae60"
+                    ax1.plot([j, j], [l, h], color=color, linewidth=0.8)
+                    ax1.plot([j-0.3, j+0.3], [c, c], color=color, linewidth=0.8)
+                    ax1.plot([j-0.3, j+0.3], [o, o], color=color, linewidth=0.8)
+                    ax1.add_patch(plt.Rectangle((j-0.35, min(o, c)), 0.7, abs(c-o),
+                                                 color=color, alpha=0.3))
+
+                ma5_n = ma5[-n:]
+                ma10_n = ma10[-n:]
+                ma20_n = ma20[-n:]
+                ax1.plot(x, ma5_n, label="MA5", linewidth=1, color="#e74c3c")
+                ax1.plot(x, ma10_n, label="MA10", linewidth=1, color="#3498db")
+                ax1.plot(x, ma20_n, label="MA20", linewidth=1, color="#f39c12")
+                ax1.set_title(f"{code} {name}", fontsize=14, fontweight="bold")
+                ax1.legend(loc="upper left")
+                ax1.set_xticklabels([])
+                ax1.grid(True, alpha=0.3)
+
+                # 2. MACD
+                ax2 = fig.add_subplot(gs[1], sharex=ax1)
+                macd_n = macd[-n:]
+                sig_n = macd_sig[-n:]
+                hist_n = macd_hist[-n:]
+                ax2.bar(x, hist_n, color=["#e74c3c" if h > 0 else "#27ae60" for h in hist_n], alpha=0.6)
+                ax2.plot(x, macd_n, color="#3498db", linewidth=1, label="MACD")
+                ax2.plot(x, sig_n, color="#f39c12", linewidth=1, label="Signal")
+                ax2.axhline(y=0, color="gray", linewidth=0.5)
+                ax2.legend(loc="upper left", fontsize=8)
+                ax2.set_xticklabels([])
+                ax2.grid(True, alpha=0.3)
+
+                # 3. KDJ
+                ax3 = fig.add_subplot(gs[2], sharex=ax1)
+                k_n = k[-n:]
+                d_n = d[-n:]
+                ax3.plot(x, k_n, color="#e74c3c", linewidth=1, label="K")
+                ax3.plot(x, d_n, color="#3498db", linewidth=1, label="D")
+                ax3.axhline(y=80, color="gray", linewidth=0.5, linestyle="--")
+                ax3.axhline(y=20, color="gray", linewidth=0.5, linestyle="--")
+                ax3.legend(loc="upper left", fontsize=8)
+                ax3.set_xticklabels([])
+                ax3.grid(True, alpha=0.3)
+
+                # 4. RSI
+                ax4 = fig.add_subplot(gs[3], sharex=ax1)
+                rsi_n = rsi[-n:]
+                ax4.plot(x, rsi_n, color="#9b59b6", linewidth=1.5, label="RSI14")
+                ax4.axhline(y=70, color="gray", linewidth=0.5, linestyle="--")
+                ax4.axhline(y=30, color="gray", linewidth=0.5, linestyle="--")
+                ax4.fill_between(x, rsi_n, 70, where=(rsi_n >= 70), color="#e74c3c", alpha=0.2)
+                ax4.fill_between(x, rsi_n, 30, where=(rsi_n <= 30), color="#27ae60", alpha=0.2)
+                ax4.set_xlim(-1, n)
+                ax4.legend(loc="upper left", fontsize=8)
+                ax4.set_xticklabels([])
+                ax4.grid(True, alpha=0.3)
+
+                # 保存
+                out_path = os.path.join(stock_dir, f"{code}_{name}.png")
+                fig.savefig(out_path, dpi=80, bbox_inches="tight",
+                           facecolor="white", edgecolor="none")
+                plt.close(fig)
+                chart_paths[code] = {"chart": out_path}
+
+            except ImportError as e:
+                if verbose:
+                    print(f"  [L3] 缺少依赖: {e}，跳过图表生成")
+                chart_paths[code] = {}
+            except Exception as e:
+                if verbose:
+                    print(f"  [L3] {code} 图表生成失败: {e}")
+                chart_paths[code] = {}
+
+        if verbose:
+            success = sum(1 for v in chart_paths.values() if v)
+            print(f"  [L3] ✓ 完成：{success}/{len(candidates)} 只图表生成成功")
+
+        return chart_paths
+
+    # ------------------------------------------------------------------ #
+    #  辅助方法                                                           #
+    # ------------------------------------------------------------------ #
+
+    def _tdx_daily_only(self, code: str, days: int = 60) -> Optional[pd.DataFrame]:
+        """仅从TDX本地获取日线数据（不调用任何远程API）"""
+        if not self._tdx:
+            return None
+        try:
+            df = self._tdx.daily(symbol=code)
+            if df is not None and len(df) > 0:
+                return df.tail(days + 10)
+        except Exception:
+            pass
+        return None
+
+    def _fetch_daily_data(self, code: str, days: int = 60) -> Optional[pd.DataFrame]:
+        """获取个股日线数据（优先TDX本地 -> akshare -> tushare）"""
+        end_date = datetime.now().strftime("%Y%m%d")
+        start_date = (datetime.now() - timedelta(days=days * 2)).strftime("%Y%m%d")
+
+        # TDX 本地
+        if self._tdx:
+            try:
+                df = self._tdx.daily(symbol=code)
+                if df is not None and len(df) > 0:
+                    # TDX 列名: date, open, high, low, close, turnover
+                    df = df.tail(days + 10)
+                    return df
+            except Exception:
+                pass
+
+        # akshare
+        if ak:
+            try:
+                df = ak.stock_zh_a_hist(
+                    symbol=code, period="daily",
+                    start_date=start_date, end_date=end_date, adjust="qfq"
+                )
+                if df is not None and len(df) > 0:
+                    # 统一列名：支持中文（日期/开盘/收盘/最高/最低/成交量）和英文（date/open/close/high/low/volume）
+                    rename = {}
+                    for c in df.columns:
+                        cl = c.lower()
+                        if "日期" in c or cl == "date":
+                            rename[c] = "date"
+                        elif "开盘" in c or cl == "open":
+                            rename[c] = "open"
+                        elif "收盘" in c or cl == "close":
+                            rename[c] = "close"
+                        elif "最高" in c or cl == "high":
+                            rename[c] = "high"
+                        elif "最低" in c or cl == "low":
+                            rename[c] = "low"
+                        elif "成交量" in c or cl in ("volume", "vol"):
+                            rename[c] = "volume"
+                    if rename:
+                        df = df.rename(columns=rename)
+                    return df.tail(days + 10)
+            except Exception:
+                pass
+
+        # tushare
+        if self._pro:
+            try:
+                df = self._pro.daily(ts_code=code, start_date=start_date, end_date=end_date)
+                if df is not None and len(df) > 0:
+                    return df.tail(days + 10)
+            except Exception:
+                pass
+
+        return None
+
+    @staticmethod
+    def _calc_sma(series: pd.Series, period: int) -> pd.Series:
+        """计算简单移动平均"""
+        return series.rolling(window=period, min_periods=1).mean()
