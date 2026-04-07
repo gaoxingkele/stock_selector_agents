@@ -50,7 +50,7 @@ CLOUBIC_MODEL_MAP = {
     "minimax":   os.getenv("CLOUBIC_MINIMAX_MODEL", "MiniMax-M2.5").strip(),
     # 不在 Cloubic 的 provider，映射到 Cloubic 可用模型作为 fallback
     "kimi":      os.getenv("CLOUBIC_KIMI_MODEL", "deepseek-v3.2").strip(),
-    "glm":       os.getenv("CLOUBIC_GLM_MODEL", "glm-5").strip(),
+    "glm":       os.getenv("CLOUBIC_GLM_MODEL", "glm-4-flash").strip(),
     "perplexity": os.getenv("CLOUBIC_PERPLEXITY_MODEL", "deepseek-v3.2").strip(),
 }
 
@@ -115,8 +115,8 @@ class Config:
     providers: Dict[str, ProviderConfig] = field(default_factory=dict)
     tdx_dir: str = "d:/tdx"   # 本地通达信安装目录
 
-    # 面板大小：每次讨论/辩论调用的LLM数量（默认4: qwen+kimi+openai+claude）
-    panel_size: int = 4
+    # 面板大小：每次讨论/辩论调用的LLM数量（默认3: minimax+doubao+glm）
+    panel_size: int = 3
 
     # 辩论轮次
     debate_rounds: int = 1

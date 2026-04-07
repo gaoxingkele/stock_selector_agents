@@ -3233,7 +3233,8 @@ class DataEngine:
     #  L1: 量化预筛层 — 全市场扫描                                         #
     # =================================================================== #
 
-    def L1_quant_filter(self, verbose: bool = True) -> List[Dict]:
+    def L1_quant_filter(self, verbose: bool = True,
+                        cutoff_date: str = None) -> List[Dict]:
         """
         L1 量化过滤：全市场扫描，筛选出符合量化条件的候选股。
 
@@ -3315,7 +3316,7 @@ class DataEngine:
                 eta = (len(codes) - checked) / rate if rate > 0 else 0
                 print(f"\r  [L1] 进度 {checked}/{len(codes)} 只 ({rate:.0f}只/秒, 剩余约{eta:.0f}秒)", end="", flush=True)
 
-            df = self._tdx_daily_only(code, days=35)
+            df = self._tdx_daily_only(code, days=35, cutoff_date=cutoff_date)
             if df is None or len(df) < 20:
                 failed += 1
                 continue
@@ -3944,13 +3945,28 @@ class DataEngine:
     #  辅助方法                                                           #
     # ------------------------------------------------------------------ #
 
-    def _tdx_daily_only(self, code: str, days: int = 60) -> Optional[pd.DataFrame]:
-        """仅从TDX本地获取日线数据（不调用任何远程API）"""
+    def _tdx_daily_only(self, code: str, days: int = 60,
+                        cutoff_date: str = None) -> Optional[pd.DataFrame]:
+        """仅从TDX本地获取日线数据（不调用任何远程API）
+
+        cutoff_date: 'YYYYMMDD'，设置后只返回该日期及之前的数据（回测point-in-time用）
+        """
         if not self._tdx:
             return None
         try:
             df = self._tdx.daily(symbol=code)
             if df is not None and len(df) > 0:
+                if cutoff_date:
+                    # 过滤到 cutoff_date（含），严格 point-in-time
+                    if 'date' in df.columns:
+                        date_series = pd.to_datetime(df['date']).dt.strftime('%Y%m%d')
+                    else:
+                        date_series = pd.Series(df.index).apply(
+                            lambda x: pd.to_datetime(x).strftime('%Y%m%d')
+                        )
+                    df = df[date_series.values <= cutoff_date]
+                    if len(df) == 0:
+                        return None
                 return df.tail(days + 10)
         except Exception:
             pass

@@ -2151,8 +2151,8 @@ def main():
     )
     parser.add_argument(
         "--panel", "-p",
-        type=int, default=4,
-        help="并行模型数量（默认4: qwen+kimi+openai+claude）",
+        type=int, default=3,
+        help="并行模型数量（默认3: minimax+doubao+glm）",
     )
     parser.add_argument(
         "--models",
