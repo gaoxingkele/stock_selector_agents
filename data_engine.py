@@ -3575,278 +3575,208 @@ class DataEngine:
         return top_results
 
     # ------------------------------------------------------------------ #
-    #  L2: 形态过滤层 — 缠论 + 波浪                                       #
+    #  L2: 综合评分 + Top30 排名                                           #
     # ------------------------------------------------------------------ #
 
-    def L2_chan_wave_filter(self, candidates: List[Dict], verbose: bool = True) -> List[Dict]:
+    def L2_score_and_rank(self, candidates: List[Dict], verbose: bool = True,
+                          top_n: int = 30) -> List[Dict]:
         """
-        L2 形态过滤：对 L1 候选股进行缠论 + 波浪分析。
+        L2 综合评分：对 L1 候选股进行多维打分排名。
 
-        通过条件 = （缠买点 OR 波浪上涨预期）AND NOT（缠卖点 OR 波浪下跌形态）
+        综合评分 = 形态分(40%) + 量能确认分(30%) + 动量分(30%)
+
+        形态分(0~100):
+          - MA多头排列(MA5>MA10>MA20) = 30, MA5>MA10 = 15
+          - ATR收窄程度 = 0~30（连续值）
+          - 站上MA20 = 15
+          - 站上MA60 = 15
+          - MACD多头排列(DIF>DEA) = 10
+
+        量能确认分(0~100):
+          - 缩量蓄势(近5日均量 < 20日均量×0.8) = 40
+          - 量能稳定(低变异系数) = 0~30
+          - 温和收阳(收阳+量不超1.5×均量) = 30
+
+        动量分(0~100):
+          - RPS20百分位 × 50（复用L1的rps20）
+          - 5日超额收益百分位 × 50
+
+        风控否决：连续5日下跌 / 当日暴跌>7%
+
+        输出 Top N（默认30），按综合得分降序。
         """
         if verbose:
-            print(f"\n[数据] L2: 形态过滤（缠论+波浪）...")
+            print(f"\n[数据] L2: 综合评分排名...")
             print(f"  输入: {len(candidates)} 只")
 
-        if len(candidates) == 0:
+        if not candidates:
             return []
 
-        passed = []
-        chan_pass = 0
-        wave_pass = 0
-        both_pass = 0
-        chan_reject = 0
-        wave_reject = 0
-        no_signal = 0
-        chan_error = 0
-
-        # 延迟导入缠论库（可选依赖）
-        Chan = None
-        try:
-            import sys as _sys
-            _aicoding_parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # D:/BaiduSyncdisk/aicoding
-            if _aicoding_parent not in _sys.path:
-                _sys.path.insert(0, _aicoding_parent)
-            from chan.Chan import CChan as _Chan
-            Chan = _Chan
-        except ImportError:
-            if verbose:
-                print("  [L2] chan.py 未安装，跳过缠论分析，仅用波浪")
-            Chan = None
-
+        scored = []
+        risk_rejected = 0
+        data_insufficient = 0
         _l2_start = time.time()
-        _l2_idx = 0
+
+        # 收集所有候选的5日收益率（用于超额收益百分位）
+        ret5_list = []
         for stock in candidates:
-            _l2_idx += 1
-            if verbose and _l2_idx % 50 == 0:
-                elapsed = time.time() - _l2_start
-                rate = _l2_idx / elapsed if elapsed > 0 else 0
-                eta = (len(candidates) - _l2_idx) / rate if rate > 0 else 0
-                print(f"\r  [L2] 进度 {_l2_idx}/{len(candidates)} 只 (缠论约{rate:.0f}只/秒, 剩余约{eta:.0f}秒)", end="", flush=True)
             df = stock.get("df")
-            if df is None or len(df) < 30:
-                no_signal += 1
-                continue
+            if df is not None and len(df) >= 6:
+                _c = "close" if "close" in df.columns else "收盘"
+                c_arr = df[_c].astype(float).values
+                ret5_list.append((c_arr[-1] / c_arr[-6] - 1) * 100)
+            else:
+                ret5_list.append(0)
+        ret5_arr = np.array(ret5_list)
+
+        for idx, stock in enumerate(candidates):
+            if verbose and (idx + 1) % 50 == 0:
+                elapsed = time.time() - _l2_start
+                rate = (idx + 1) / elapsed if elapsed > 0 else 0
+                eta = (len(candidates) - idx - 1) / rate if rate > 0 else 0
+                print(f"\r  [L2] 进度 {idx+1}/{len(candidates)} 只 ({rate:.0f}只/秒, 剩余约{eta:.0f}秒)", end="", flush=True)
 
             code = stock["code"]
-            name = stock["name"]
 
-            # 缠论分析
-            chan_bi = None
-            chan_sell = False
-            chan_buy = False
-            chan_signal = ""
-
-            if Chan is not None:
-                try:
-                    from chan.Common.CEnum import AUTYPE, BSP_TYPE, DATA_SRC, KL_TYPE, DATA_FIELD
-                    from chan.Common.CTime import CTime
-                    from chan.KLine.KLine_Unit import CKLine_Unit
-                    from chan.Common.func_util import str2float
-
-                    # 缠论需要250+根K线，L1传入的df只有35根，重新从TDX获取
-                    df_for_chan = self._tdx_daily_only(code, days=300)
-                    if df_for_chan is None or len(df_for_chan) < 20:
-                        raise ValueError("TDX缠论数据不足")
-                    klu_list = []
-                    df_kline = df_for_chan.tail(250)
-                    # 处理日期列：优先用"日期"/"date"列，否则从索引获取
-                    has_date_col = "日期" in df_kline.columns or "date" in df_kline.columns
-
-                    for idx in range(len(df_kline)):
-                        row = df_kline.iloc[idx]
-                        # 获取日期
-                        if has_date_col:
-                            date_val = str(row.get("日期", row.get("date", "")))
-                        else:
-                            # 日期在索引中（TDX返回的DataFrame）
-                            date_idx = df_kline.index[idx]
-                            if hasattr(date_idx, 'strftime'):
-                                date_val = date_idx.strftime("%Y-%m-%d")
-                            else:
-                                date_val = str(date_idx)[:10]
-                        if len(date_val) != 10:
-                            continue
-                        year, month, day = int(date_val[:4]), int(date_val[5:7]), int(date_val[8:10])
-
-                        # 获取OHLC（支持中英文列名和TDX格式）
-                        o = str2float(row.get("开盘", row.get("open", row.get("开盘价", 0))))
-                        h = str2float(row.get("最高", row.get("high", row.get("最高价", 0))))
-                        l = str2float(row.get("最低", row.get("low", row.get("最低价", 0))))
-                        c = str2float(row.get("收盘", row.get("close", row.get("收盘价", 0))))
-                        # 缠论要求 high >= max(open, close) 且 low <= min(open, close)
-                        h = max(o, c, h)
-                        l = min(o, c, l)
-
-                        item = {
-                            DATA_FIELD.FIELD_TIME: CTime(year, month, day, 0, 0, auto=False),
-                            DATA_FIELD.FIELD_OPEN: o,
-                            DATA_FIELD.FIELD_HIGH: h,
-                            DATA_FIELD.FIELD_LOW: l,
-                            DATA_FIELD.FIELD_CLOSE: c,
-                        }
-                        vol_val = row.get("成交量", row.get("volume", None))
-                        if vol_val is not None:
-                            item[DATA_FIELD.FIELD_VOLUME] = str2float(vol_val)
-                        klu = CKLine_Unit(item)
-                        klu_list.append(klu)
-
-                    if len(klu_list) < 20:
-                        no_signal += 1
-                        continue
-
-                    # 创建缠论实例并加载数据
-                    # trigger_step=True 防止__init__自动调用load()加载BaoStock数据
-                    from chan.ChanConfig import CChanConfig
-                    config = CChanConfig()
-                    config.trigger_step = True
-                    config.print_warning = False
-                    config.print_err_time = False
-                    ch = Chan(
-                        code=code,
-                        begin_time=None,
-                        end_time=None,
-                        data_src=DATA_SRC.BAO_STOCK,
-                        lv_list=[KL_TYPE.K_DAY],
-                        config=config,
-                        autype=AUTYPE.QFQ,
-                    )
-                    ch.trigger_load({KL_TYPE.K_DAY: klu_list})
-
-                    # 获取买卖点（使用正确的缠论 API）
-                    chan_data = ch[0]
-                    bsp_list = chan_data.bs_point_lst.get_latest_bsp(number=0)
-                    # bsp_list: 所有笔端点形成的买卖点(含1类/2类/3类)
-                    for bsp in bsp_list:
-                        # 只看1类买卖点(T1=1买/1卖, T1P=1类强力型)
-                        if BSP_TYPE.T1 in bsp.type or BSP_TYPE.T1P in bsp.type:
-                            if bsp.is_buy:
-                                chan_buy = True
-                                chan_signal += f"买({bsp.type2str()});"
-                            else:
-                                chan_sell = True
-                                chan_signal += f"卖({bsp.type2str()});"
-                except Exception as e:
-                    # 缠论分析失败时跳过（静默）
-                    if chan_error == 0:
-                        print(f"\n  [L2] 缠论异常（仅显示首个）: {type(e).__name__}: {e}")
-                    chan_error += 1
-
-            # 波浪分析（使用 ta-lib）
-            wave_bull = False
-            wave_bear = False
-            wave_signal = ""
-            try:
-                import talib
-                _c = "close" if "close" in df.columns else "收盘"
-                _h = "high" if "high" in df.columns else "最高"
-                _l = "low" if "low" in df.columns else "最低"
-                close = df[_c].astype(float).values
-                high = df[_h].astype(float).values
-                low = df[_l].astype(float).values
-                volume = df["volume"].astype(float).values if "volume" in df.columns else (df["成交量"].astype(float).values if "成交量" in df.columns else None)
-
-                # RSI 背离检测（简化版）
-                rsi = talib.RSI(close, timeperiod=14)
-                rsi_last = rsi[-5:]  # 最近5个RSI值
-
-                # 检测最近的高低点
-                recent_high_idx = np.argmax(high[-20:])  # 近20日高点
-                recent_low_idx = np.argmin(low[-20:])   # 近20日低点
-                recent_high_val = high[-20:][recent_high_idx]
-                recent_low_val = low[-20:][recent_low_idx]
-                price_high = close[-1] > recent_low_val  # 当前价格在低点上方
-
-                # 2浪底：回调幅度在0.382-0.786之间，且RSI未创新低
-                if recent_high_idx > recent_low_idx:  # 刚经历一波上涨后的回调
-                    # 计算从高点到当前回调幅度
-                    price_drop = (recent_high_val - close[-1]) / max(recent_high_val, 1)
-                    if 0.3 < price_drop < 0.6:  # 回调38%-60%区间
-                        wave_bull = True
-                        wave_signal += "2浪底;"
-                    elif price_drop >= 0.6:  # 回调太深可能是3浪下跌
-                        wave_bear = True
-                        wave_signal += "3浪下跌中;"
-
-                # 检测MACD背离
-                macd, signal, hist = talib.MACD(close, fastperiod=12, slowperiod=26, signalperiod=9)
-                if len(macd) >= 10:
-                    macd_recent = macd[-10:]
-                    price_recent = close[-10:]
-                    # 价格新低但MACD未新低 = 底背离（上涨信号）
-                    if (close[-1] < np.min(price_recent[:-1]) and
-                        macd[-1] > np.min(macd_recent[:-1])):
-                        wave_bull = True
-                        wave_signal += "MACD底背离;"
-                    # 价格新高但MACD未新高 = 顶背离（下跌信号）
-                    elif (close[-1] > np.max(price_recent[:-1]) and
-                          macd[-1] < np.max(macd_recent[:-1])):
-                        wave_bear = True
-                        wave_signal += "MACD顶背离;"
-
-                # 5浪完成检测（5浪后往往下跌）
-                # 简化：用ZigZag近似
-                try:
-                    zigzag = talib.ZIGZAG(close, penetration=0.05)
-                    # 检测最近是否有连续5波
-                    zz_diff = np.diff(zigzag)
-                    # 找拐点
-                except Exception:
-                    pass
-
-                # 成交量放大确认上涨趋势
-                if volume is not None:
-                    vol_ma5 = np.mean(volume[-5:])
-                    vol_ma20 = np.mean(volume[-20:])
-                    if vol_ma5 > vol_ma20 * 1.5 and close[-1] > close[-5]:
-                        if not wave_bull:
-                            wave_bull = True
-                            wave_signal += "量价齐升;"
-                        if wave_bear:
-                            wave_bear = False  # 量能充足时取消下跌信号
-
-            except ImportError:
-                if verbose:
-                    print(f"  [L2] ta-lib 未安装，跳过波浪分析")
-            except Exception:
-                pass
-
-            # 综合判定
-            has_buy_signal = chan_buy or wave_bull
-            has_sell_signal = chan_sell or wave_bear
-
-            if has_sell_signal:
-                # 卖点一票否决
-                if chan_sell:
-                    chan_reject += 1
-                if wave_bear:
-                    wave_reject += 1
+            # ── 获取300根K线（用于EMA60/MACD等长期指标）──────────────
+            df300 = self._tdx_daily_only(code, days=300)
+            if df300 is None or len(df300) < 60:
+                data_insufficient += 1
                 continue
 
-            if has_buy_signal:
-                passed.append({
-                    **stock,
-                    "chan_buy": chan_signal or (chan_buy and "买点" not in chan_signal),
-                    "wave_bull": wave_signal or (wave_bull and "波浪" not in wave_signal),
-                    "chan_buy_detail": chan_signal,
-                    "wave_bull_detail": wave_signal,
-                })
-                if chan_buy and wave_bull:
-                    both_pass += 1
-                elif chan_buy:
-                    chan_pass += 1
-                else:
-                    wave_pass += 1
+            _c = "close" if "close" in df300.columns else "收盘"
+            _o = "open" if "open" in df300.columns else "开盘"
+            _h = "high" if "high" in df300.columns else "最高"
+            _l = "low" if "low" in df300.columns else "最低"
+            _v = "volume" if "volume" in df300.columns else ("vol" if "vol" in df300.columns else "成交量")
+
+            close300 = df300[_c].astype(float).values
+            open300 = df300[_o].astype(float).values
+            high300 = df300[_h].astype(float).values
+            low300 = df300[_l].astype(float).values
+            vol300 = df300[_v].astype(float).values
+            n300 = len(close300)
+
+            # ── 轻量风控否决 ──────────────────────────────────────────
+            # 连续5日下跌
+            if n300 >= 6:
+                drops = sum(1 for i in range(-5, 0) if close300[i] < close300[i - 1])
+                if drops >= 5:
+                    risk_rejected += 1
+                    continue
+            # 当日暴跌>7%
+            if n300 >= 2 and close300[-2] > 0:
+                if (close300[-1] - close300[-2]) / close300[-2] < -0.07:
+                    risk_rejected += 1
+                    continue
+
+            # ═══════ 形态分（0~100，权重40%）═══════════════════════════
+            ma5 = stock.get("MA5", 0)
+            ma10 = stock.get("MA10", 0)
+            ma20 = stock.get("MA20", 0)
+
+            # MA多头排列
+            if ma5 > ma10 > ma20:
+                ma_score = 30
+            elif ma5 > ma10:
+                ma_score = 15
             else:
-                no_signal += 1
+                ma_score = 0
+
+            # ATR收窄
+            tr300 = np.maximum(high300[1:] - low300[1:],
+                               np.maximum(np.abs(high300[1:] - close300[:-1]),
+                                          np.abs(low300[1:] - close300[:-1])))
+            if len(tr300) >= 20:
+                atr_5 = float(np.mean(tr300[-5:]))
+                atr_20 = float(np.mean(tr300[-20:]))
+                atr_ratio = atr_5 / max(atr_20, 0.001)
+                atr_score = max(0, min(30, (1.0 - atr_ratio) * 60))
+            else:
+                atr_score = 0
+
+            # 站上MA20
+            close_s = pd.Series(close300)
+            ma20_val = close_s.rolling(20, min_periods=20).mean().iloc[-1]
+            above_ma20 = 15 if (ma20_val == ma20_val and close300[-1] > ma20_val) else 0
+
+            # 站上MA60
+            ma60_score = 0
+            if n300 >= 60:
+                ma60_val = close_s.rolling(60, min_periods=60).mean().iloc[-1]
+                if ma60_val == ma60_val and close300[-1] > ma60_val:
+                    ma60_score = 15
+
+            # MACD多头排列(DIF>DEA)
+            ema12 = close_s.ewm(span=12, adjust=False).mean()
+            ema26 = close_s.ewm(span=26, adjust=False).mean()
+            dif = ema12 - ema26
+            dea = dif.ewm(span=9, adjust=False).mean()
+            macd_bonus = 10 if dif.iloc[-1] > dea.iloc[-1] else 0
+
+            form_score = min(ma_score + atr_score + above_ma20 + ma60_score + macd_bonus, 100)
+
+            # ═══════ 量能确认分（0~100，权重30%）═══════════════════════
+            vol_score_val = 0
+            if n300 >= 20:
+                vol_ma5 = float(np.mean(vol300[-5:]))
+                vol_ma20 = float(np.mean(vol300[-20:]))
+
+                # 缩量蓄势
+                if vol_ma5 < vol_ma20 * 0.8:
+                    vol_score_val += 40
+                elif vol_ma5 < vol_ma20:
+                    vol_score_val += 20
+
+                # 量能稳定（低变异系数）
+                vol_std = float(np.std(vol300[-5:]))
+                vol_cv = vol_std / max(vol_ma5, 1)
+                vol_score_val += max(0, min(30, (1.0 - vol_cv) * 40))
+
+                # 温和收阳（收阳 + 量不超均量1.5倍）
+                if close300[-1] > open300[-1] and vol300[-1] < vol_ma20 * 1.5:
+                    vol_score_val += 30
+
+            vol_score_val = min(vol_score_val, 100)
+
+            # ═══════ 动量分（0~100，权重30%）═══════════════════════════
+            # RPS20百分位（复用L1的rps20）× 50
+            rps_pct = stock.get("rps20", 50) / 100.0  # 0~1
+            rps_score = rps_pct * 50
+
+            # 5日超额收益百分位 × 50
+            from scipy.stats import percentileofscore
+            ret5_val = ret5_list[idx]
+            excess_pct = percentileofscore(ret5_arr, ret5_val, kind='rank') / 100.0
+            excess_score = excess_pct * 50
+
+            momentum_score = min(rps_score + excess_score, 100)
+
+            # ═══════ 综合评分 ════════════════════════════════════════════
+            total = form_score * 0.40 + vol_score_val * 0.30 + momentum_score * 0.30
+
+            scored.append({
+                **stock,
+                "l2_score": round(total, 1),
+                "form_score": round(form_score, 1),
+                "vol_score": round(vol_score_val, 1),
+                "mom_score": round(momentum_score, 1),
+                "l2_detail": f"形态={form_score:.0f} 量能={vol_score_val:.0f} 动量={momentum_score:.0f}",
+            })
+
+        # 按 l2_score 降序排列，取 Top N
+        scored.sort(key=lambda x: x["l2_score"], reverse=True)
+        top_results = scored[:top_n]
 
         if verbose:
             elapsed = time.time() - _l2_start
-            print(f"\n  [L2] ✓ 通过: {len(passed)} 只，耗时 {elapsed:.1f}秒")
-            print(f"       缠论买点: {chan_pass} | 波浪上涨: {wave_pass} | 两者都有: {both_pass}")
-            print(f"       缠论卖点排除: {chan_reject} | 波浪下跌排除: {wave_reject} | 无信号: {no_signal} | 缠论异常: {chan_error}")
+            print(f"\n  [L2] 评分完成：{len(scored)} 只已评分，取 Top{top_n}，耗时 {elapsed:.1f}秒")
+            print(f"       风控否决: {risk_rejected} | 数据不足: {data_insufficient}")
+            if top_results:
+                scores = [c["l2_score"] for c in top_results]
+                print(f"       Top{min(top_n, len(top_results))} 得分范围: {min(scores):.1f} ~ {max(scores):.1f}")
 
-        return passed
+        return top_results
 
     # ------------------------------------------------------------------ #
     #  L3: K线图 + 指标生成                                               #

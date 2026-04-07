@@ -843,32 +843,22 @@ def run_link_b_pipeline(
         print(f"    {i:2d}. {c.get('code','')} {c.get('name','?'):<8} "
               f"得分={score:>5.1f}  RPS={rps:>5.1f}  near_high={nh:.2f}  量比={ar:.1f}")
 
-    # ── L2: 形态过滤 ─────────────────────────────────────────────
-    print_section("L2: 形态过滤（缠论+波浪）")
+    # ── L2: 综合评分排名 ─────────────────────────────────────────
+    print_section("L2: 综合评分排名（形态+量能+动量）")
     t_l2 = time.time()
-    l2_candidates = engine.L2_chan_wave_filter(l1_candidates, verbose=verbose)
-    print(f"\n  ✓ L2 完成，耗时 {time.time()-t_l2:.1f}s")
+    l2_candidates = engine.L2_score_and_rank(l1_candidates, verbose=verbose)
+    print(f"\n  L2 完成，耗时 {time.time()-t_l2:.1f}s")
     save_result({"L2_candidates": l2_candidates}, f"L2_candidates_{TODAY}.json")
 
     if not l2_candidates:
         print("\n  [警告] L2 无候选股，链路B终止")
         return {}
 
-    print(f"\n  ── L2 通过 {len(l2_candidates)} 只:")
+    print(f"\n  ── L2 Top {len(l2_candidates)} 只:")
     for i, c in enumerate(l2_candidates, 1):
-        chan = c.get("chan_buy_detail", "")
-        wave = c.get("wave_bull_detail", "")
-        sigs = []
-        if chan and chan not in ("无", "neutral", ""):
-            sigs.append(f"缠:{chan}")
-        if wave and wave not in ("无", "neutral", ""):
-            sigs.append(f"浪:{wave}")
-        sig_str = " ".join(sigs) if sigs else "无明确信号"
-        mv = c.get("总市值亿", 0)
-        pe = c.get("PE")
-        pe_str = f"{pe:.1f}" if pe is not None else "空"
+        detail = c.get("l2_detail", "")
         print(f"    {i:2d}. {c.get('code','')} {c.get('name','?'):<8} "
-              f"市值={mv:>8.0f}亿  PE={pe_str:>6}  {sig_str}")
+              f"L2={c.get('l2_score',0):>5.1f}  {detail}")
 
     # ── L2 → L3 确认 ─────────────────────────────────────────────
     print_section("L2 → L3 确认")

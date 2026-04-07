@@ -209,35 +209,35 @@ def _compute_rps(cache: TdxCache, codes: List[str],
 
 
 def l1_filter_at_date(cache: TdxCache, codes: List[str],
-                      cutoff_date: str) -> List[Dict]:
+                      cutoff_date: str, top_n: int = 150) -> List[Dict]:
     """
-    L1 蓄势预过滤（v7 = v4的L1硬过滤 + v6的丰富因子传递）。
+    L1 多维打分选股（与 data_engine.L1_quant_filter 对齐）。
 
-    硬性条件（沿用v4，已验证54.5%胜率）：
-      1. RPS 30%~70%
-      2. 收盘价 > MA20
-      3. 看空形态淘汰
-    蓄势条件（至少满足2条）：
-      A. MA多头排列（MA5>MA10>MA20）
-      B. ATR收窄
-      C. 近5日无单日涨幅>5%
-    新增：向L2传递丰富因子（MA20斜率、流动性、近高点、收益结构）用于评分。
+    硬性预筛（淘汰）：
+      - 看空形态（三连阴、无量空跌）
+      - 均线空头排列 MA5<MA10<MA20
+      - 20日均成交额 < 2.5亿（估算）
+
+    多维打分（0~100）：
+      - RPS20 百分位 × 25
+      - MA20斜率向上 = 20
+      - ATR5 < ATR20 = 15（波动收敛）
+      - near_high > 0.8 = 15（高位结构）
+      - 放量收阳 = 15
+      - 量比 > 1.2 = 10
+
+    输出 Top N（默认150），按得分降序。
     """
+    from scipy.stats import percentileofscore
+
     all_rps = _compute_rps(cache, codes, cutoff_date, lookback=20)
-    if all_rps:
-        rps_values = sorted(all_rps.values())
-        low_idx  = int(len(rps_values) * 0.30)
-        high_idx = int(len(rps_values) * 0.70)
-        rps_low  = rps_values[min(low_idx, len(rps_values) - 1)]
-        rps_high = rps_values[min(high_idx, len(rps_values) - 1)]
-    else:
-        rps_low, rps_high = -999, 999
 
-    results = []
+    # Phase 1: 硬性预筛 + 收集特征
+    candidates = []
 
     for code in codes:
-        code_rps = all_rps.get(code)
-        if code_rps is None or code_rps < rps_low or code_rps > rps_high:
+        code_rps_ret = all_rps.get(code)
+        if code_rps_ret is None:
             continue
 
         df = cache.get_bars(code, cutoff_date, days=65)
@@ -266,7 +266,6 @@ def l1_filter_at_date(cache: TdxCache, codes: List[str],
         if n < 20:
             continue
 
-        # ── 硬性过滤（v4 原样保留）────────────────────────────────────
         ma5_s  = _calc_sma(pd.Series(close_arr), 5)
         ma10_s = _calc_sma(pd.Series(close_arr), 10)
         ma20_s = _calc_sma(pd.Series(close_arr), 20)
@@ -278,92 +277,116 @@ def l1_filter_at_date(cache: TdxCache, codes: List[str],
         ma10 = ma10_s.iloc[-1]
         ma20 = ma20_s.iloc[-1]
 
+        # ── 硬性淘汰 ────────────────────────────────────────────────
+        # 均线空头排列
         if ma5 < ma10 < ma20:
             continue
-        if close_arr[-1] <= ma20:
-            continue
 
+        # 三连阴
         if n >= 3:
             if (close_arr[-1] < open_arr[-1] and
                     close_arr[-2] < open_arr[-2] and
                     close_arr[-3] < open_arr[-3]):
                 continue
+
+        # 无量空跌
         if n >= 3:
             if (close_arr[-1] < close_arr[-2] < close_arr[-3] and
                     vol_arr[-1] < vol_arr[-2] < vol_arr[-3]):
                 continue
 
-        # ── 蓄势条件（至少满足2条）────────────────────────────────────
-        cond_a = (ma5 > ma10 > ma20)
-
-        tr_arr = np.maximum(high_arr - low_arr,
-                            np.maximum(np.abs(high_arr - np.roll(close_arr, 1)),
-                                       np.abs(low_arr - np.roll(close_arr, 1))))
+        # 20日均成交额 < 2.5亿（估算）
         if n >= 20:
-            atr_5  = np.mean(tr_arr[-5:])
-            atr_20 = np.mean(tr_arr[-20:])
-            cond_b = (atr_5 < atr_20) if atr_20 > 0 else False
+            avg_amount_20 = float(np.mean(close_arr[-20:] * vol_arr[-20:] * 100) / 1e8)
+            if avg_amount_20 < 2.5:
+                continue
         else:
-            cond_b = False
+            avg_amount_20 = 0
 
-        if n >= 6:
-            daily_returns = (close_arr[-5:] - close_arr[-6:-1]) / np.maximum(close_arr[-6:-1], 0.01)
-            cond_c = bool(np.all(daily_returns < 0.05))
-        else:
-            cond_c = False
+        # ── 收集打分特征 ─────────────────────────────────────────────
+        ret_20d = code_rps_ret  # 20日收益率
 
-        cond_count = sum([cond_a, cond_b, cond_c])
-        if cond_count < 2:
-            continue
-
-        # ── 计算丰富因子（传递给L2评分）───────────────────────────────
-        vol_ma20 = np.mean(vol_arr[-20:]) if n >= 20 else vol_arr.mean()
-        vol_ratio = vol_arr[-1] / max(vol_ma20, 1)
-
-        # MA20斜率（软因子，不做硬过滤）
+        # MA20 斜率
         ma20_slope = 0
         if len(ma20_s) >= 6:
             ma20_prev = ma20_s.iloc[-6]
             if ma20_prev == ma20_prev and abs(ma20_prev) > 0.01:
                 ma20_slope = (ma20 - ma20_prev) / abs(ma20_prev)
 
-        # 20日日均成交额（软因子）
-        avg_amount_20 = np.mean(close_arr[-20:] * vol_arr[-20:] * 100)
+        # ATR5 vs ATR20
+        hl = high_arr[1:] - low_arr[1:]
+        hc = np.abs(high_arr[1:] - close_arr[:-1])
+        lc = np.abs(low_arr[1:] - close_arr[:-1])
+        tr_arr = np.maximum(hl, np.maximum(hc, lc))
+        atr5  = float(np.mean(tr_arr[-5:])) if len(tr_arr) >= 5 else 0
+        atr20 = float(np.mean(tr_arr[-20:])) if len(tr_arr) >= 20 else 0
 
-        # 近60日高点距离
-        if n >= 60:
-            high_60 = np.max(high_arr[-60:])
-        else:
-            high_60 = np.max(high_arr)
-        near_high_60 = close_arr[-1] / max(high_60, 0.01)
+        # near_high
+        high_20 = float(np.max(high_arr[-20:])) if n >= 20 else float(np.max(high_arr))
+        near_high = close_arr[-1] / max(high_20, 0.01)
 
-        # 短期收益结构
-        ret5  = (close_arr[-1] / close_arr[-6]  - 1) * 100 if n >= 6  else 0
-        ret10 = (close_arr[-1] / close_arr[-11] - 1) * 100 if n >= 11 else 0
-        ret20 = (close_arr[-1] / close_arr[-21] - 1) * 100 if n >= 21 else 0
+        # 放量收阳
+        is_yang_fang = (close_arr[-1] > open_arr[-1]) and (vol_arr[-1] > vol_arr[-2])
+
+        # 量比
+        vol_ma20 = float(np.mean(vol_arr[-20:])) if n >= 20 else float(np.mean(vol_arr))
+        amount_ratio = vol_arr[-1] / max(vol_ma20, 1)
 
         # MA60
-        ma60 = np.mean(close_arr[-60:]) if n >= 60 else None
+        ma60 = float(np.mean(close_arr[-60:])) if n >= 60 else None
 
-        results.append({
+        # 短期收益
+        ret5  = (close_arr[-1] / close_arr[-6]  - 1) * 100 if n >= 6  else 0
+        ret10 = (close_arr[-1] / close_arr[-11] - 1) * 100 if n >= 11 else 0
+
+        candidates.append({
             "code": code,
             "close": float(round(close_arr[-1], 2)),
             "MA5":   float(round(ma5, 2)),
             "MA10":  float(round(ma10, 2)),
             "MA20":  float(round(ma20, 2)),
             "MA60":  float(round(ma60, 2)) if ma60 else None,
-            "ma20_slope": float(round(ma20_slope * 100, 3)),
-            "vol_ratio": float(round(vol_ratio, 3)),
-            "avg_amount_20": float(round(avg_amount_20 / 1e8, 2)),
-            "near_high_60": float(round(near_high_60, 4)),
+            "ret_20d": ret_20d,
+            "ma20_slope": ma20_slope,
+            "atr5": atr5,
+            "atr20": atr20,
+            "near_high": round(near_high, 4),
+            "is_yang_fang": is_yang_fang,
+            "amount_ratio": round(amount_ratio, 3),
+            "avg_amount_20": round(avg_amount_20, 2),
+            "vol_ratio": round(amount_ratio, 3),
             "ret5":  float(round(ret5, 2)),
             "ret10": float(round(ret10, 2)),
-            "ret20": float(round(ret20, 2)),
-            "rps_20d": float(round(code_rps * 100, 2)),
-            "cond_count": cond_count,
+            "rps_20d": float(round(code_rps_ret * 100, 2)),
         })
 
-    return results
+    if not candidates:
+        return []
+
+    # Phase 2: 计算 RPS20 百分位 + 多维打分
+    ret_values = np.array([c["ret_20d"] for c in candidates])
+    rps_pcts = np.array([percentileofscore(ret_values, r, kind='rank') for r in ret_values])
+
+    for i, c in enumerate(candidates):
+        rps_pct = rps_pcts[i]
+        score = 0.0
+        score += rps_pct * 0.25              # RPS20 百分位 × 25
+        if c["ma20_slope"] > 0:
+            score += 20                       # MA20 斜率向上
+        if c["atr20"] > 0 and c["atr5"] < c["atr20"]:
+            score += 15                       # ATR 收敛
+        if c["near_high"] > 0.8:
+            score += 15                       # 高位结构
+        if c["is_yang_fang"]:
+            score += 15                       # 放量收阳
+        if c["amount_ratio"] > 1.2:
+            score += 10                       # 量比
+
+        c["rps20"] = round(rps_pct, 1)
+        c["score"] = round(score, 1)
+
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+    return candidates[:top_n]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
