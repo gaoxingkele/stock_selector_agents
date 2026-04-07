@@ -3234,18 +3234,26 @@ class DataEngine:
     # =================================================================== #
 
     def L1_quant_filter(self, verbose: bool = True,
-                        cutoff_date: str = None) -> List[Dict]:
+                        cutoff_date: str = None,
+                        top_n: int = 150) -> List[Dict]:
         """
-        L1 量化过滤：全市场扫描，筛选出符合量化条件的候选股。
+        L1 量化过滤：全市场扫描，多维打分制选股。
 
-        先淘汰明显看空形态（三连阴、阴包阳、昨日大阴线）
+        硬性预筛（淘汰）：
+          - 看空形态（三连阴、阴包阳、昨日大阴线、跌幅>5%）
+          - 市值 < 40亿 或 > 1500亿
+          - 20日平均成交额 < 2.5亿
+          - 均线空头排列、无量空跌、涨停股
 
-        通过条件（OR，任一满足即可）：
-          a. 近3日成交量逐日递增且总增量 > 50%
-          b. 近2日收盘价 > MA5 且 > MA10
-          c. MA5拐头向上 AND MA10拐头向上 AND (MA20走平 OR MA20向上)
+        多维打分（0~100）：
+          - RPS20 百分位 × 25   （全市场相对强度）
+          - MA20斜率向上 = 20   （趋势质量）
+          - ATR5 < ATR20 = 15   （波动收敛/蓄势）
+          - near_high > 0.8 = 15（高位结构完好）
+          - 放量收阳 = 15       （量价确认）
+          - 量比 > 1.2 = 10     （当日量能确认）
 
-        市值 ≤ 500亿，PE < 50 或为空
+        输出 Top N（默认150），按综合得分降序。
         """
         if verbose:
             print("\n[数据] L1: 全市场量化扫描...")
@@ -3387,13 +3395,15 @@ class DataEngine:
             ma10 = ma10_series.iloc[-1]
             ma20 = ma20_series.iloc[-1]
 
-            # ① PE>60 OR PE<10 OR 市值>500亿 → 淘汰
+            # ① 市值 40亿~1500亿（PFH门槛），PE>60 OR PE<10 → 淘汰
             if code in basics_cache:
                 b = basics_cache[code]
                 pe = b.get("pe")
                 mktcap = b.get("mktcap")
-                if (pe is not None and (pe > 60 or pe < 10)) or \
-                   (mktcap is not None and mktcap > 500):
+                if mktcap is not None and (mktcap < 40 or mktcap > 1500):
+                    eliminated_pe_mcap += 1
+                    continue
+                if pe is not None and (pe > 60 or pe < 10):
                     eliminated_pe_mcap += 1
                     continue
 
@@ -3410,21 +3420,16 @@ class DataEngine:
                     eliminated_limitup += 1
                     continue
 
-            # ③ 换手率<0.5% OR 成交额<1亿 → 淘汰
-            # TDX日线无换手率字段，通过成交量估算
+            # ③ 20日平均成交额 < 2.5亿 → 淘汰（PFH流动性门槛）
             # 成交额 ≈ 成交量(手)×收盘价×100 → 亿元
-            if y_close > 0 and y_close < 10000:  # 排除极端价格
-                estimated_amount = vol_arr[-2] * y_close * 100 / 1e8  # 亿元
-                # 流通市值估算
-                if code in basics_cache:
-                    float_shares = basics_cache[code].get("float_shares")  # 万股
-                    if float_shares and float_shares > 0:
-                        float_mktcap = float_shares * y_close / 10000  # 万股×元→亿元
-                        if float_mktcap > 0:
-                            estimated_turnover_rate = (vol_arr[-2] / (float_shares * 100)) * 100  # %
-                            if estimated_turnover_rate < 0.5 or estimated_amount < 1:
-                                eliminated_liquidity += 1
-                                continue
+            if len(close_arr) >= 20 and y_close > 0:
+                recent_amounts = vol_arr[-20:] * close_arr[-20:] * 100 / 1e8
+                avg_amount_20 = float(np.mean(recent_amounts))
+                if avg_amount_20 < 2.5:
+                    eliminated_liquidity += 1
+                    continue
+            else:
+                avg_amount_20 = 0
 
             # ④ 均线空头排列 MA5<MA10<MA20 → 淘汰
             if ma5 < ma10 < ma20:
@@ -3448,52 +3453,126 @@ class DataEngine:
                     eliminated无量空跌 += 1
                     continue
 
-            # ── 条件 a：近3日成交量逐日递增且总增量 > 50% ─────────
+            # ── 收集打分特征（不再用 OR 逻辑，全部纳入评分体系）─────
+            # 1) 20日收益率（用于 RPS 排名，后续计算）
+            ret_20d = (close_arr[-1] - close_arr[-20]) / close_arr[-20] if len(close_arr) >= 20 and close_arr[-20] > 0 else 0.0
+
+            # 2) MA20 斜率：5日变化率
+            ma20_prev = ma20_series.iloc[-6] if len(ma20_series) >= 6 else ma20_series.iloc[0]
+            ma20_slope = (ma20 - ma20_prev) / max(ma20_prev, 1)
+
+            # 3) ATR5 vs ATR20（波动收敛）
+            # True Range = max(H-L, |H-prevC|, |L-prevC|)
+            hl = high_arr[1:] - low_arr[1:]
+            hc = np.abs(high_arr[1:] - close_arr[:-1])
+            lc = np.abs(low_arr[1:] - close_arr[:-1])
+            tr_tail = np.maximum(hl, np.maximum(hc, lc))
+            tr_arr = np.concatenate([[high_arr[0] - low_arr[0]], tr_tail])
+            atr5 = float(np.mean(tr_arr[-5:])) if len(tr_arr) >= 5 else float(np.mean(tr_arr))
+            atr20 = float(np.mean(tr_arr[-20:])) if len(tr_arr) >= 20 else float(np.mean(tr_arr))
+
+            # 4) near_high：当前价 / 近20日最高价
+            high_20 = float(np.max(high_arr[-20:])) if len(high_arr) >= 20 else float(np.max(high_arr))
+            near_high = close_arr[-1] / high_20 if high_20 > 0 else 0
+
+            # 5) 放量收阳：当日收阳 + 当日成交量 > 前日
+            is_yang = close_arr[-1] > open_arr[-1]
+            vol_up = vol_arr[-1] > vol_arr[-2]
+            is_yang_fang = is_yang and vol_up
+
+            # 6) 量比：当日成交量 / 20日均量
+            avg_vol_20 = float(np.mean(vol_arr[-20:])) if len(vol_arr) >= 20 else float(np.mean(vol_arr))
+            amount_ratio = vol_arr[-1] / avg_vol_20 if avg_vol_20 > 0 else 0
+
+            # 7) 放量幅度（保留兼容）
             v1, v2, v3 = vol_arr[-3], vol_arr[-2], vol_arr[-1]
-            vol_increasing = (v2 > v1) and (v3 > v2)
             ma_vol_10 = vol_arr[-10:-3].mean() if len(vol_arr) >= 10 else vol_arr.mean()
             vol_increase = ((v3 - v1) / max(ma_vol_10, 1)) if ma_vol_10 > 0 else 0
-            cond_a = vol_increasing and (vol_increase > 0.50)
 
-            # ── 条件 b：近2日收盘价 > MA5 且 > MA10 ───────────────
-            cond_b = (close_arr[-2] > ma5) and (close_arr[-1] > ma5) and \
-                     (close_arr[-2] > ma10) and (close_arr[-1] > ma10)
-
-            # ── 条件 c：MA5/MA10拐头向上，MA20走平或向上 ──────────
-            # 对比前5日均值与当前值判断趋势
-            ma5_prev = ma5_series.iloc[-6] if len(ma5_series) >= 6 else ma5_series.iloc[0]
-            ma10_prev = ma10_series.iloc[-6] if len(ma10_series) >= 6 else ma10_series.iloc[0]
-            ma20_prev = ma20_series.iloc[-11] if len(ma20_series) >= 11 else ma20_series.iloc[0]
-            ma5_up = ma5 > ma5_prev
-            ma10_up = ma10 > ma10_prev
-            # MA20走平：|斜率|小，或方向向上
-            ma20_up = ma20 > ma20_prev
-            ma20_flat = abs(ma20 - ma20_prev) / max(ma20_prev, 1) < 0.005
-            cond_c = ma5_up and ma10_up and (ma20_up or ma20_flat)
-
-            if cond_a or cond_b or cond_c:
-                candidate_results.append({
-                    "code": code,
-                    "name": code,  # TDX无名称，用代码代替
-                    "放量幅度": round(vol_increase * 100, 1),
-                    "close": close_arr[-1],
-                    "MA5": round(ma5, 2),
-                    "MA10": round(ma10, 2),
-                    "MA20": round(ma20, 2),
-                    "cond_a": cond_a,
-                    "cond_b": cond_b,
-                    "cond_c": cond_c,
-                    "df": df,
-                })
+            candidate_results.append({
+                "code": code,
+                "name": code,
+                "close": close_arr[-1],
+                "MA5": round(ma5, 2),
+                "MA10": round(ma10, 2),
+                "MA20": round(ma20, 2),
+                "放量幅度": round(vol_increase * 100, 1),
+                "ret_20d": ret_20d,
+                "ma20_slope": ma20_slope,
+                "atr5": atr5,
+                "atr20": atr20,
+                "near_high": round(near_high, 4),
+                "is_yang_fang": is_yang_fang,
+                "amount_ratio": round(amount_ratio, 2),
+                "avg_amount_20": round(avg_amount_20, 2),
+                "df": df,
+            })
 
         if verbose:
             elapsed = time.time() - _l1_start
-            print(f"\n  [L1] ✓ 完成：{len(candidate_results)} 只通过全量筛选，耗时 {elapsed:.1f}秒")
+            print(f"\n  [L1] 预筛完成：{len(candidate_results)} 只通过硬性门槛，耗时 {elapsed:.1f}秒")
             print(f"       检查 {checked} 只 | 看空淘汰 {eliminated_bear} 只 | 数据不足 {failed} 只")
             print(f"       PE/市值淘汰 {eliminated_pe_mcap} | 涨停淘汰 {eliminated_limitup} | "
                   f"流动性淘汰 {eliminated_liquidity} | 空头排列 {eliminated空头} | 无量空跌 {eliminated无量空跌}")
 
-        return candidate_results
+        if not candidate_results:
+            return []
+
+        # ── Phase 2: 计算 RPS20 百分位 + 多维打分 ─────────────────────
+        if verbose:
+            print(f"\n  [L1] Phase 2: 多维打分（{len(candidate_results)} 只）...")
+
+        # RPS20: 按 ret_20d 排名，计算百分位
+        ret_values = np.array([c["ret_20d"] for c in candidate_results])
+        # percentileofscore: 每只股票在全体中的百分位（0~100）
+        from scipy.stats import percentileofscore
+        rps_pcts = np.array([percentileofscore(ret_values, r, kind='rank') for r in ret_values])
+
+        for i, c in enumerate(candidate_results):
+            rps_pct = rps_pcts[i]  # 0~100
+            score = 0.0
+
+            # 1) RPS20 百分位 × 0.25 → 最高25分
+            score += rps_pct * 0.25
+
+            # 2) MA20 斜率 > 0 → 20分
+            if c["ma20_slope"] > 0:
+                score += 20
+
+            # 3) ATR5 < ATR20（波动收敛）→ 15分
+            if c["atr20"] > 0 and c["atr5"] < c["atr20"]:
+                score += 15
+
+            # 4) near_high > 0.8（高位结构完好）→ 15分
+            if c["near_high"] > 0.8:
+                score += 15
+
+            # 5) 放量收阳 → 15分
+            if c["is_yang_fang"]:
+                score += 15
+
+            # 6) 量比 > 1.2 → 10分
+            if c["amount_ratio"] > 1.2:
+                score += 10
+
+            c["rps20"] = round(rps_pct, 1)
+            c["score"] = round(score, 1)
+
+        # 按 score 降序排列，取 Top N
+        candidate_results.sort(key=lambda x: x["score"], reverse=True)
+        top_results = candidate_results[:top_n]
+
+        if verbose:
+            scores = [c["score"] for c in top_results]
+            print(f"  [L1] 打分完成，Top{top_n} 得分范围: {min(scores):.1f} ~ {max(scores):.1f}")
+            # 分数分布
+            bins = [0, 30, 50, 70, 100]
+            for j in range(len(bins) - 1):
+                cnt = sum(1 for s in scores if bins[j] <= s < bins[j+1])
+                print(f"       {bins[j]:>3}~{bins[j+1]:<3}: {cnt} 只", end="")
+            print()
+
+        return top_results
 
     # ------------------------------------------------------------------ #
     #  L2: 形态过滤层 — 缠论 + 波浪                                       #

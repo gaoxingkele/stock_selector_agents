@@ -178,32 +178,26 @@ def run_l1():
     print(f"{'='*80}")
 
     # 表头
-    print(f"{'代码':<8} {'名称':<10} {'现价':>8} {'MA5':>8} {'MA10':>8} {'MA20':>8} "
-          f"{'放量%':>7} {'条件':<6} {'PE':>7} {'流通市值亿':>11} {'总市值亿':>11}")
-    print("-" * 100)
+    print(f"{'代码':<8} {'名称':<10} {'得分':>6} {'RPS20':>6} {'near_h':>7} {'量比':>6} "
+          f"{'MA20斜率':>8} {'ATR比':>6} {'放量阳':>6} {'PE':>7} {'总市值亿':>11}")
+    print("-" * 110)
 
     for item in candidates:
-        cond = ""
-        if item["cond_a"]:
-            cond += "A"
-        if item["cond_b"]:
-            cond += "B"
-        if item["cond_c"]:
-            cond += "C"
+        pe_str = f"{item.get('pe', 0) or 0:.1f}" if item.get('pe') is not None else "N/A"
+        mktcap_str = f"{item['mktcap']:.0f}" if item.get('mktcap') is not None else "N/A"
+        atr_ratio = f"{item.get('atr5', 0) / item.get('atr20', 1):.2f}" if item.get('atr20', 0) > 0 else "N/A"
+        yang = "Y" if item.get("is_yang_fang") else "-"
 
-        pe_str = f"{item['pe']:.1f}" if item['pe'] is not None else "N/A"
-        mktcap_str = f"{item['mktcap']:.0f}" if item['mktcap'] is not None else "N/A"
-        float_str = f"{item['float_shares']:.0f}" if item['float_shares'] is not None else "N/A"
+        print(f"{item['code']:<8} {item.get('name', '?'):<10} "
+              f"{item.get('score', 0):>6.1f} {item.get('rps20', 0):>6.1f} "
+              f"{item.get('near_high', 0):>7.3f} {item.get('amount_ratio', 0):>6.2f} "
+              f"{item.get('ma20_slope', 0):>8.4f} {atr_ratio:>6} {yang:>6} "
+              f"{pe_str:>7} {mktcap_str:>11}")
 
-        print(f"{item['code']:<8} {item['name']:<10} {item['close']:>8.2f} "
-              f"{item['MA5']:>8.2f} {item['MA10']:>8.2f} {item['MA20']:>8.2f} "
-              f"{item['放量幅度']:>6.1f}% {cond:<6} {pe_str:>7} {mktcap_str:>11} {float_str:>11}")
-
-    print("-" * 100)
-    print(f"共 {len(candidates)} 只")
+    print("-" * 110)
+    print(f"共 {len(candidates)} 只（按得分降序排列）")
     print()
-    print("条件说明: A=放量递增 B=均线多头 C=均线拐头向上")
-    print("注意: PE为空表示无数据，流通市值单位为万股，总市值单位为亿元")
+    print("评分: RPS20百分位×25 + MA20斜率向上=20 + ATR收敛=15 + near_high>0.8=15 + 放量收阳=15 + 量比>1.2=10")
 
     # ========== 6b. 注入300根日线（用于L2缠论分析）==========
     print("\n[6b] 加载300根日线数据（用于L2缠论分析）...")

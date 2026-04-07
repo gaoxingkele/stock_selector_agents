@@ -834,14 +834,14 @@ def run_link_b_pipeline(
         print("\n  [警告] L1 无候选股，链路B终止")
         return {}
 
-    print(f"\n  ── L1 通过 {len(l1_candidates)} 只:")
+    print(f"\n  ── L1 通过 {len(l1_candidates)} 只（多维打分 Top N）:")
     for i, c in enumerate(l1_candidates, 1):
-        pe = c.get("PE")
-        pe_str = f"{pe:.1f}" if pe is not None else "空"
-        mv = c.get("总市值亿", 0)
-        vol_str = c.get("放量幅度", 0)
+        score = c.get("score", 0)
+        rps = c.get("rps20", 0)
+        nh = c.get("near_high", 0)
+        ar = c.get("amount_ratio", 0)
         print(f"    {i:2d}. {c.get('code','')} {c.get('name','?'):<8} "
-              f"市值={mv:>8.0f}亿  PE={pe_str:>6}  放量={vol_str:>5.1f}%")
+              f"得分={score:>5.1f}  RPS={rps:>5.1f}  near_high={nh:.2f}  量比={ar:.1f}")
 
     # ── L2: 形态过滤 ─────────────────────────────────────────────
     print_section("L2: 形态过滤（缠论+波浪）")
