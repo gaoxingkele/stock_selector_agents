@@ -3237,11 +3237,14 @@ class DataEngine:
                         cutoff_date: str = None,
                         top_pct: float = 0.05) -> List[Dict]:
         """
-        L1 量化过滤：全市场扫描，连续化多维打分选股。
+        L1 量化过滤：全市场扫描，多时间框架形态+量化打分选股。
 
-        v3: 混合评分（二值基础+渐变加成），新增RPS60中期动量确认。
-          - 牛市：RPS20×20 + RPS60×10 + MA20斜率(10+5) + ATR收敛(5+5) + near_high渐变20 + 放量收阳10 + 量比渐变10 + 极致收敛5
-          - 熊市：MA20斜率(15+10) + ATR收敛(15+10) + RPS20×10 + RPS60×5 + near_high(10+5) + 缩量企稳15 + 站上MA20×5
+        v4: 形态识别驱动（日线+周线），看多加分，看空排除。
+          数据窗口: 500日（2年+），支持周线形态检测。
+          排除层（硬淘汰）：MA5/20/60空头、MACD零轴下顶背离、破前低放量、
+                          双顶/头肩顶/VCP看空、三角breakdown、旗型看空
+          加分层：双底/头肩底/VCP看多/三角突破/旗型看多/多头排列（周线>日线）
+                 + RPS20/60动量 + 技术指标（MA斜率/ATR/near_high/量比）
         """
         if verbose:
             print("\n[数据] L1: 全市场量化扫描...")
@@ -3316,12 +3319,12 @@ class DataEngine:
                 eta = (len(codes) - checked) / rate if rate > 0 else 0
                 print(f"\r  [L1] 进度 {checked}/{len(codes)} 只 ({rate:.0f}只/秒, 剩余约{eta:.0f}秒)", end="", flush=True)
 
-            df = self._tdx_daily_only(code, days=70, cutoff_date=cutoff_date)
-            if df is None or len(df) < 20:
+            df = self._tdx_daily_only(code, days=500, cutoff_date=cutoff_date)
+            if df is None or len(df) < 60:
                 failed += 1
                 continue
 
-            df = df.tail(70).reset_index(drop=True)
+            df = df.tail(500).reset_index(drop=True)
 
             _c = "close" if "close" in df.columns else "收盘"
             _o = "open" if "open" in df.columns else "开盘"
@@ -3345,56 +3348,30 @@ class DataEngine:
                 _r20 = (close_arr[-1] - close_arr[-20]) / close_arr[-20] if close_arr[-20] > 0 else 0
                 _breadth_ret20_sum += _r20
 
-            # ── 预筛：淘汰明显看空形态（基于已完成的最近交易日，不含今日）────
-            # df 已按时间升序排列，index -1=今日(可能未完成), -2=昨日(最近已完成)
+            # ── 预筛：淘汰明显崩溃形态（仅排除极端情况，形态判断交给 pattern_detector）──
             if n < 3:
                 failed += 1
                 continue
 
-            # 最新完成的交易日(昨日): index -2
-            # 前一完成的交易日(前日): index -3
-            y_open = open_arr[-2]   # 昨日开盘
-            y_close = close_arr[-2]  # 昨日收盘
-            y_high = high_arr[-2]
-            y_low = low_arr[-2]
-            d_open = open_arr[-3]   # 前日开盘
-            d_close = close_arr[-3]  # 前日收盘
+            y_close = close_arr[-2]
+            d_close = close_arr[-3]
 
-            # ① 日线跌幅>5%（昨日收盘相比前日收盘）
-            decline_rate = (y_close - d_close) / d_close if d_close > 0 else 0
-            too_bearish = decline_rate < -0.05  # 跌幅超5%
-
-            # ② 昨日阴线（收盘<开盘）
-            is_bearish = y_close < y_open
-
-            # ③ 阴包阳：昨日阴线实体覆盖前日阳线实体
-            # 条件：昨日阴线 + 前日阳线 + 昨日开盘>前日收盘 + 昨日收盘<前日开盘
-            d_bullish = d_close > d_open  # 前日阳线
-            y_engulfs_d = (is_bearish and d_bullish and
-                            y_open > d_close and
-                            y_close < d_open)
-
-            # ④ 连续三天阴线：最近3个已完成交易日都是阴线
-            if n >= 4:
-                d1_bearish = close_arr[-2] < open_arr[-2]   # 昨日阴线
-                d2_bearish = close_arr[-3] < open_arr[-3]   # 前日阴线
-                d3_bearish = close_arr[-4] < open_arr[-4]   # 大前日阴线
-                three_consecutive_bearish = d1_bearish and d2_bearish and d3_bearish
-            else:
-                three_consecutive_bearish = False
-
-            if too_bearish or is_bearish or y_engulfs_d or three_consecutive_bearish:
-                eliminated_bear += 1
-                continue
+            # ① 连续2日大阴（跌幅>3%）→ 排除（极端崩溃）
+            if n >= 3 and d_close > 0 and y_close > 0:
+                decline_d1 = (close_arr[-2] - close_arr[-3]) / close_arr[-3]
+                decline_d2 = (close_arr[-3] - close_arr[-4]) / close_arr[-4] if n >= 4 and close_arr[-4] > 0 else 0
+                if decline_d1 < -0.03 and decline_d2 < -0.03:
+                    eliminated_bear += 1
+                    continue
 
             # ── 预筛：PE/市值/换手率/涨停/均线/无量空跌 ───────────────
             # 先计算均线（后续多个过滤器共享）
             ma5_series = self._calc_sma(pd.Series(close_arr), 5)
-            ma10_series = self._calc_sma(pd.Series(close_arr), 10)
             ma20_series = self._calc_sma(pd.Series(close_arr), 20)
+            ma60_series = self._calc_sma(pd.Series(close_arr), 60) if n >= 60 else None
             ma5 = ma5_series.iloc[-1]
-            ma10 = ma10_series.iloc[-1]
             ma20 = ma20_series.iloc[-1]
+            ma60 = ma60_series.iloc[-1] if ma60_series is not None else 0
 
             # ① 市值 40亿~1500亿（PFH门槛），PE>60 OR PE<10 → 淘汰
             if code in basics_cache:
@@ -3432,8 +3409,8 @@ class DataEngine:
             else:
                 avg_amount_20 = 0
 
-            # ④ 均线空头排列 MA5<MA10<MA20 → 淘汰
-            if ma5 < ma10 < ma20:
+            # ④ 均线空头排列 MA5<MA20<MA60 → 淘汰（形态排除层也会检测，这里做快速预筛）
+            if ma60 > 0 and ma5 < ma20 < ma60:
                 eliminated空头 += 1
                 continue
 
@@ -3497,8 +3474,8 @@ class DataEngine:
                 "name": code,
                 "close": close_arr[-1],
                 "MA5": round(ma5, 2),
-                "MA10": round(ma10, 2),
                 "MA20": round(ma20, 2),
+                "MA60": round(ma60, 2),
                 "放量幅度": round(vol_increase * 100, 1),
                 "ret_20d": ret_20d,
                 "ret_60d": ret_60d,
@@ -3510,6 +3487,7 @@ class DataEngine:
                 "amount_ratio": round(amount_ratio, 2),
                 "avg_amount_20": round(avg_amount_20, 2),
                 "df": df,
+                "_df_raw": df.copy(),  # 保留原始 df（含列名），用于 pattern_detector
             })
 
         if verbose:
@@ -3612,25 +3590,105 @@ class DataEngine:
             c["rps60"] = round(rps60_pct, 1)
             c["score"] = round(score, 1)
 
-        # 按 score 降序排列，牛市取 Top 15%，熊市取 Top 5%
+        # ── Phase 3: 形态识别（日线+周线）──────────────────────────────
+        # 先按量化分排序，取 Top 30% 候选跑形态（控制耗时）
+        from pattern_detector import PatternDetector, _standardize_df, daily_to_weekly
+
+        candidate_results.sort(key=lambda x: x["score"], reverse=True)
+        pattern_pool_n = max(50, int(len(candidate_results) * 0.30))
+        pattern_pool = candidate_results[:pattern_pool_n]
+
+        if verbose:
+            print(f"\n  [L1] Phase 3: 形态识别（日线+周线）对 Top {pattern_pool_n} 只运行...")
+
+        _pattern_start = time.time()
+        eliminated_pattern = 0  # 被形态排除的数量
+
+        for idx_c, c in enumerate(pattern_pool):
+            if verbose and (idx_c + 1) % 50 == 0:
+                print(f"\r  [形态] {idx_c + 1}/{pattern_pool_n}", end="", flush=True)
+
+            try:
+                raw_df = c.get("_df_raw")
+                if raw_df is None or len(raw_df) < 60:
+                    continue
+
+                # 标准化列名 + 设置日期 index
+                std_df = _standardize_df(raw_df.copy())
+                if not isinstance(std_df.index, pd.DatetimeIndex):
+                    if "date" in std_df.columns:
+                        std_df.index = pd.to_datetime(std_df["date"])
+                    elif "日期" in std_df.columns:
+                        std_df.index = pd.to_datetime(std_df["日期"])
+                    else:
+                        std_df.index = pd.to_datetime(std_df.index)
+
+                # 合成周线
+                weekly_df = daily_to_weekly(std_df) if len(std_df) >= 100 else None
+
+                detector = PatternDetector(
+                    std_df, df_weekly=weekly_df,
+                    pivot_bars_left=6, pivot_bars_right=6,
+                    weekly_pivot_bars_left=4, weekly_pivot_bars_right=4
+                )
+                result = detector.detect_all()
+
+                c["pattern_score"] = result["bullish_score"]
+                c["pattern_exclude"] = result["bearish_exclude"]
+                c["pattern_tags"] = result.get("bearish_tags", [])
+                c["pattern_list"] = [p["pattern"] for p in result.get("patterns", [])]
+
+                # 看空排除 → 标记（不从列表删除，但打分设为-1）
+                if result["bearish_exclude"]:
+                    c["score"] = -1
+                    eliminated_pattern += 1
+                else:
+                    # 形态加分叠加到总分
+                    c["score"] = round(c["score"] + result["bullish_score"], 1)
+
+            except Exception as e:
+                logger.debug(f"[L1] 形态检测异常 {c['code']}: {e}")
+                c["pattern_score"] = 0
+                c["pattern_exclude"] = False
+                c["pattern_tags"] = []
+                c["pattern_list"] = []
+
+        # 未进入形态检测的候选，补充默认值
+        for c in candidate_results[pattern_pool_n:]:
+            c["pattern_score"] = 0
+            c["pattern_exclude"] = False
+            c["pattern_tags"] = []
+            c["pattern_list"] = []
+
+        if verbose:
+            _pattern_elapsed = time.time() - _pattern_start
+            print(f"\n  [L1] 形态检测完成：{eliminated_pattern} 只被排除，耗时 {_pattern_elapsed:.1f}秒")
+
+        # ── 排序 + 截断：排除看空标记的候选，按综合分排序 ──
+        candidate_results = [c for c in candidate_results if c["score"] > 0]
         candidate_results.sort(key=lambda x: x["score"], reverse=True)
         pct = 0.15 if is_bull else top_pct
         top_n = max(20, min(200, int(len(candidate_results) * pct)))
         top_results = candidate_results[:top_n]
 
         if verbose:
-            scores = [c["score"] for c in top_results]
-            print(f"  [L1] 打分完成，Top {top_pct:.0%}={top_n} 只（共{len(candidate_results)}只通过预筛）")
-            print(f"       得分范围: {min(scores):.1f} ~ {max(scores):.1f}")
-            bins = [0, 30, 50, 70, 100]
-            for j in range(len(bins) - 1):
-                cnt = sum(1 for s in scores if bins[j] <= s < bins[j+1])
-                print(f"       {bins[j]:>3}~{bins[j+1]:<3}: {cnt} 只", end="")
-            print()
+            if top_results:
+                scores = [c["score"] for c in top_results]
+                print(f"  [L1] 最终选出 {len(top_results)} 只（共{len(candidate_results)}只存活）")
+                print(f"       得分范围: {min(scores):.1f} ~ {max(scores):.1f}")
+                # 统计有形态加分的候选
+                with_pattern = sum(1 for c in top_results if c.get("pattern_score", 0) > 0)
+                print(f"       有形态加分: {with_pattern} 只")
+            else:
+                print(f"  [L1] 无候选存活")
 
         # 附带市场环境信息到每个候选
         for c in top_results:
             c["market_regime"] = market_regime
+
+        # 清理内部字段
+        for c in top_results:
+            c.pop("_df_raw", None)
 
         return top_results
 
@@ -3721,13 +3779,13 @@ class DataEngine:
 
             # ═══════ 形态分（0~100）═══════════════════════════════════════
             ma5 = stock.get("MA5", 0)
-            ma10 = stock.get("MA10", 0)
             ma20 = stock.get("MA20", 0)
+            ma60 = stock.get("MA60", 0)
 
             # MA多头排列（二值）
-            if ma5 > ma10 > ma20:
+            if ma60 > 0 and ma5 > ma20 > ma60:
                 ma_score = 30
-            elif ma5 > ma10:
+            elif ma5 > ma20:
                 ma_score = 15
             else:
                 ma_score = 0

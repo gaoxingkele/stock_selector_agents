@@ -179,30 +179,30 @@ def run_l1():
 
     # 表头
     print(f"{'代码':<8} {'名称':<10} {'得分':>6} {'RPS20':>6} {'near_h':>7} {'量比':>6} "
-          f"{'MA20斜率':>8} {'ATR比':>6} {'放量阳':>6} {'PE':>7} {'总市值亿':>11}")
+          f"{'MA20斜率':>8} {'ATR比':>6} {'形态分':>6} {'形态':>20}")
     print("-" * 110)
 
     for item in candidates:
-        pe_str = f"{item.get('pe', 0) or 0:.1f}" if item.get('pe') is not None else "N/A"
-        mktcap_str = f"{item['mktcap']:.0f}" if item.get('mktcap') is not None else "N/A"
         atr_ratio = f"{item.get('atr5', 0) / item.get('atr20', 1):.2f}" if item.get('atr20', 0) > 0 else "N/A"
-        yang = "Y" if item.get("is_yang_fang") else "-"
+        pscore = item.get("pattern_score", 0)
+        plist = item.get("pattern_list", [])
+        pstr = ",".join(plist) if plist else "-"
+        if len(pstr) > 20:
+            pstr = pstr[:17] + "..."
 
         print(f"{item['code']:<8} {item.get('name', '?'):<10} "
               f"{item.get('score', 0):>6.1f} {item.get('rps20', 0):>6.1f} "
               f"{item.get('near_high', 0):>7.3f} {item.get('amount_ratio', 0):>6.2f} "
-              f"{item.get('ma20_slope', 0):>8.4f} {atr_ratio:>6} {yang:>6} "
-              f"{pe_str:>7} {mktcap_str:>11}")
+              f"{item.get('ma20_slope', 0):>8.4f} {atr_ratio:>6} "
+              f"{pscore:>6} {pstr:>20}")
 
     print("-" * 110)
     regime = candidates[0].get("market_regime", "?") if candidates else "?"
     regime_cn = {"bull": "🐂牛市", "bear": "🐻熊市", "neutral": "⚖️震荡偏多"}.get(regime, regime)
-    print(f"共 {len(candidates)} 只（Top 5%，{regime_cn}模式，按得分降序排列）")
+    print(f"共 {len(candidates)} 只（{regime_cn}模式，按综合得分降序排列）")
     print()
-    if regime in ("bull", "neutral"):
-        print("牛市评分: RPS20×30 + near_high>0.85=20 + 放量收阳=15 + MA20斜率=15 + ATR收敛=10 + 量比>1.5=10")
-    else:
-        print("熊市评分: MA20斜率=25 + ATR收敛=25 + RPS20×15 + near_high>0.75=15 + 缩量企稳=15 + 站上MA20=5")
+    print("评分 = 量化基础分(RPS+MA斜率+ATR+near_high+量比) + 形态加分(日线+周线底部/突破/多头)")
+    print("排除 = MA5/20/60空头 | MACD顶背离 | 破前低放量 | 双顶/头肩顶 | 三角breakdown")
 
     # ========== 6b. 注入300根日线（用于L2缠论分析）==========
     print("\n[6b] 加载300根日线数据（用于L2缠论分析）...")
