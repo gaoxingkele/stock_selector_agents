@@ -264,8 +264,13 @@ def find_double_bottom(df: pd.DataFrame, pivots: pd.DataFrame) -> Optional[dict]
     d_idx = df.index[-1]
     d = float(df.at[d_idx, "Close"])
     atr_ser = get_atr(df["High"], df["Low"], df["Close"])
+    _prev_a = None
 
     while True:
+        if a_idx == _prev_a:
+            break
+        _prev_a = a_idx
+
         pos = pivots.index.get_loc(a_idx)
         if isinstance(pos, slice):
             pos = pos.stop
@@ -285,7 +290,6 @@ def find_double_bottom(df: pd.DataFrame, pivots: pd.DataFrame) -> Optional[dict]
         avg_bar = (df_slice["High"] - df_slice["Low"]).median()
 
         if _is_double_bottom(a, b, c, d, a_vol, c_vol, avg_bar, atr_val):
-            # 验证形态完整性
             if c_idx != df.loc[c_idx:, "Close"].idxmin():
                 a_idx, a, a_vol = c_idx, c, c_vol
                 continue
@@ -314,8 +318,13 @@ def find_double_top(df: pd.DataFrame, pivots: pd.DataFrame) -> Optional[dict]:
     d_idx = df.index[-1]
     d = float(df.at[d_idx, "Close"])
     atr_ser = get_atr(df["High"], df["Low"], df["Close"])
+    _prev_a = None
 
     while True:
+        if a_idx == _prev_a:
+            break
+        _prev_a = a_idx
+
         pos = pivots.index.get_loc(a_idx)
         if isinstance(pos, slice):
             pos = pos.stop
@@ -358,8 +367,13 @@ def find_hns(df: pd.DataFrame, pivots: pd.DataFrame) -> Optional[dict]:
 
     c_idx = pivots["P"].idxmax()
     c = _resolve_dup(pivots, c_idx, mode="max")
+    _prev_c_idx = None
 
     while True:
+        if c_idx == _prev_c_idx:
+            break  # 防止死循环
+        _prev_c_idx = c_idx
+
         pos = pivots.index.get_loc(c_idx)
         if isinstance(pos, slice):
             pos = pos.start
@@ -383,13 +397,11 @@ def find_hns(df: pd.DataFrame, pivots: pd.DataFrame) -> Optional[dict]:
         avg_bar = (df_slice["High"] - df_slice["Low"]).median()
 
         if _is_hns(a, b, c, d, e, f, avg_bar):
-            # 验证 pivot 方向正确
             if (a == df.at[a_idx, "Low"] or c == df.at[c_idx, "Low"]
                     or e == df.at[e_idx, "Low"]):
                 c_idx, c = e_idx, e
                 continue
 
-            # 颈线检查
             neckline = min(b, d)
             lowest_after_e = df.loc[e_idx:, "Low"].min()
             if lowest_after_e < neckline and abs(lowest_after_e - neckline) > avg_bar:
@@ -416,8 +428,13 @@ def find_reverse_hns(df: pd.DataFrame, pivots: pd.DataFrame) -> Optional[dict]:
 
     c_idx = pivots["P"].idxmin()
     c = _resolve_dup(pivots, c_idx, mode="min")
+    _prev_c_idx = None
 
     while True:
+        if c_idx == _prev_c_idx:
+            break
+        _prev_c_idx = c_idx
+
         pos = pivots.index.get_loc(c_idx)
         if isinstance(pos, slice):
             pos = pos.start
@@ -471,8 +488,13 @@ def find_triangles(df: pd.DataFrame, pivots: pd.DataFrame) -> Optional[dict]:
     a = _resolve_dup(pivots, a_idx, mode="max")
     f_idx = df.index[-1]
     f = float(df.at[f_idx, "Close"])
+    _prev_a = None
 
     while True:
+        if a_idx == _prev_a:
+            break
+        _prev_a = a_idx
+
         b_idx = pivots.loc[a_idx:, "P"].idxmin()
         b = _resolve_dup(pivots, b_idx, mode="min")
 
@@ -561,8 +583,13 @@ def find_bullish_vcp(df: pd.DataFrame, pivots: pd.DataFrame) -> Optional[dict]:
     a = _resolve_dup(pivots, a_idx, mode="max")
     e_idx = df.index[-1]
     e = float(df.at[e_idx, "Close"])
+    _prev_a = None
 
     while True:
+        if a_idx == _prev_a:
+            break
+        _prev_a = a_idx
+
         pos = pivots.index.get_loc(a_idx)
         if isinstance(pos, slice):
             pos = pos.stop
@@ -612,8 +639,13 @@ def find_bearish_vcp(df: pd.DataFrame, pivots: pd.DataFrame) -> Optional[dict]:
     a = _resolve_dup(pivots, a_idx, mode="min")
     e_idx = df.index[-1]
     e = float(df.at[e_idx, "Close"])
+    _prev_a = None
 
     while True:
+        if a_idx == _prev_a:
+            break
+        _prev_a = a_idx
+
         pos = pivots.index.get_loc(a_idx)
         if isinstance(pos, slice):
             pos = pos.stop

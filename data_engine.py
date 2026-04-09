@@ -3237,23 +3237,25 @@ class DataEngine:
                         cutoff_date: str = None,
                         top_pct: float = 0.05) -> List[Dict]:
         """
-        L1 量化过滤：全市场扫描，多时间框架形态+量化打分选股。
+        L1 量化过滤：全市场扫描，双轮并行选股。
 
-        v4: 形态识别驱动（日线+周线），看多加分，看空排除。
-          数据窗口: 500日（2年+），支持周线形态检测。
-          排除层（硬淘汰）：MA5/20/60空头、MACD零轴下顶背离、破前低放量、
-                          双顶/头肩顶/VCP看空、三角breakdown、旗型看空
-          加分层：双底/头肩底/VCP看多/三角突破/旗型看多/多头排列（周线>日线）
-                 + RPS20/60动量 + 技术指标（MA斜率/ATR/near_high/量比）
+        v5: 双轮并行架构
+          Phase 1 — 全市场预筛（PE/市值/流动性/涨停/连续大阴），读500日数据
+          Phase 2A — 量化强势轮（RPS+MA斜率+ATR+near_high+量比），选趋势强势股
+          Phase 2B — 形态潜力轮（日线+周线形态识别），选底部反转/突破形态股
+          Phase 3 — 合并去重，综合排序
         """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from pattern_detector import PatternDetector, _standardize_df, daily_to_weekly
+        from scipy.stats import percentileofscore
+
         if verbose:
-            print("\n[数据] L1: 全市场量化扫描...")
+            print("\n[数据] L1: 全市场量化扫描（v5 双轮并行）...")
             print("  ① 仅使用TDX本地数据（PE/市值过滤在个股日线中检查）...")
 
-        # Step 1: 生成A股代码列表
-        # 优先从 stock_list.json 读取真实股票清单（新浪接口获取的公开数据）
-        # 若文件不存在则回退到代码范围扫描
-        # 加载本地PE/市值缓存（stock_basics.json）
+        # ══════════════════════════════════════════════════════════════════
+        #  Step 1: 生成A股代码列表 + 加载缓存
+        # ══════════════════════════════════════════════════════════════════
         basics_file = Path(__file__).parent / "output" / "stock_basics.json"
         basics_cache: Dict[str, Dict] = {}
         if basics_file.exists():
@@ -3279,7 +3281,6 @@ class DataEngine:
             all_codes = None
 
         if all_codes is None:
-            # 回退：按代码范围生成
             all_codes = []
             for code in range(600000, 602000):
                 all_codes.append(f"{code:06d}")
@@ -3290,25 +3291,22 @@ class DataEngine:
             for code in range(300001, 302000):
                 all_codes.append(f"{code:06d}")
             if verbose:
-                print(f"  代码范围: 约{len(all_codes)}只（沪市主板+科创板+深市主板+创业板，无stock_list.json）")
-        elif verbose:
-            print(f"  代码范围: 约{len(all_codes)}只")
+                print(f"  代码范围: 约{len(all_codes)}只（沪市主板+科创板+深市主板+创业板）")
 
-        # Step 2: 直接进入日线扫描，在个股循环内做所有过滤
+        # ══════════════════════════════════════════════════════════════════
+        #  Phase 1: 全市场预筛 — 一次遍历，收集基本面合格的候选 + 市场广度
+        # ══════════════════════════════════════════════════════════════════
         codes = all_codes
-        candidate_results = []
+        prefiltered = []   # 通过预筛的候选（含完整数据）
         checked = 0
         failed = 0
-        eliminated_bear = 0  # 被预筛淘汰的看空形态
-        eliminated_pe_mcap = 0  # PE/市值不合格
-        eliminated_limitup = 0  # 涨停股
-        eliminated_liquidity = 0  # 流动性枯竭
-        eliminated空头 = 0  # 均线空头排列
-        eliminated无量空跌 = 0  # 无量空跌
-        # 市场广度统计（用于牛熊判断）
-        _breadth_above_ma20 = 0  # 站上MA20的股票数
-        _breadth_total = 0       # 有效统计的股票数
-        _breadth_ret20_sum = 0.0 # 20日收益率总和
+        eliminated_bear = 0
+        eliminated_pe_mcap = 0
+        eliminated_limitup = 0
+        eliminated_liquidity = 0
+        _breadth_above_ma20 = 0
+        _breadth_total = 0
+        _breadth_ret20_sum = 0.0
         _l1_start = time.time()
 
         for code in codes:
@@ -3317,14 +3315,15 @@ class DataEngine:
                 elapsed = time.time() - _l1_start
                 rate = checked / elapsed if elapsed > 0 else 0
                 eta = (len(codes) - checked) / rate if rate > 0 else 0
-                print(f"\r  [L1] 进度 {checked}/{len(codes)} 只 ({rate:.0f}只/秒, 剩余约{eta:.0f}秒)", end="", flush=True)
+                print(f"\r  [Phase1] 进度 {checked}/{len(codes)} 只 ({rate:.0f}只/秒, 剩余约{eta:.0f}秒)", end="", flush=True)
 
             df = self._tdx_daily_only(code, days=500, cutoff_date=cutoff_date)
             if df is None or len(df) < 60:
                 failed += 1
                 continue
 
-            df = df.tail(500).reset_index(drop=True)
+            df_raw = df.tail(500).copy()  # 保留原始列名和 index（含 date）
+            df = df_raw.reset_index(drop=True)
 
             _c = "close" if "close" in df.columns else "收盘"
             _o = "open" if "open" in df.columns else "开盘"
@@ -3337,9 +3336,9 @@ class DataEngine:
             high_arr = df[_h].astype(float).values
             low_arr = df[_l].astype(float).values
             vol_arr = df[_v].astype(float).values
-
-            # ── 市场广度统计（所有有效股票都计入，不论后续是否被淘汰）──
             n = len(close_arr)
+
+            # 市场广度统计（所有有效股票都计入）
             if n >= 20:
                 _breadth_total += 1
                 _ma20_val = float(np.mean(close_arr[-20:]))
@@ -3348,32 +3347,21 @@ class DataEngine:
                 _r20 = (close_arr[-1] - close_arr[-20]) / close_arr[-20] if close_arr[-20] > 0 else 0
                 _breadth_ret20_sum += _r20
 
-            # ── 预筛：淘汰明显崩溃形态（仅排除极端情况，形态判断交给 pattern_detector）──
             if n < 3:
                 failed += 1
                 continue
 
+            # ① 连续2日大阴（跌幅>3%）→ 排除
             y_close = close_arr[-2]
             d_close = close_arr[-3]
-
-            # ① 连续2日大阴（跌幅>3%）→ 排除（极端崩溃）
-            if n >= 3 and d_close > 0 and y_close > 0:
+            if d_close > 0 and y_close > 0:
                 decline_d1 = (close_arr[-2] - close_arr[-3]) / close_arr[-3]
                 decline_d2 = (close_arr[-3] - close_arr[-4]) / close_arr[-4] if n >= 4 and close_arr[-4] > 0 else 0
                 if decline_d1 < -0.03 and decline_d2 < -0.03:
                     eliminated_bear += 1
                     continue
 
-            # ── 预筛：PE/市值/换手率/涨停/均线/无量空跌 ───────────────
-            # 先计算均线（后续多个过滤器共享）
-            ma5_series = self._calc_sma(pd.Series(close_arr), 5)
-            ma20_series = self._calc_sma(pd.Series(close_arr), 20)
-            ma60_series = self._calc_sma(pd.Series(close_arr), 60) if n >= 60 else None
-            ma5 = ma5_series.iloc[-1]
-            ma20 = ma20_series.iloc[-1]
-            ma60 = ma60_series.iloc[-1] if ma60_series is not None else 0
-
-            # ① 市值 40亿~1500亿（PFH门槛），PE>60 OR PE<10 → 淘汰
+            # ② PE/市值
             if code in basics_cache:
                 b = basics_cache[code]
                 pe = b.get("pe")
@@ -3385,22 +3373,19 @@ class DataEngine:
                     eliminated_pe_mcap += 1
                     continue
 
-            # ② 今日涨停（沪深10%，科创/创业板20%，ST 5%）→ 淘汰
-            # 今日数据（index -1）若为涨停则排除（最后结果不含涨停股）
+            # ③ 涨停排除
             today_close = close_arr[-1]
             today_high = high_arr[-1]
-            y_close = close_arr[-2]   # 昨日收盘（已验证为已完成）
+            y_close = close_arr[-2]
             if y_close > 0:
-                # 判断涨停：收盘≈最高价 且 涨幅≈±10%（普通股）
                 gain_today = (today_close - y_close) / y_close
                 is_limitup = (abs(today_close - today_high) < 0.01) and (gain_today > 0.099)
                 if is_limitup:
                     eliminated_limitup += 1
                     continue
 
-            # ③ 20日平均成交额 < 2.5亿 → 淘汰（PFH流动性门槛）
-            # 成交额 ≈ 成交量(手)×收盘价×100 → 亿元
-            if len(close_arr) >= 20 and y_close > 0:
+            # ④ 流动性
+            if n >= 20 and y_close > 0:
                 recent_amounts = vol_arr[-20:] * close_arr[-20:] * 100 / 1e8
                 avg_amount_20 = float(np.mean(recent_amounts))
                 if avg_amount_20 < 2.5:
@@ -3409,40 +3394,20 @@ class DataEngine:
             else:
                 avg_amount_20 = 0
 
-            # ④ 均线空头排列 MA5<MA20<MA60 → 淘汰（形态排除层也会检测，这里做快速预筛）
-            if ma60 > 0 and ma5 < ma20 < ma60:
-                eliminated空头 += 1
-                continue
+            # ── 收集特征（两轮共享）──
+            ma5_s = self._calc_sma(pd.Series(close_arr), 5)
+            ma20_s = self._calc_sma(pd.Series(close_arr), 20)
+            ma60_s = self._calc_sma(pd.Series(close_arr), 60) if n >= 60 else None
+            ma5 = ma5_s.iloc[-1]
+            ma20 = ma20_s.iloc[-1]
+            ma60 = ma60_s.iloc[-1] if ma60_s is not None else 0
 
-            # ⑤ 无量空跌：近3日（已完成）连续下跌且成交量萎缩
-            # 使用 index -2(昨日), -3(前日), -4(大前日) —— 不含今日未完成数据
-            if n >= 4:
-                c1 = close_arr[-2]   # 昨日收盘
-                c2 = close_arr[-3]   # 前日收盘
-                c3 = close_arr[-4]   # 大前日收盘
-                v1 = vol_arr[-2]     # 昨日成交量
-                v2 = vol_arr[-3]     # 前日成交量
-                v3 = vol_arr[-4]     # 大前日成交量
-                # 连续3天下跌：c1<c2<c3（指数越小越低）
-                down_3 = (c1 < c2) and (c2 < c3)
-                # 成交量萎缩：v1<v2 and v2<v3
-                vol_shrink = (v1 < v2) and (v2 < v3)
-                if down_3 and vol_shrink:
-                    eliminated无量空跌 += 1
-                    continue
+            ret_20d = (close_arr[-1] - close_arr[-20]) / close_arr[-20] if n >= 20 and close_arr[-20] > 0 else 0.0
+            ret_60d = (close_arr[-1] - close_arr[-60]) / close_arr[-60] if n >= 60 and close_arr[-60] > 0 else ret_20d
 
-            # ── 收集打分特征（不再用 OR 逻辑，全部纳入评分体系）─────
-            # 1) 20日收益率（用于 RPS 排名，后续计算）
-            ret_20d = (close_arr[-1] - close_arr[-20]) / close_arr[-20] if len(close_arr) >= 20 and close_arr[-20] > 0 else 0.0
-            # 1b) 60日收益率（中期动量确认）
-            ret_60d = (close_arr[-1] - close_arr[-60]) / close_arr[-60] if len(close_arr) >= 60 and close_arr[-60] > 0 else ret_20d
-
-            # 2) MA20 斜率：5日变化率
-            ma20_prev = ma20_series.iloc[-6] if len(ma20_series) >= 6 else ma20_series.iloc[0]
+            ma20_prev = ma20_s.iloc[-6] if len(ma20_s) >= 6 else ma20_s.iloc[0]
             ma20_slope = (ma20 - ma20_prev) / max(ma20_prev, 1)
 
-            # 3) ATR5 vs ATR20（波动收敛）
-            # True Range = max(H-L, |H-prevC|, |L-prevC|)
             hl = high_arr[1:] - low_arr[1:]
             hc = np.abs(high_arr[1:] - close_arr[:-1])
             lc = np.abs(low_arr[1:] - close_arr[:-1])
@@ -3451,56 +3416,39 @@ class DataEngine:
             atr5 = float(np.mean(tr_arr[-5:])) if len(tr_arr) >= 5 else float(np.mean(tr_arr))
             atr20 = float(np.mean(tr_arr[-20:])) if len(tr_arr) >= 20 else float(np.mean(tr_arr))
 
-            # 4) near_high：当前价 / 近20日最高价
-            high_20 = float(np.max(high_arr[-20:])) if len(high_arr) >= 20 else float(np.max(high_arr))
+            high_20 = float(np.max(high_arr[-20:])) if n >= 20 else float(np.max(high_arr))
             near_high = close_arr[-1] / high_20 if high_20 > 0 else 0
 
-            # 5) 放量收阳：当日收阳 + 当日成交量 > 前日
-            is_yang = close_arr[-1] > open_arr[-1]
-            vol_up = vol_arr[-1] > vol_arr[-2]
-            is_yang_fang = is_yang and vol_up
+            is_yang_fang = (close_arr[-1] > open_arr[-1]) and (vol_arr[-1] > vol_arr[-2])
 
-            # 6) 量比：当日成交量 / 20日均量
-            avg_vol_20 = float(np.mean(vol_arr[-20:])) if len(vol_arr) >= 20 else float(np.mean(vol_arr))
+            avg_vol_20 = float(np.mean(vol_arr[-20:])) if n >= 20 else float(np.mean(vol_arr))
             amount_ratio = vol_arr[-1] / avg_vol_20 if avg_vol_20 > 0 else 0
 
-            # 7) 放量幅度（保留兼容）
-            v1, v2, v3 = vol_arr[-3], vol_arr[-2], vol_arr[-1]
-            ma_vol_10 = vol_arr[-10:-3].mean() if len(vol_arr) >= 10 else vol_arr.mean()
-            vol_increase = ((v3 - v1) / max(ma_vol_10, 1)) if ma_vol_10 > 0 else 0
-
-            candidate_results.append({
-                "code": code,
-                "name": code,
+            prefiltered.append({
+                "code": code, "name": code,
                 "close": close_arr[-1],
-                "MA5": round(ma5, 2),
-                "MA20": round(ma20, 2),
-                "MA60": round(ma60, 2),
-                "放量幅度": round(vol_increase * 100, 1),
-                "ret_20d": ret_20d,
-                "ret_60d": ret_60d,
+                "MA5": round(ma5, 2), "MA20": round(ma20, 2), "MA60": round(ma60, 2),
+                "ret_20d": ret_20d, "ret_60d": ret_60d,
                 "ma20_slope": ma20_slope,
-                "atr5": atr5,
-                "atr20": atr20,
+                "atr5": atr5, "atr20": atr20,
                 "near_high": round(near_high, 4),
                 "is_yang_fang": is_yang_fang,
                 "amount_ratio": round(amount_ratio, 2),
                 "avg_amount_20": round(avg_amount_20, 2),
                 "df": df,
-                "_df_raw": df.copy(),  # 保留原始 df（含列名），用于 pattern_detector
+                "_df_raw": df_raw,   # 保留原始 df（含列名+日期 index）
             })
 
         if verbose:
             elapsed = time.time() - _l1_start
-            print(f"\n  [L1] 预筛完成：{len(candidate_results)} 只通过硬性门槛，耗时 {elapsed:.1f}秒")
-            print(f"       检查 {checked} 只 | 看空淘汰 {eliminated_bear} 只 | 数据不足 {failed} 只")
-            print(f"       PE/市值淘汰 {eliminated_pe_mcap} | 涨停淘汰 {eliminated_limitup} | "
-                  f"流动性淘汰 {eliminated_liquidity} | 空头排列 {eliminated空头} | 无量空跌 {eliminated无量空跌}")
+            print(f"\n  [Phase1] 预筛完成：{len(prefiltered)} 只通过，耗时 {elapsed:.1f}秒")
+            print(f"       检查 {checked} | 数据不足 {failed} | 大阴淘汰 {eliminated_bear} | "
+                  f"PE/市值 {eliminated_pe_mcap} | 涨停 {eliminated_limitup} | 流动性 {eliminated_liquidity}")
 
-        if not candidate_results:
+        if not prefiltered:
             return []
 
-        # ── 牛熊判断：基于市场广度 ────────────────────────────────────
+        # ── 牛熊判断 ──
         breadth_ratio = _breadth_above_ma20 / max(_breadth_total, 1)
         avg_ret20 = _breadth_ret20_sum / max(_breadth_total, 1)
         if breadth_ratio > 0.55 and avg_ret20 > 0.01:
@@ -3509,180 +3457,223 @@ class DataEngine:
             market_regime = "bear"
         else:
             market_regime = "neutral"
-        # neutral 按牛市处理（偏进攻）
         is_bull = market_regime in ("bull", "neutral")
 
         if verbose:
             regime_cn = {"bull": "🐂 牛市", "bear": "🐻 熊市", "neutral": "⚖️ 震荡偏多"}[market_regime]
             print(f"\n  [市场环境] {regime_cn}（广度={breadth_ratio:.1%} 站上MA20, 均20日收益={avg_ret20:.2%}）")
 
-        # ── Phase 2: 计算 RPS 百分位 + 连续化多维打分 ──────────────────
-        if verbose:
-            print(f"  [L1] Phase 2: 连续化打分-{'牛市模式' if is_bull else '熊市模式'}（{len(candidate_results)} 只）...")
+        # ══════════════════════════════════════════════════════════════════
+        #  Phase 2A: 量化强势轮（在预筛候选上跑量化打分）
+        # ══════════════════════════════════════════════════════════════════
+        def _run_quant_track(candidates, is_bull_mode):
+            """量化强势轮：RPS + 技术指标打分，返回 Top N"""
+            ret_values = np.array([c["ret_20d"] for c in candidates])
+            rps_pcts = np.array([percentileofscore(ret_values, r, kind='rank') for r in ret_values])
+            ret60_values = np.array([c["ret_60d"] for c in candidates])
+            rps60_pcts = np.array([percentileofscore(ret60_values, r, kind='rank') for r in ret60_values])
 
-        # RPS20: 按 ret_20d 排名，计算百分位
-        ret_values = np.array([c["ret_20d"] for c in candidate_results])
-        from scipy.stats import percentileofscore
-        rps_pcts = np.array([percentileofscore(ret_values, r, kind='rank') for r in ret_values])
-        # RPS60: 按 ret_60d 排名，中期趋势确认
-        ret60_values = np.array([c["ret_60d"] for c in candidate_results])
-        rps60_pcts = np.array([percentileofscore(ret60_values, r, kind='rank') for r in ret60_values])
+            for i, c in enumerate(candidates):
+                rps_pct = rps_pcts[i]
+                rps60_pct = rps60_pcts[i]
+                score = 0.0
+                atr_r = c["atr5"] / max(c["atr20"], 0.001)
 
-        for i, c in enumerate(candidate_results):
-            rps_pct = rps_pcts[i]    # 0~100
-            rps60_pct = rps60_pcts[i]  # 0~100
-            score = 0.0
-            atr_r = c["atr5"] / max(c["atr20"], 0.001)
-
-            if is_bull:
-                # ══ 牛市评分：二值基础+渐变加成（max≈100）══
-                # 1) RPS20 × 0.20 → 最高20分（短期动量）
-                score += rps_pct * 0.20
-                # 2) RPS60 × 0.10 → 最高10分（中期趋势确认）
-                score += rps60_pct * 0.10
-                # 3) MA20斜率：基础10分(>0) + 渐变加成5分 → 最高15分
-                if c["ma20_slope"] > 0:
-                    score += 10 + min(5, c["ma20_slope"] * 200)
-                # 4) ATR收敛：基础5分(ratio<1) + 渐变加成5分 → 最高10分
-                if atr_r < 1.0:
-                    score += 5 + min(5, (1.0 - atr_r) * 15)
-                # 5) near_high渐变 → 最高20分（0.6→0分, 1.0→20分）
-                score += max(0, min(20, (c["near_high"] - 0.6) / 0.4 * 20))
-                # 6) 放量收阳 → 10分
-                if c["is_yang_fang"]:
-                    score += 10
-                # 7) 量比渐变：最优1.0-2.0区间 → 最高10分
-                ar = c["amount_ratio"]
-                if 1.0 <= ar <= 2.0:
-                    score += 10
-                elif 0.7 <= ar < 1.0:
-                    score += (ar - 0.7) / 0.3 * 10
-                elif 2.0 < ar <= 3.0:
-                    score += (3.0 - ar) / 1.0 * 10
-                # 8) 极致波动率收敛奖励 → 最高5分
-                if atr_r < 0.7:
-                    score += 5
-            else:
-                # ══ 熊市评分：二值基础+渐变加成（max≈100）══
-                # 1) MA20斜率：基础15分(>0) + 渐变加成10分 → 最高25分
-                if c["ma20_slope"] > 0:
-                    score += 15 + min(10, c["ma20_slope"] * 300)
-                # 2) ATR收敛：基础15分(ratio<1) + 渐变加成10分 → 最高25分
-                if atr_r < 1.0:
-                    score += 15 + min(10, (1.0 - atr_r) * 30)
-                # 3) RPS20 × 0.10 → 最高10分
-                score += rps_pct * 0.10
-                # 4) RPS60 × 0.05 → 最高5分（中期趋势弱确认）
-                score += rps60_pct * 0.05
-                # 5) near_high：基础10分(>0.75) + 渐变5分 → 最高15分
-                if c["near_high"] > 0.75:
-                    score += 10 + min(5, (c["near_high"] - 0.75) / 0.25 * 5)
-                elif c["near_high"] > 0.6:
-                    score += (c["near_high"] - 0.6) / 0.15 * 10
-                # 6) 缩量企稳（0.5~1.2）→ 15分（保持二值，熊市核心信号）
-                if 0.5 <= c["amount_ratio"] <= 1.2:
-                    score += 15
-                # 7) 站上MA20 → 5分
-                if c["close"] > c["MA20"] > 0:
-                    score += 5
-
-            c["rps20"] = round(rps_pct, 1)
-            c["rps60"] = round(rps60_pct, 1)
-            c["score"] = round(score, 1)
-
-        # ── Phase 3: 形态识别（日线+周线）──────────────────────────────
-        # 先按量化分排序，取 Top 30% 候选跑形态（控制耗时）
-        from pattern_detector import PatternDetector, _standardize_df, daily_to_weekly
-
-        candidate_results.sort(key=lambda x: x["score"], reverse=True)
-        pattern_pool_n = max(50, int(len(candidate_results) * 0.30))
-        pattern_pool = candidate_results[:pattern_pool_n]
-
-        if verbose:
-            print(f"\n  [L1] Phase 3: 形态识别（日线+周线）对 Top {pattern_pool_n} 只运行...")
-
-        _pattern_start = time.time()
-        eliminated_pattern = 0  # 被形态排除的数量
-
-        for idx_c, c in enumerate(pattern_pool):
-            if verbose and (idx_c + 1) % 50 == 0:
-                print(f"\r  [形态] {idx_c + 1}/{pattern_pool_n}", end="", flush=True)
-
-            try:
-                raw_df = c.get("_df_raw")
-                if raw_df is None or len(raw_df) < 60:
-                    continue
-
-                # 标准化列名 + 设置日期 index
-                std_df = _standardize_df(raw_df.copy())
-                if not isinstance(std_df.index, pd.DatetimeIndex):
-                    if "date" in std_df.columns:
-                        std_df.index = pd.to_datetime(std_df["date"])
-                    elif "日期" in std_df.columns:
-                        std_df.index = pd.to_datetime(std_df["日期"])
-                    else:
-                        std_df.index = pd.to_datetime(std_df.index)
-
-                # 合成周线
-                weekly_df = daily_to_weekly(std_df) if len(std_df) >= 100 else None
-
-                detector = PatternDetector(
-                    std_df, df_weekly=weekly_df,
-                    pivot_bars_left=6, pivot_bars_right=6,
-                    weekly_pivot_bars_left=4, weekly_pivot_bars_right=4
-                )
-                result = detector.detect_all()
-
-                c["pattern_score"] = result["bullish_score"]
-                c["pattern_exclude"] = result["bearish_exclude"]
-                c["pattern_tags"] = result.get("bearish_tags", [])
-                c["pattern_list"] = [p["pattern"] for p in result.get("patterns", [])]
-
-                # 看空排除 → 标记（不从列表删除，但打分设为-1）
-                if result["bearish_exclude"]:
-                    c["score"] = -1
-                    eliminated_pattern += 1
+                if is_bull_mode:
+                    score += rps_pct * 0.20
+                    score += rps60_pct * 0.10
+                    if c["ma20_slope"] > 0:
+                        score += 10 + min(5, c["ma20_slope"] * 200)
+                    if atr_r < 1.0:
+                        score += 5 + min(5, (1.0 - atr_r) * 15)
+                    score += max(0, min(20, (c["near_high"] - 0.6) / 0.4 * 20))
+                    if c["is_yang_fang"]:
+                        score += 10
+                    ar = c["amount_ratio"]
+                    if 1.0 <= ar <= 2.0:
+                        score += 10
+                    elif 0.7 <= ar < 1.0:
+                        score += (ar - 0.7) / 0.3 * 10
+                    elif 2.0 < ar <= 3.0:
+                        score += (3.0 - ar) / 1.0 * 10
+                    if atr_r < 0.7:
+                        score += 5
                 else:
-                    # 形态加分叠加到总分
-                    c["score"] = round(c["score"] + result["bullish_score"], 1)
+                    if c["ma20_slope"] > 0:
+                        score += 15 + min(10, c["ma20_slope"] * 300)
+                    if atr_r < 1.0:
+                        score += 15 + min(10, (1.0 - atr_r) * 30)
+                    score += rps_pct * 0.10
+                    score += rps60_pct * 0.05
+                    if c["near_high"] > 0.75:
+                        score += 10 + min(5, (c["near_high"] - 0.75) / 0.25 * 5)
+                    elif c["near_high"] > 0.6:
+                        score += (c["near_high"] - 0.6) / 0.15 * 10
+                    if 0.5 <= c["amount_ratio"] <= 1.2:
+                        score += 15
+                    if c["close"] > c["MA20"] > 0:
+                        score += 5
 
-            except Exception as e:
-                logger.debug(f"[L1] 形态检测异常 {c['code']}: {e}")
+                c["rps20"] = round(rps_pct, 1)
+                c["rps60"] = round(rps60_pct, 1)
+                c["quant_score"] = round(score, 1)
+
+            sorted_cands = sorted(candidates, key=lambda x: x["quant_score"], reverse=True)
+            pct = 0.10 if is_bull_mode else top_pct
+            n = max(20, min(200, int(len(sorted_cands) * pct)))
+            return sorted_cands[:n]
+
+        # ══════════════════════════════════════════════════════════════════
+        #  Phase 2B: 形态潜力轮（全量候选跑形态检测）
+        # ══════════════════════════════════════════════════════════════════
+        def _run_pattern_track(candidates):
+            """形态潜力轮：看空排除 + 看多加分，返回有价值的形态候选"""
+            results = []
+            excluded = 0
+
+            for c in candidates:
+                try:
+                    raw_df = c.get("_df_raw")
+                    if raw_df is None or len(raw_df) < 60:
+                        continue
+
+                    std_df = _standardize_df(raw_df.copy())
+                    if not isinstance(std_df.index, pd.DatetimeIndex):
+                        if "date" in std_df.columns:
+                            std_df.index = pd.to_datetime(std_df["date"])
+                        elif "日期" in std_df.columns:
+                            std_df.index = pd.to_datetime(std_df["日期"])
+                        else:
+                            std_df.index = pd.to_datetime(std_df.index)
+
+                    weekly_df = daily_to_weekly(std_df) if len(std_df) >= 100 else None
+
+                    detector = PatternDetector(
+                        std_df, df_weekly=weekly_df,
+                        pivot_bars_left=6, pivot_bars_right=6,
+                        weekly_pivot_bars_left=4, weekly_pivot_bars_right=4
+                    )
+                    det_result = detector.detect_all()
+
+                    c["pattern_score"] = det_result["bullish_score"]
+                    c["pattern_exclude"] = det_result["bearish_exclude"]
+                    c["pattern_tags"] = det_result.get("bearish_tags", [])
+                    c["pattern_list"] = [p["pattern"] for p in det_result.get("patterns", [])]
+
+                    if det_result["bearish_exclude"]:
+                        excluded += 1
+                        continue
+
+                    # 有看多形态的才进入结果（形态轮只选有形态信号的票）
+                    if det_result["bullish_score"] > 0:
+                        results.append(c)
+
+                except Exception as e:
+                    logger.debug(f"[形态轮] {c['code']} error: {e}")
+
+            return results, excluded
+
+        # ══════════════════════════════════════════════════════════════════
+        #  并行执行两轮
+        # ══════════════════════════════════════════════════════════════════
+        if verbose:
+            print(f"\n  [Phase2] 双轮并行启动（{len(prefiltered)} 只候选）...")
+            print(f"    2A 量化强势轮: RPS+技术指标打分")
+            print(f"    2B 形态潜力轮: 日线+周线形态识别")
+
+        _phase2_start = time.time()
+        quant_results = []
+        pattern_results = []
+        pattern_excluded = 0
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            future_quant = executor.submit(_run_quant_track, prefiltered, is_bull)
+            future_pattern = executor.submit(_run_pattern_track, prefiltered)
+
+            quant_results = future_quant.result()
+            pattern_results, pattern_excluded = future_pattern.result()
+
+        _phase2_elapsed = time.time() - _phase2_start
+        if verbose:
+            print(f"\n  [Phase2] 完成，耗时 {_phase2_elapsed:.1f}秒")
+            print(f"    2A 量化轮选出: {len(quant_results)} 只")
+            print(f"    2B 形态轮选出: {len(pattern_results)} 只（排除 {pattern_excluded} 只看空）")
+
+        # ══════════════════════════════════════════════════════════════════
+        #  Phase 3: 合并去重 + 综合排序
+        # ══════════════════════════════════════════════════════════════════
+        # 合并：以 code 为 key 去重，两轮都选中的标记 "dual"
+        merged = {}
+        for c in quant_results:
+            code = c["code"]
+            merged[code] = c
+            c["source"] = "quant"
+            # 补充默认形态字段
+            if "pattern_score" not in c:
                 c["pattern_score"] = 0
                 c["pattern_exclude"] = False
                 c["pattern_tags"] = []
                 c["pattern_list"] = []
 
-        # 未进入形态检测的候选，补充默认值
-        for c in candidate_results[pattern_pool_n:]:
-            c["pattern_score"] = 0
-            c["pattern_exclude"] = False
-            c["pattern_tags"] = []
-            c["pattern_list"] = []
+        for c in pattern_results:
+            code = c["code"]
+            if code in merged:
+                # 两轮都选中 → 合并形态信息到量化轮结果
+                merged[code]["source"] = "dual"
+                merged[code]["pattern_score"] = c.get("pattern_score", 0)
+                merged[code]["pattern_exclude"] = c.get("pattern_exclude", False)
+                merged[code]["pattern_tags"] = c.get("pattern_tags", [])
+                merged[code]["pattern_list"] = c.get("pattern_list", [])
+            else:
+                # 仅形态轮选出 → 补充量化分（用预筛收集的特征计算）
+                if "quant_score" not in c:
+                    c["quant_score"] = 0
+                    c["rps20"] = 0
+                    c["rps60"] = 0
+                c["source"] = "pattern"
+                merged[code] = c
 
-        if verbose:
-            _pattern_elapsed = time.time() - _pattern_start
-            print(f"\n  [L1] 形态检测完成：{eliminated_pattern} 只被排除，耗时 {_pattern_elapsed:.1f}秒")
+        # 排除被形态轮标记为看空的（即使量化轮选中了）
+        for code in list(merged.keys()):
+            if merged[code].get("pattern_exclude", False):
+                del merged[code]
 
-        # ── 排序 + 截断：排除看空标记的候选，按综合分排序 ──
-        candidate_results = [c for c in candidate_results if c["score"] > 0]
-        candidate_results.sort(key=lambda x: x["score"], reverse=True)
-        pct = 0.15 if is_bull else top_pct
-        top_n = max(20, min(200, int(len(candidate_results) * pct)))
-        top_results = candidate_results[:top_n]
+        # 综合评分：quant_score(归一化到0~100) + pattern_score(原始分)
+        top_results = list(merged.values())
+        if top_results:
+            max_quant = max(c.get("quant_score", 0) for c in top_results) or 1
+            for c in top_results:
+                qs = c.get("quant_score", 0) / max_quant * 100  # 归一化到0~100
+                ps = c.get("pattern_score", 0)
+                # 综合分 = 量化分60% + 形态分40%（形态满分约70，归一化到100）
+                ps_norm = min(100, ps * 100 / 70) if ps > 0 else 0
+                c["score"] = round(qs * 0.6 + ps_norm * 0.4, 1)
+                # 双轮共识额外加分（两轮都选中说明既有动量又有形态）
+                if c.get("source") == "dual":
+                    c["score"] = round(c["score"] + 10, 1)
+
+            top_results.sort(key=lambda x: x["score"], reverse=True)
+            # 最终截断
+            final_n = max(20, min(200, int(len(prefiltered) * (0.10 if is_bull else top_pct))))
+            top_results = top_results[:final_n]
 
         if verbose:
             if top_results:
                 scores = [c["score"] for c in top_results]
-                print(f"  [L1] 最终选出 {len(top_results)} 只（共{len(candidate_results)}只存活）")
+                src_counts = {}
+                for c in top_results:
+                    s = c.get("source", "?")
+                    src_counts[s] = src_counts.get(s, 0) + 1
+                print(f"\n  [Phase3] 最终选出 {len(top_results)} 只")
                 print(f"       得分范围: {min(scores):.1f} ~ {max(scores):.1f}")
-                # 统计有形态加分的候选
+                src_str = " | ".join(f"{k}={v}" for k, v in sorted(src_counts.items()))
+                print(f"       来源: {src_str}")
                 with_pattern = sum(1 for c in top_results if c.get("pattern_score", 0) > 0)
                 print(f"       有形态加分: {with_pattern} 只")
             else:
-                print(f"  [L1] 无候选存活")
+                print(f"\n  [Phase3] 无候选存活")
 
-        # 附带市场环境信息到每个候选
+        # 附带市场环境信息
         for c in top_results:
             c["market_regime"] = market_regime
 
