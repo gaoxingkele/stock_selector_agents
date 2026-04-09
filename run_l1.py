@@ -195,9 +195,14 @@ def run_l1():
               f"{pe_str:>7} {mktcap_str:>11}")
 
     print("-" * 110)
-    print(f"共 {len(candidates)} 只（按得分降序排列）")
+    regime = candidates[0].get("market_regime", "?") if candidates else "?"
+    regime_cn = {"bull": "🐂牛市", "bear": "🐻熊市", "neutral": "⚖️震荡偏多"}.get(regime, regime)
+    print(f"共 {len(candidates)} 只（Top 5%，{regime_cn}模式，按得分降序排列）")
     print()
-    print("评分: RPS20百分位×25 + MA20斜率向上=20 + ATR收敛=15 + near_high>0.8=15 + 放量收阳=15 + 量比>1.2=10")
+    if regime in ("bull", "neutral"):
+        print("牛市评分: RPS20×30 + near_high>0.85=20 + 放量收阳=15 + MA20斜率=15 + ATR收敛=10 + 量比>1.5=10")
+    else:
+        print("熊市评分: MA20斜率=25 + ATR收敛=25 + RPS20×15 + near_high>0.75=15 + 缩量企稳=15 + 站上MA20=5")
 
     # ========== 6b. 注入300根日线（用于L2缠论分析）==========
     print("\n[6b] 加载300根日线数据（用于L2缠论分析）...")

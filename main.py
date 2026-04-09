@@ -834,7 +834,9 @@ def run_link_b_pipeline(
         print("\n  [警告] L1 无候选股，链路B终止")
         return {}
 
-    print(f"\n  ── L1 通过 {len(l1_candidates)} 只（多维打分 Top N）:")
+    regime = l1_candidates[0].get("market_regime", "?") if l1_candidates else "?"
+    regime_cn = {"bull": "🐂牛市", "bear": "🐻熊市", "neutral": "⚖️震荡"}.get(regime, regime)
+    print(f"\n  ── L1 通过 {len(l1_candidates)} 只（Top 5%，{regime_cn}模式）:")
     for i, c in enumerate(l1_candidates, 1):
         score = c.get("score", 0)
         rps = c.get("rps20", 0)

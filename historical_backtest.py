@@ -209,41 +209,33 @@ def _compute_rps(cache: TdxCache, codes: List[str],
 
 
 def l1_filter_at_date(cache: TdxCache, codes: List[str],
-                      cutoff_date: str, top_n: int = 150) -> List[Dict]:
+                      cutoff_date: str, top_pct: float = 0.05) -> List[Dict]:
     """
     L1 多维打分选股（与 data_engine.L1_quant_filter 对齐）。
 
-    硬性预筛（淘汰）：
-      - 看空形态（三连阴、无量空跌）
-      - 均线空头排列 MA5<MA10<MA20
-      - 20日均成交额 < 2.5亿（估算）
-
-    多维打分（0~100）：
-      - RPS20 百分位 × 25
-      - MA20斜率向上 = 20
-      - ATR5 < ATR20 = 15（波动收敛）
-      - near_high > 0.8 = 15（高位结构）
-      - 放量收阳 = 15
-      - 量比 > 1.2 = 10
-
-    输出 Top N（默认150），按得分降序。
+    自动检测市场环境（牛市/熊市），差异化评分 + Top 5%。
     """
     from scipy.stats import percentileofscore
 
     all_rps = _compute_rps(cache, codes, cutoff_date, lookback=20)
+    all_rps60 = _compute_rps(cache, codes, cutoff_date, lookback=60)
 
-    # Phase 1: 硬性预筛 + 收集特征
+    # Phase 1: 硬性预筛 + 收集特征 + 市场广度统计
     candidates = []
+    _breadth_above_ma20 = 0
+    _breadth_total = 0
+    _breadth_ret20_sum = 0.0
 
     for code in codes:
         code_rps_ret = all_rps.get(code)
         if code_rps_ret is None:
             continue
+        code_rps60_ret = all_rps60.get(code, code_rps_ret)
 
-        df = cache.get_bars(code, cutoff_date, days=65)
+        df = cache.get_bars(code, cutoff_date, days=75)
         if df is None:
             continue
-        df = df.tail(65).reset_index(drop=True)
+        df = df.tail(75).reset_index(drop=True)
 
         c_col = "close" if "close" in df.columns else ("收盘" if "收盘" in df.columns else None)
         o_col = "open"  if "open"  in df.columns else ("开盘" if "开盘" in df.columns else None)
@@ -265,6 +257,13 @@ def l1_filter_at_date(cache: TdxCache, codes: List[str],
         n = len(close_arr)
         if n < 20:
             continue
+
+        # 市场广度统计
+        _breadth_total += 1
+        _ma20_brd = float(np.mean(close_arr[-20:]))
+        if close_arr[-1] > _ma20_brd:
+            _breadth_above_ma20 += 1
+        _breadth_ret20_sum += code_rps_ret
 
         ma5_s  = _calc_sma(pd.Series(close_arr), 5)
         ma10_s = _calc_sma(pd.Series(close_arr), 10)
@@ -305,6 +304,7 @@ def l1_filter_at_date(cache: TdxCache, codes: List[str],
 
         # ── 收集打分特征 ─────────────────────────────────────────────
         ret_20d = code_rps_ret  # 20日收益率
+        ret_60d = code_rps60_ret  # 60日收益率（中期动量）
 
         # MA20 斜率
         ma20_slope = 0
@@ -347,6 +347,7 @@ def l1_filter_at_date(cache: TdxCache, codes: List[str],
             "MA20":  float(round(ma20, 2)),
             "MA60":  float(round(ma60, 2)) if ma60 else None,
             "ret_20d": ret_20d,
+            "ret_60d": ret_60d,
             "ma20_slope": ma20_slope,
             "atr5": atr5,
             "atr20": atr20,
@@ -363,29 +364,74 @@ def l1_filter_at_date(cache: TdxCache, codes: List[str],
     if not candidates:
         return []
 
-    # Phase 2: 计算 RPS20 百分位 + 多维打分
+    # ── 牛熊判断 ──
+    breadth_ratio = _breadth_above_ma20 / max(_breadth_total, 1)
+    avg_ret20 = _breadth_ret20_sum / max(_breadth_total, 1)
+    if breadth_ratio > 0.55 and avg_ret20 > 0.01:
+        market_regime = "bull"
+    elif breadth_ratio < 0.40 or avg_ret20 < -0.02:
+        market_regime = "bear"
+    else:
+        market_regime = "neutral"
+    is_bull = market_regime in ("bull", "neutral")
+
+    # Phase 2: 连续化多维打分（含RPS60中期动量确认）
     ret_values = np.array([c["ret_20d"] for c in candidates])
     rps_pcts = np.array([percentileofscore(ret_values, r, kind='rank') for r in ret_values])
+    ret60_values = np.array([c["ret_60d"] for c in candidates])
+    rps60_pcts = np.array([percentileofscore(ret60_values, r, kind='rank') for r in ret60_values])
 
     for i, c in enumerate(candidates):
         rps_pct = rps_pcts[i]
+        rps60_pct = rps60_pcts[i]
         score = 0.0
-        score += rps_pct * 0.25              # RPS20 百分位 × 25
-        if c["ma20_slope"] > 0:
-            score += 20                       # MA20 斜率向上
-        if c["atr20"] > 0 and c["atr5"] < c["atr20"]:
-            score += 15                       # ATR 收敛
-        if c["near_high"] > 0.8:
-            score += 15                       # 高位结构
-        if c["is_yang_fang"]:
-            score += 15                       # 放量收阳
-        if c["amount_ratio"] > 1.2:
-            score += 10                       # 量比
+        atr_r = c["atr5"] / max(c["atr20"], 0.001)
+
+        if is_bull:
+            # 牛市：二值基础+渐变加成（max≈100）
+            score += rps_pct * 0.20           # RPS20 max 20
+            score += rps60_pct * 0.10         # RPS60 max 10
+            if c["ma20_slope"] > 0:           # MA20斜率 base10+grad5 = max 15
+                score += 10 + min(5, c["ma20_slope"] * 200)
+            if atr_r < 1.0:                   # ATR收敛 base5+grad5 = max 10
+                score += 5 + min(5, (1.0 - atr_r) * 15)
+            score += max(0, min(20, (c["near_high"] - 0.6) / 0.4 * 20))  # near_high渐变 max 20
+            if c["is_yang_fang"]:
+                score += 10                    # 放量收阳 10
+            ar = c["amount_ratio"]             # 量比渐变 max 10
+            if 1.0 <= ar <= 2.0:
+                score += 10
+            elif 0.7 <= ar < 1.0:
+                score += (ar - 0.7) / 0.3 * 10
+            elif 2.0 < ar <= 3.0:
+                score += (3.0 - ar) / 1.0 * 10
+            if atr_r < 0.7:
+                score += 5                     # 极致收敛奖励 5
+        else:
+            # 熊市：二值基础+渐变加成（max≈100）
+            if c["ma20_slope"] > 0:           # MA20斜率 base15+grad10 = max 25
+                score += 15 + min(10, c["ma20_slope"] * 300)
+            if atr_r < 1.0:                   # ATR收敛 base15+grad10 = max 25
+                score += 15 + min(10, (1.0 - atr_r) * 30)
+            score += rps_pct * 0.10           # RPS20 max 10
+            score += rps60_pct * 0.05         # RPS60 max 5
+            if c["near_high"] > 0.75:         # near_high base10+grad5 = max 15
+                score += 10 + min(5, (c["near_high"] - 0.75) / 0.25 * 5)
+            elif c["near_high"] > 0.6:
+                score += (c["near_high"] - 0.6) / 0.15 * 10
+            if 0.5 <= c["amount_ratio"] <= 1.2:
+                score += 15                    # 缩量企稳（二值）15
+            if c["close"] > c.get("MA20", 0) > 0:
+                score += 5                     # 站上MA20 5
 
         c["rps20"] = round(rps_pct, 1)
+        c["rps60"] = round(rps60_pct, 1)
         c["score"] = round(score, 1)
+        c["market_regime"] = market_regime
 
     candidates.sort(key=lambda x: x["score"], reverse=True)
+    pct = 0.15 if is_bull else top_pct
+    top_n = max(20, min(200, int(len(candidates) * pct)))
     return candidates[:top_n]
 
 
@@ -595,14 +641,15 @@ def _risk_filter(chan_result: Dict, cr_result: Dict,
 
 
 def l2_score_and_rank(cache: TdxCache, l1_candidates: List[Dict],
-                      cutoff_date: str, top_n: int = 30) -> List[Dict]:
+                      cutoff_date: str, top_pct: float = 0.05) -> List[Dict]:
     """
-    L2 蓄势评分 + Top30 排名（最终版 — 回测验证最优的v3评分体系）。
+    L2 三维评分：形态+量能+动量（v3: 动量加入RPS60中期确认）。
 
-    综合评分 = 蓄势形态分(40%) + 量能确认分(30%) + RPS动量分(30%)
-
-    风控：连续5日下跌 / 当日暴跌>7% 否决（轻量）。
+    牛市: 形态35% + 量能25% + 动量40%
+    熊市: 形态45% + 量能35% + 动量20%
     """
+    market_regime = l1_candidates[0].get("market_regime", "bull") if l1_candidates else "bull"
+    is_bull = market_regime in ("bull", "neutral")
     scored = []
 
     # 收集候选池RPS用于百分位
@@ -639,7 +686,7 @@ def l2_score_and_rank(cache: TdxCache, l1_candidates: List[Dict],
             if (close_v[-1] - close_v[-2]) / close_v[-2] < -0.07:
                 continue
 
-        # ═══════ 蓄势形态分（0~100，权重40%）═════════════════════════
+        # ═══════ 形态分（0~100）═══════════════════════════════════════
         ma5  = item.get("MA5", 0)
         ma10 = item.get("MA10", 0)
         ma20 = item.get("MA20", 0)
@@ -673,7 +720,7 @@ def l2_score_and_rank(cache: TdxCache, l1_candidates: List[Dict],
             if ma60_val == ma60_val and close300.iloc[-1] > ma60_val:
                 ma60_score = 15
 
-        # MACD（DIF>DEA=多头排列加分，不要求DIF>0）
+        # MACD（DIF>DEA）
         ema12 = close300.ewm(span=12, adjust=False).mean()
         ema26 = close300.ewm(span=26, adjust=False).mean()
         dif = ema12 - ema26
@@ -682,14 +729,14 @@ def l2_score_and_rank(cache: TdxCache, l1_candidates: List[Dict],
 
         form_score = min(ma_score + atr_score + above_ma20 + ma60_score + macd_bonus, 100)
 
-        # ═══════ 量能确认分（0~100，权重30%）═════════════════════════
+        # ═══════ 量能确认分（0~100）═════════════════════════════════
         vol300 = df300[v_col].astype(float).values if v_col else None
         vol_score = 0
         if vol300 is not None and n300 >= 20:
             vol_ma5  = np.mean(vol300[-5:])
             vol_ma20 = np.mean(vol300[-20:])
             if vol_ma5 < vol_ma20 * 0.8:
-                vol_score += 40  # 明显缩量（蓄势信号）
+                vol_score += 40
             elif vol_ma5 < vol_ma20:
                 vol_score += 20
 
@@ -704,10 +751,13 @@ def l2_score_and_rank(cache: TdxCache, l1_candidates: List[Dict],
                 vol_score += 30
         vol_score = min(vol_score, 100)
 
-        # ═══════ RPS动量分（0~100，权重30%）══════════════════════════
+        # ═══════ 动量分（0~100）：RPS20+RPS60+5日超额 ════════════════
         rps_val = item.get("rps_20d", 0)
         rps_pct = float(np.searchsorted(np.sort(rps_arr), rps_val)) / max(len(rps_arr), 1)
-        rps_score = rps_pct * 50
+        rps20_score = rps_pct * 30
+        # RPS60 中期趋势确认（v3新增）
+        rps60_pct = item.get("rps60", 50) / 100.0
+        rps60_score = rps60_pct * 20
 
         if n300 >= 5:
             ret_5d = (close300.iloc[-1] - close300.iloc[-5]) / close300.iloc[-5] * 100
@@ -715,10 +765,13 @@ def l2_score_and_rank(cache: TdxCache, l1_candidates: List[Dict],
             ret_5d = 0
         excess_score = min(max(ret_5d * 5, 0), 50)
 
-        momentum_score = rps_score + excess_score
+        momentum_score = min(rps20_score + rps60_score + excess_score, 100)
 
-        # ═══════ 综合评分 ════════════════════════════════════════════
-        total = form_score * 0.40 + vol_score * 0.30 + momentum_score * 0.30
+        # ═══════ 综合评分（牛熊差异化权重）══════════════════════════
+        if is_bull:
+            total = form_score * 0.35 + vol_score * 0.25 + momentum_score * 0.40
+        else:
+            total = form_score * 0.45 + vol_score * 0.35 + momentum_score * 0.20
 
         scored.append({
             "code":       code,
@@ -729,9 +782,12 @@ def l2_score_and_rank(cache: TdxCache, l1_candidates: List[Dict],
             "mom_score":  round(momentum_score, 1),
             "rps_20d":    item.get("rps_20d", 0),
             "vol_ratio":  item.get("vol_ratio", 0),
+            "market_regime": market_regime,
         })
 
     scored.sort(key=lambda x: -x["total_score"])
+    pct = 0.15 if is_bull else top_pct
+    top_n = max(5, min(30, int(len(scored) * pct)))
     return scored[:top_n]
 
 
