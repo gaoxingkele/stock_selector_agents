@@ -3550,8 +3550,8 @@ class DataEngine:
 
                     detector = PatternDetector(
                         std_df, df_weekly=weekly_df,
-                        pivot_bars_left=6, pivot_bars_right=6,
-                        weekly_pivot_bars_left=4, weekly_pivot_bars_right=4
+                        pivot_bars_left=5, pivot_bars_right=5,
+                        weekly_pivot_bars_left=2, weekly_pivot_bars_right=2
                     )
                     det_result = detector.detect_all()
 

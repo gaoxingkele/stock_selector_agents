@@ -172,13 +172,18 @@ def _resolve_dup(pivots: pd.DataFrame, idx, col: str = "P",
 # 形态判定函数（纯几何判断）
 # ═══════════════════════════════════════════════════════════════════════
 
+# A 股形态容差系数：原始 stock-pattern 默认为 1.0（基于美股低波动）
+# A 股波动大、形态不规整，统一放宽到 1.8x
+TOLERANCE = 1.8
+
+
 def _is_hns(a, b, c, d, e, f, avg_bar) -> bool:
     """头肩顶: C 是头（最高），A/E 是肩，B/D 是颈线"""
     shoulder_thresh = round(avg_bar * 0.6, 2)
     return (c > max(a, e)
             and max(b, d) < min(a, e)
             and f < e
-            and abs(b - d) < avg_bar
+            and abs(b - d) < avg_bar * TOLERANCE
             and abs(c - e) > shoulder_thresh)
 
 
@@ -188,14 +193,14 @@ def _is_reverse_hns(a, b, c, d, e, f, avg_bar) -> bool:
     return (c < min(a, e)
             and min(b, d) > max(a, e)
             and f > e
-            and abs(b - d) < avg_bar
+            and abs(b - d) < avg_bar * TOLERANCE
             and abs(c - e) > shoulder_thresh)
 
 
 def _is_double_top(a, b, c, d, a_vol, c_vol, avg_bar, atr) -> bool:
     """双顶"""
     return (c - b < atr * 4
-            and abs(a - c) <= avg_bar * 0.5
+            and abs(a - c) <= avg_bar * 0.5 * TOLERANCE
             and c_vol < a_vol
             and b < min(a, c)
             and b < d < c)
@@ -204,7 +209,7 @@ def _is_double_top(a, b, c, d, a_vol, c_vol, avg_bar, atr) -> bool:
 def _is_double_bottom(a, b, c, d, a_vol, c_vol, avg_bar, atr) -> bool:
     """双底"""
     return (b - c < atr * 4
-            and abs(a - c) <= avg_bar * 0.5
+            and abs(a - c) <= avg_bar * 0.5 * TOLERANCE
             and c_vol < a_vol
             and b > max(a, c)
             and b > d > c)
@@ -212,9 +217,9 @@ def _is_double_bottom(a, b, c, d, a_vol, c_vol, avg_bar, atr) -> bool:
 
 def _is_triangle(a, b, c, d, e, f, avg_bar) -> Optional[str]:
     """三角形: Ascending / Descending / Symmetric"""
-    ac_flat = abs(a - c) <= avg_bar
-    ce_flat = abs(c - e) <= avg_bar
-    bd_flat = abs(b - d) <= avg_bar
+    ac_flat = abs(a - c) <= avg_bar * TOLERANCE
+    ce_flat = abs(c - e) <= avg_bar * TOLERANCE
+    bd_flat = abs(b - d) <= avg_bar * TOLERANCE
 
     if ac_flat and ce_flat and b < d < f < e:
         return "Ascending"
@@ -227,9 +232,9 @@ def _is_triangle(a, b, c, d, e, f, avg_bar) -> Optional[str]:
 
 def _is_bullish_vcp(a, b, c, d, e, avg_bar) -> bool:
     """VCP 看多（波动收缩底部抬升）"""
-    if c > a and abs(a - c) >= avg_bar * 0.5:
+    if c > a and abs(a - c) >= avg_bar * 0.5 * TOLERANCE:
         return False
-    return (abs(a - c) <= avg_bar
+    return (abs(a - c) <= avg_bar * TOLERANCE
             and abs(b - d) >= avg_bar * 0.8
             and b < min(a, c, d, e)
             and d < min(a, c, e)
@@ -238,9 +243,9 @@ def _is_bullish_vcp(a, b, c, d, e, avg_bar) -> bool:
 
 def _is_bearish_vcp(a, b, c, d, e, avg_bar) -> bool:
     """VCP 看空（波动收缩顶部下移）"""
-    if c < a and abs(a - c) >= avg_bar * 0.5:
+    if c < a and abs(a - c) >= avg_bar * 0.5 * TOLERANCE:
         return False
-    return (abs(a - c) <= avg_bar
+    return (abs(a - c) <= avg_bar * TOLERANCE
             and abs(b - d) >= avg_bar * 0.8
             and b > max(a, c, d, e)
             and d > max(a, c, e)
@@ -913,10 +918,10 @@ class PatternDetector:
 
     def __init__(self, df_daily: pd.DataFrame,
                  df_weekly: pd.DataFrame = None,
-                 pivot_bars_left: int = 6,
-                 pivot_bars_right: int = 6,
-                 weekly_pivot_bars_left: int = 4,
-                 weekly_pivot_bars_right: int = 4):
+                 pivot_bars_left: int = 5,
+                 pivot_bars_right: int = 5,
+                 weekly_pivot_bars_left: int = 2,
+                 weekly_pivot_bars_right: int = 2):
         self.df_daily = _standardize_df(df_daily.copy())
         self.df_weekly = _standardize_df(df_weekly.copy()) if df_weekly is not None else None
         self.pivot_bl = pivot_bars_left
