@@ -3690,11 +3690,17 @@ class DataEngine:
     def L2_score_and_rank(self, candidates: List[Dict], verbose: bool = True,
                           top_pct: float = 0.05) -> List[Dict]:
         """
-        L2 综合评分：形态+量能+动量（三维）。
+        L2 综合评分（v5 双轮对齐）：继承 L1 的 quant_score + pattern_score，
+        叠加 L2 独有的长期指标（MACD/EMA60/300日上下文）+ 风控。
 
-        v3: 动量维度新增RPS60中期确认，其余保持二值评分。
-          - 牛市：形态35% + 量能25% + 动量40%
-          - 熊市：形态45% + 量能35% + 动量20%
+          L2 总分 =
+            L1 quant_score 归一化 × 0.40
+          + L1 pattern_score 归一化 × 0.30
+          + L2 健康分（MACD/EMA60/接近百日新高） × 0.20
+          + L2 量能确认分 × 0.10
+          + 双轮共识（source=dual） +5
+
+          风控否决：连续5日下跌、当日暴跌>7%
         """
         # 继承L1的市场环境
         market_regime = "bull"
@@ -3704,7 +3710,7 @@ class DataEngine:
 
         if verbose:
             regime_cn = {"bull": "牛市", "bear": "熊市", "neutral": "震荡偏多"}.get(market_regime, market_regime)
-            print(f"\n[数据] L2: 综合评分排名（{regime_cn}模式）...")
+            print(f"\n[数据] L2 v5: 综合评分排名（{regime_cn}模式）...")
             print(f"  输入: {len(candidates)} 只")
 
         if not candidates:
@@ -3715,17 +3721,9 @@ class DataEngine:
         data_insufficient = 0
         _l2_start = time.time()
 
-        # 收集所有候选的5日收益率（用于超额收益百分位）
-        ret5_list = []
-        for stock in candidates:
-            df = stock.get("df")
-            if df is not None and len(df) >= 6:
-                _c = "close" if "close" in df.columns else "收盘"
-                c_arr = df[_c].astype(float).values
-                ret5_list.append((c_arr[-1] / c_arr[-6] - 1) * 100)
-            else:
-                ret5_list.append(0)
-        ret5_arr = np.array(ret5_list)
+        # 归一化基准：L1 传入的分数最大值
+        max_quant = max((c.get("quant_score", 0) for c in candidates), default=1) or 1
+        max_pattern = max((c.get("pattern_score", 0) for c in candidates), default=1) or 1
 
         for idx, stock in enumerate(candidates):
             if verbose and (idx + 1) % 50 == 0:
@@ -3768,103 +3766,87 @@ class DataEngine:
                     risk_rejected += 1
                     continue
 
-            # ═══════ 形态分（0~100）═══════════════════════════════════════
-            ma5 = stock.get("MA5", 0)
-            ma20 = stock.get("MA20", 0)
-            ma60 = stock.get("MA60", 0)
-
-            # MA多头排列（二值）
-            if ma60 > 0 and ma5 > ma20 > ma60:
-                ma_score = 30
-            elif ma5 > ma20:
-                ma_score = 15
-            else:
-                ma_score = 0
-
-            # ATR收窄
-            tr300 = np.maximum(high300[1:] - low300[1:],
-                               np.maximum(np.abs(high300[1:] - close300[:-1]),
-                                          np.abs(low300[1:] - close300[:-1])))
-            if len(tr300) >= 20:
-                atr_5 = float(np.mean(tr300[-5:]))
-                atr_20 = float(np.mean(tr300[-20:]))
-                atr_ratio = atr_5 / max(atr_20, 0.001)
-                atr_score = max(0, min(30, (1.0 - atr_ratio) * 60))
-            else:
-                atr_score = 0
-
-            # 站上MA20
+            # ═══════ L2 长期健康分（0~100）═══════
+            # 基于 300 日数据的 MACD / EMA60 / 300日新高
             close_s = pd.Series(close300)
-            ma20_val = close_s.rolling(20, min_periods=20).mean().iloc[-1]
-            above_ma20 = 15 if (ma20_val == ma20_val and close300[-1] > ma20_val) else 0
+            health_score = 0
 
-            # 站上MA60
-            ma60_score = 0
-            if n300 >= 60:
-                ma60_val = close_s.rolling(60, min_periods=60).mean().iloc[-1]
-                if ma60_val == ma60_val and close300[-1] > ma60_val:
-                    ma60_score = 15
-
-            # MACD多头排列(DIF>DEA)
+            # MACD 多头（DIF>DEA，零轴上方更强）
             ema12 = close_s.ewm(span=12, adjust=False).mean()
             ema26 = close_s.ewm(span=26, adjust=False).mean()
             dif = ema12 - ema26
             dea = dif.ewm(span=9, adjust=False).mean()
-            macd_bonus = 10 if dif.iloc[-1] > dea.iloc[-1] else 0
+            if dif.iloc[-1] > dea.iloc[-1]:
+                health_score += 20
+                if dif.iloc[-1] > 0:
+                    health_score += 10
 
-            form_score = min(ma_score + atr_score + above_ma20 + ma60_score + macd_bonus, 100)
+            # EMA60 趋势
+            if n300 >= 60:
+                ema60_s = close_s.ewm(span=60, adjust=False).mean()
+                ema60 = ema60_s.iloc[-1]
+                if close300[-1] > ema60:
+                    health_score += 15
+                if n300 >= 71:
+                    ema60_prev = ema60_s.iloc[-11]
+                    if ema60 > ema60_prev:
+                        health_score += 15
 
-            # ═══════ 量能确认分（0~100）══════════════════════════════════
+            # MA60 支撑
+            if n300 >= 60:
+                ma60_val = float(np.mean(close300[-60:]))
+                if close300[-1] > ma60_val * 0.95:
+                    health_score += 15
+
+            # 接近百日新高
+            if n300 >= 100:
+                high_100 = float(np.max(close300[-100:]))
+                if close300[-1] >= high_100 * 0.95:
+                    health_score += 25
+
+            health_score = min(health_score, 100)
+
+            # ═══════ L2 量能确认分（0~100）═══════
             vol_score_val = 0
             if n300 >= 20:
                 vol_ma5 = float(np.mean(vol300[-5:]))
                 vol_ma20 = float(np.mean(vol300[-20:]))
 
-                # 缩量蓄势
                 if vol_ma5 < vol_ma20 * 0.8:
                     vol_score_val += 40
                 elif vol_ma5 < vol_ma20:
                     vol_score_val += 20
 
-                # 量能稳定（低变异系数）
                 vol_std = float(np.std(vol300[-5:]))
                 vol_cv = vol_std / max(vol_ma5, 1)
                 vol_score_val += max(0, min(30, (1.0 - vol_cv) * 40))
 
-                # 温和收阳（收阳 + 量不超均量1.5倍）
                 if close300[-1] > open300[-1] and vol300[-1] < vol_ma20 * 1.5:
                     vol_score_val += 30
 
             vol_score_val = min(vol_score_val, 100)
 
-            # ═══════ 动量分（0~100）：RPS20+RPS60+5日超额 ════════════════
-            from scipy.stats import percentileofscore
-            # RPS20 × 30
-            rps_pct = stock.get("rps20", 50) / 100.0
-            rps20_score = rps_pct * 30
-            # RPS60 × 20（中期趋势确认，v3新增）
-            rps60_pct = stock.get("rps60", 50) / 100.0
-            rps60_score = rps60_pct * 20
-            # 5日超额收益百分位 × 50
-            ret5_val = ret5_list[idx]
-            excess_pct = percentileofscore(ret5_arr, ret5_val, kind='rank') / 100.0
-            excess_score = excess_pct * 50
+            # ═══════ 综合评分：继承 L1 + L2 独有价值 ═══════
+            quant_norm = stock.get("quant_score", 0) / max_quant * 100
+            pattern_norm = (stock.get("pattern_score", 0) / max_pattern * 100) if max_pattern > 0 else 0
 
-            momentum_score = min(rps20_score + rps60_score + excess_score, 100)
+            total = (quant_norm * 0.40
+                     + pattern_norm * 0.30
+                     + health_score * 0.20
+                     + vol_score_val * 0.10)
 
-            # ═══════ 综合评分（牛熊差异化权重）══════════════════════════
-            if is_bull:
-                total = form_score * 0.35 + vol_score_val * 0.25 + momentum_score * 0.40
-            else:
-                total = form_score * 0.45 + vol_score_val * 0.35 + momentum_score * 0.20
+            # 双轮共识加分
+            if stock.get("source") == "dual":
+                total += 5
 
             scored.append({
                 **stock,
                 "l2_score": round(total, 1),
-                "form_score": round(form_score, 1),
-                "vol_score": round(vol_score_val, 1),
-                "mom_score": round(momentum_score, 1),
-                "l2_detail": f"形态={form_score:.0f} 量能={vol_score_val:.0f} 动量={momentum_score:.0f}",
+                "l2_quant_norm": round(quant_norm, 1),
+                "l2_pattern_norm": round(pattern_norm, 1),
+                "l2_health": round(health_score, 1),
+                "l2_vol": round(vol_score_val, 1),
+                "l2_detail": f"量化={quant_norm:.0f} 形态={pattern_norm:.0f} 健康={health_score:.0f} 量能={vol_score_val:.0f}",
                 "market_regime": market_regime,
             })
 
@@ -3879,10 +3861,7 @@ class DataEngine:
             regime_cn = {"bull": "牛市", "bear": "熊市", "neutral": "震荡偏多"}.get(market_regime, market_regime)
             print(f"\n  [L2] 评分完成（{regime_cn}）：{len(scored)} 只已评分，取 Top {top_pct:.0%}={top_n} 只，耗时 {elapsed:.1f}秒")
             print(f"       风控否决: {risk_rejected} | 数据不足: {data_insufficient}")
-            if is_bull:
-                print(f"       权重: 形态35% + 量能25% + 动量40%")
-            else:
-                print(f"       权重: 形态45% + 量能35% + 动量20%")
+            print(f"       权重: L1量化40% + L1形态30% + L2健康20% + L2量能10% (+双轮共识5)")
             if top_results:
                 scores = [c["l2_score"] for c in top_results]
                 print(f"       Top{min(top_n, len(top_results))} 得分范围: {min(scores):.1f} ~ {max(scores):.1f}")

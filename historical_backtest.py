@@ -727,41 +727,44 @@ def _risk_filter(chan_result: Dict, cr_result: Dict,
 def l2_score_and_rank(cache: TdxCache, l1_candidates: List[Dict],
                       cutoff_date: str, top_pct: float = 0.05) -> List[Dict]:
     """
-    L2 三维评分：形态+量能+动量（v3: 动量加入RPS60中期确认）。
+    L2 v5 综合评分：继承 L1 的 quant_score + pattern_score，
+    叠加 L2 独有的长期指标（MACD/EMA60/300日上下文）+ 风控。
 
-    牛市: 形态35% + 量能25% + 动量40%
-    熊市: 形态45% + 量能35% + 动量20%
+      L2 总分 =
+        L1 quant_score 归一化 × 0.40
+      + L1 pattern_score 归一化 × 0.30
+      + L2 健康分 × 0.20
+      + L2 量能确认分 × 0.10
+      + 双轮共识(source=dual) +5
     """
     market_regime = l1_candidates[0].get("market_regime", "bull") if l1_candidates else "bull"
     is_bull = market_regime in ("bull", "neutral")
     scored = []
 
-    # 收集候选池RPS用于百分位
-    all_rps = [c.get("rps_20d", 0) for c in l1_candidates]
-    rps_arr = np.array(all_rps) if all_rps else np.array([0])
+    # 归一化基准
+    max_quant = max((c.get("quant_score", 0) for c in l1_candidates), default=1) or 1
+    max_pattern = max((c.get("pattern_score", 0) for c in l1_candidates), default=1) or 1
 
     for item in l1_candidates:
         code = item["code"]
 
-        # ── 获取300根K线 ─────────────────────────────────────────────
+        # ── 获取300根K线 ──
         df300 = cache.get_bars(code, cutoff_date, days=300)
         if df300 is None or len(df300) < 60:
             continue
         c_col = "close" if "close" in df300.columns else ("收盘" if "收盘" in df300.columns else None)
         o_col = "open"  if "open"  in df300.columns else ("开盘" if "开盘" in df300.columns else None)
-        h_col = "high"  if "high"  in df300.columns else ("最高" if "最高" in df300.columns else None)
-        l_col = "low"   if "low"   in df300.columns else ("最低" if "最低" in df300.columns else None)
         v_col = "volume" if "volume" in df300.columns else (
                 "vol" if "vol" in df300.columns else (
                 "成交量" if "成交量" in df300.columns else None))
-        if not all([c_col, o_col, h_col, l_col]):
+        if not all([c_col, o_col]):
             continue
 
         close300 = df300[c_col].astype(float)
         close_v  = close300.values
         n300 = len(close300)
 
-        # ── 轻量风控 ────────────────────────────────────────────────
+        # ── 轻量风控 ──
         if n300 >= 6:
             drops = sum(1 for i in range(-5, 0) if close_v[i] < close_v[i - 1])
             if drops >= 5:
@@ -770,50 +773,44 @@ def l2_score_and_rank(cache: TdxCache, l1_candidates: List[Dict],
             if (close_v[-1] - close_v[-2]) / close_v[-2] < -0.07:
                 continue
 
-        # ═══════ 形态分（0~100）═══════════════════════════════════════
-        ma5  = item.get("MA5", 0)
-        ma20 = item.get("MA20", 0)
-        ma60 = item.get("MA60", 0)
-        if ma60 > 0 and ma5 > ma20 > ma60:
-            ma_score = 30
-        elif ma5 > ma20:
-            ma_score = 15
-        else:
-            ma_score = 0
+        # ═══════ L2 健康分（0~100）═══════
+        health_score = 0
 
-        # ATR收窄
-        high300 = df300[h_col].astype(float).values
-        low300  = df300[l_col].astype(float).values
-        if n300 >= 20:
-            tr = np.maximum(high300 - low300,
-                            np.maximum(np.abs(high300 - np.roll(close_v, 1)),
-                                       np.abs(low300 - np.roll(close_v, 1))))
-            atr_5  = np.mean(tr[-5:])
-            atr_20 = np.mean(tr[-20:])
-            atr_ratio = atr_5 / max(atr_20, 0.001)
-            atr_score = max(0, min(30, (1.0 - atr_ratio) * 60))
-        else:
-            atr_score = 0
-
-        # 站上MA20 + MA60
-        ma20_val = close300.rolling(20, min_periods=20).mean().iloc[-1]
-        above_ma20 = 15 if (ma20_val == ma20_val and close300.iloc[-1] > ma20_val) else 0
-        ma60_score = 0
-        if n300 >= 60:
-            ma60_val = close300.rolling(60, min_periods=60).mean().iloc[-1]
-            if ma60_val == ma60_val and close300.iloc[-1] > ma60_val:
-                ma60_score = 15
-
-        # MACD（DIF>DEA）
+        # MACD
         ema12 = close300.ewm(span=12, adjust=False).mean()
         ema26 = close300.ewm(span=26, adjust=False).mean()
         dif = ema12 - ema26
         dea = dif.ewm(span=9, adjust=False).mean()
-        macd_bonus = 10 if dif.iloc[-1] > dea.iloc[-1] else 0
+        if dif.iloc[-1] > dea.iloc[-1]:
+            health_score += 20
+            if dif.iloc[-1] > 0:
+                health_score += 10
 
-        form_score = min(ma_score + atr_score + above_ma20 + ma60_score + macd_bonus, 100)
+        # EMA60 趋势
+        if n300 >= 60:
+            ema60_s = close300.ewm(span=60, adjust=False).mean()
+            ema60 = ema60_s.iloc[-1]
+            if close_v[-1] > ema60:
+                health_score += 15
+            if n300 >= 71:
+                if ema60 > ema60_s.iloc[-11]:
+                    health_score += 15
 
-        # ═══════ 量能确认分（0~100）═════════════════════════════════
+        # MA60 支撑
+        if n300 >= 60:
+            ma60_val = float(np.mean(close_v[-60:]))
+            if close_v[-1] > ma60_val * 0.95:
+                health_score += 15
+
+        # 接近百日新高
+        if n300 >= 100:
+            high_100 = float(np.max(close_v[-100:]))
+            if close_v[-1] >= high_100 * 0.95:
+                health_score += 25
+
+        health_score = min(health_score, 100)
+
+        # ═══════ L2 量能确认分（0~100）═══════
         vol300 = df300[v_col].astype(float).values if v_col else None
         vol_score = 0
         if vol300 is not None and n300 >= 20:
@@ -835,35 +832,29 @@ def l2_score_and_rank(cache: TdxCache, l1_candidates: List[Dict],
                 vol_score += 30
         vol_score = min(vol_score, 100)
 
-        # ═══════ 动量分（0~100）：RPS20+RPS60+5日超额 ════════════════
-        rps_val = item.get("rps_20d", 0)
-        rps_pct = float(np.searchsorted(np.sort(rps_arr), rps_val)) / max(len(rps_arr), 1)
-        rps20_score = rps_pct * 30
-        # RPS60 中期趋势确认（v3新增）
-        rps60_pct = item.get("rps60", 50) / 100.0
-        rps60_score = rps60_pct * 20
+        # ═══════ 综合评分 ═══════
+        quant_norm = item.get("quant_score", 0) / max_quant * 100
+        pattern_norm = (item.get("pattern_score", 0) / max_pattern * 100) if max_pattern > 0 else 0
 
-        if n300 >= 5:
-            ret_5d = (close300.iloc[-1] - close300.iloc[-5]) / close300.iloc[-5] * 100
-        else:
-            ret_5d = 0
-        excess_score = min(max(ret_5d * 5, 0), 50)
+        total = (quant_norm * 0.40
+                 + pattern_norm * 0.30
+                 + health_score * 0.20
+                 + vol_score * 0.10)
 
-        momentum_score = min(rps20_score + rps60_score + excess_score, 100)
-
-        # ═══════ 综合评分（牛熊差异化权重）══════════════════════════
-        if is_bull:
-            total = form_score * 0.35 + vol_score * 0.25 + momentum_score * 0.40
-        else:
-            total = form_score * 0.45 + vol_score * 0.35 + momentum_score * 0.20
+        if item.get("source") == "dual":
+            total += 5
 
         scored.append({
             "code":       code,
             "close":      item["close"],
             "total_score": round(total, 1),
-            "form_score": round(form_score, 1),
-            "vol_score":  round(vol_score, 1),
-            "mom_score":  round(momentum_score, 1),
+            "l2_quant_norm": round(quant_norm, 1),
+            "l2_pattern_norm": round(pattern_norm, 1),
+            "l2_health": round(health_score, 1),
+            "l2_vol": round(vol_score, 1),
+            "pattern_score": item.get("pattern_score", 0),
+            "pattern_list": item.get("pattern_list", []),
+            "source": item.get("source", "?"),
             "rps_20d":    item.get("rps_20d", 0),
             "vol_ratio":  item.get("vol_ratio", 0),
             "market_regime": market_regime,
