@@ -173,25 +173,31 @@ def _resolve_dup(pivots: pd.DataFrame, idx, col: str = "P",
 # ═══════════════════════════════════════════════════════════════════════
 
 # A 股形态容差系数：原始 stock-pattern 默认为 1.0（基于美股低波动）
-# A 股波动大、形态不规整，统一放宽到 1.8x
-TOLERANCE = 1.8
+# A 股波动大、形态不规整，统一放宽到 2.0x
+TOLERANCE = 2.0
 
 
 def _is_hns(a, b, c, d, e, f, avg_bar) -> bool:
-    """头肩顶: C 是头（最高），A/E 是肩，B/D 是颈线"""
+    """头肩顶: C 是头（最高），A/E 是肩，B/D 是颈线
+    A 股放宽：颈线允许接近肩部（不要求严格低于肩部 0.5×avg_bar）
+    """
     shoulder_thresh = round(avg_bar * 0.6, 2)
+    neckline_tol = avg_bar * 0.5 * TOLERANCE
     return (c > max(a, e)
-            and max(b, d) < min(a, e)
+            and max(b, d) < min(a, e) + neckline_tol  # 颈线允许略高于肩
             and f < e
             and abs(b - d) < avg_bar * TOLERANCE
             and abs(c - e) > shoulder_thresh)
 
 
 def _is_reverse_hns(a, b, c, d, e, f, avg_bar) -> bool:
-    """头肩底: C 是头（最低），A/E 是肩，B/D 是颈线"""
+    """头肩底: C 是头（最低），A/E 是肩，B/D 是颈线
+    A 股放宽：颈线允许接近肩部（不要求严格高于肩部 0.5×avg_bar）
+    """
     shoulder_thresh = round(avg_bar * 0.6, 2)
+    neckline_tol = avg_bar * 0.5 * TOLERANCE
     return (c < min(a, e)
-            and min(b, d) > max(a, e)
+            and min(b, d) > max(a, e) - neckline_tol  # 颈线允许略低于肩
             and f > e
             and abs(b - d) < avg_bar * TOLERANCE
             and abs(c - e) > shoulder_thresh)
@@ -216,17 +222,26 @@ def _is_double_bottom(a, b, c, d, a_vol, c_vol, avg_bar, atr) -> bool:
 
 
 def _is_triangle(a, b, c, d, e, f, avg_bar) -> Optional[str]:
-    """三角形: Ascending / Descending / Symmetric"""
+    """三角形: Ascending / Descending / Symmetric
+    A 股放宽：单调约束改为整体趋势（首末点差距足够大），允许中间噪音
+    """
     ac_flat = abs(a - c) <= avg_bar * TOLERANCE
     ce_flat = abs(c - e) <= avg_bar * TOLERANCE
     bd_flat = abs(b - d) <= avg_bar * TOLERANCE
+    noise = avg_bar * 0.5  # 允许的中间噪音容差
 
-    if ac_flat and ce_flat and b < d < f < e:
+    # 上升三角：高点平 + 低点抬升（首末点 b<f 即可，中间允许小回调）
+    if ac_flat and ce_flat and b < f - noise and d < f + noise and b < d + noise:
         return "Ascending"
-    if bd_flat and a > c > e > f and f >= d:
+
+    # 下降三角：低点平 + 高点下移
+    if bd_flat and a > f + noise and c > f - noise and a > c - noise and e > f - noise:
         return "Descending"
-    if a > c > e and b < d < f and e > f:
+
+    # 对称三角：高点下移 + 低点抬升
+    if a > e + noise and b < f - noise and a > c - noise and c > e - noise and b < d + noise and d < f + noise:
         return "Symmetric"
+
     return None
 
 
@@ -408,8 +423,9 @@ def find_hns(df: pd.DataFrame, pivots: pd.DataFrame) -> Optional[dict]:
                 continue
 
             neckline = min(b, d)
+            # 头肩顶允许跌破颈线（跌破是看跌信号），只在远离>3×avg_bar 才认为已完成
             lowest_after_e = df.loc[e_idx:, "Low"].min()
-            if lowest_after_e < neckline and abs(lowest_after_e - neckline) > avg_bar:
+            if lowest_after_e < neckline - avg_bar * 3:
                 c_idx, c = e_idx, e
                 continue
 
@@ -469,8 +485,10 @@ def find_reverse_hns(df: pd.DataFrame, pivots: pd.DataFrame) -> Optional[dict]:
                 continue
 
             neckline = max(b, d)
+            # 头肩底允许突破颈线（突破是看涨信号），但要求 close 在颈线附近不能远离
+            # 只在突破后又远走（>3×avg_bar）才认为形态已完成不再有效
             highest_after_e = df.loc[e_idx:, "High"].max()
-            if highest_after_e > neckline and abs(highest_after_e - neckline) > avg_bar:
+            if highest_after_e > neckline + avg_bar * 3:
                 c_idx, c = e_idx, e
                 continue
 
@@ -903,18 +921,20 @@ class PatternDetector:
         "MA_BULL": {"daily": 10, "weekly": 0},  # 多头排列
     }
 
-    # 排除标志（看空）
-    BEAR_EXCLUDE = {
-        "DTOP",              # 双顶
-        "HNSD",              # 头肩顶
-        "VCPD",              # VCP 看空
-        "TRNG_Descending",   # 下降三角
-        "TRNG_breakdown",    # 三角向下突破
-        "FLAGD",             # 看空旗型
-        "MACD_DIV",          # MACD 零轴下顶背离
-        "BREAK_SUPPORT",     # 破前低放量
-        "MA_BEAR",           # MA5/20/60 空头排列
+    # 看空强度分（按形态严重程度）
+    # 决策：当 bear_score - bull_score > BEAR_VETO_THRESHOLD 时排除
+    BEAR_SCORES = {
+        "HNSD":          {"daily": 20, "weekly": 35},  # 头肩顶
+        "DTOP":          {"daily": 15, "weekly": 25},  # 双顶
+        "VCPD":          {"daily": 10, "weekly": 15},  # VCP 看空
+        "TRNG_breakdown":{"daily": 10, "weekly": 15},  # 三角向下突破
+        "FLAGD":         {"daily": 10, "weekly": 15},  # 看空旗型
+        "BREAK_SUPPORT": {"daily": 15, "weekly": 0},   # 破前低放量（强信号）
+        "MACD_DIV":      {"daily": 8,  "weekly": 12},  # MACD 顶背离（弱单独信号）
+        "MA_BEAR":       {"daily": 5,  "weekly": 10},  # 均线空头（弱单独信号）
     }
+
+    BEAR_VETO_THRESHOLD = 25  # 看空净分超过该阈值才一票否决（25 = 中等强度看空形态）
 
     def __init__(self, df_daily: pd.DataFrame,
                  df_weekly: pd.DataFrame = None,
@@ -1010,52 +1030,68 @@ class PatternDetector:
         运行完整检测，返回：
         {
             "bullish_score": int,         # 看多总加分
+            "bearish_score": int,         # 看空总扣分
             "bearish_exclude": bool,      # 是否应排除
             "bearish_tags": [str, ...],   # 触发的看空标签
             "patterns": [dict, ...],      # 所有检测到的形态详情
         }
+
+        新版判定逻辑（看多 vs 看空强度对比）：
+          1. 计算 bull_score 和 bear_score（区分日线/周线权重）
+          2. 周线 HNSD/DTOP 直接排除（最强看空信号）
+          3. bear_net = bear_score - bull_score
+             - bear_net > BEAR_VETO_THRESHOLD → 排除
+             - 否则保留，bullish_score 反映净加分
         """
         all_patterns = []
         all_bearish_tags = []
-        total_score = 0
+        bull_score = 0
+        bear_score = 0
 
         # ── 日线检测 ──
         bull_d, bear_d = self._detect_on_timeframe(
             self.df_daily, "daily", self.pivot_bl, self.pivot_br)
         all_patterns.extend(bull_d)
-        all_bearish_tags.extend(bear_d)
+        all_bearish_tags.extend([(t, "daily") for t in bear_d])
 
         for p in bull_d:
             ptn = p["pattern"]
             if ptn in self.BULL_SCORES:
-                total_score += self.BULL_SCORES[ptn]["daily"]
+                bull_score += self.BULL_SCORES[ptn]["daily"]
+        for tag in bear_d:
+            if tag in self.BEAR_SCORES:
+                bear_score += self.BEAR_SCORES[tag]["daily"]
 
         # ── 周线检测 ──
         if self.df_weekly is not None and len(self.df_weekly) >= 20:
             bull_w, bear_w = self._detect_on_timeframe(
                 self.df_weekly, "weekly", self.weekly_bl, self.weekly_br)
             all_patterns.extend(bull_w)
-            all_bearish_tags.extend(bear_w)
+            all_bearish_tags.extend([(t, "weekly") for t in bear_w])
 
             for p in bull_w:
                 ptn = p["pattern"]
                 if ptn in self.BULL_SCORES:
-                    total_score += self.BULL_SCORES[ptn]["weekly"]
+                    bull_score += self.BULL_SCORES[ptn]["weekly"]
+            for tag in bear_w:
+                if tag in self.BEAR_SCORES:
+                    bear_score += self.BEAR_SCORES[tag]["weekly"]
 
-        # ── 排除判定：看空以排除为主 ──
-        should_exclude = any(tag in self.BEAR_EXCLUDE for tag in all_bearish_tags)
-
-        # 周线看空权重更高：周线顶部形态直接排除
-        weekly_bearish = [t for t in all_bearish_tags
-                          if t in ("HNSD", "DTOP") and
-                          any(p.get("timeframe") == "weekly" and p.get("pattern") == t
-                              for p in all_patterns)]
-        if weekly_bearish:
+        # ── 排除判定 ──
+        # 1) 周线 HNSD/DTOP 一票否决（最强看空形态）
+        weekly_strong_bear = [t for t, tf in all_bearish_tags
+                              if tf == "weekly" and t in ("HNSD", "DTOP")]
+        if weekly_strong_bear:
             should_exclude = True
+        else:
+            # 2) 看空净分超阈值才排除
+            bear_net = bear_score - bull_score
+            should_exclude = bear_net > self.BEAR_VETO_THRESHOLD
 
         return {
-            "bullish_score": total_score,
+            "bullish_score": bull_score,
+            "bearish_score": bear_score,
             "bearish_exclude": should_exclude,
-            "bearish_tags": list(set(all_bearish_tags)),
+            "bearish_tags": list(set(t for t, _ in all_bearish_tags)),
             "patterns": all_patterns,
         }
