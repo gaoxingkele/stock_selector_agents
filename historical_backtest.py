@@ -211,31 +211,31 @@ def _compute_rps(cache: TdxCache, codes: List[str],
 def l1_filter_at_date(cache: TdxCache, codes: List[str],
                       cutoff_date: str, top_pct: float = 0.05) -> List[Dict]:
     """
-    L1 多维打分选股（与 data_engine.L1_quant_filter 对齐）。
+    L1 v5 双轮并行架构（与 data_engine.L1_quant_filter 对齐）。
 
-    自动检测市场环境（牛市/熊市），差异化评分 + Top 5%。
+    Phase 1: 全市场预筛（流动性+连续大阴），读500日数据
+    Phase 2A: 量化强势轮（RPS+技术指标）
+    Phase 2B: 形态潜力轮（日线+周线形态识别）
+    Phase 3: 合并去重 + 综合排序
     """
+    from concurrent.futures import ThreadPoolExecutor
     from scipy.stats import percentileofscore
+    from pattern_detector import PatternDetector, _standardize_df, daily_to_weekly
 
-    all_rps = _compute_rps(cache, codes, cutoff_date, lookback=20)
-    all_rps60 = _compute_rps(cache, codes, cutoff_date, lookback=60)
-
-    # Phase 1: 硬性预筛 + 收集特征 + 市场广度统计
-    candidates = []
+    # ══════════════════════════════════════════════════════════════════
+    #  Phase 1: 预筛（流动性+大阴），收集特征
+    # ══════════════════════════════════════════════════════════════════
+    prefiltered = []
     _breadth_above_ma20 = 0
     _breadth_total = 0
     _breadth_ret20_sum = 0.0
 
     for code in codes:
-        code_rps_ret = all_rps.get(code)
-        if code_rps_ret is None:
+        df = cache.get_bars(code, cutoff_date, days=500)
+        if df is None or len(df) < 60:
             continue
-        code_rps60_ret = all_rps60.get(code, code_rps_ret)
-
-        df = cache.get_bars(code, cutoff_date, days=75)
-        if df is None:
-            continue
-        df = df.tail(75).reset_index(drop=True)
+        df_raw = df.tail(500).copy()
+        df = df_raw.reset_index(drop=True)
 
         c_col = "close" if "close" in df.columns else ("收盘" if "收盘" in df.columns else None)
         o_col = "open"  if "open"  in df.columns else ("开盘" if "开盘" in df.columns else None)
@@ -263,89 +263,64 @@ def l1_filter_at_date(cache: TdxCache, codes: List[str],
         _ma20_brd = float(np.mean(close_arr[-20:]))
         if close_arr[-1] > _ma20_brd:
             _breadth_above_ma20 += 1
-        _breadth_ret20_sum += code_rps_ret
+        _r20 = (close_arr[-1] - close_arr[-20]) / close_arr[-20] if close_arr[-20] > 0 else 0
+        _breadth_ret20_sum += _r20
 
+        if n < 4:
+            continue
+
+        # ① 连续2日大阴（跌幅>3%）→ 排除
+        if close_arr[-3] > 0 and close_arr[-2] > 0:
+            decline_d1 = (close_arr[-2] - close_arr[-3]) / close_arr[-3]
+            decline_d2 = (close_arr[-3] - close_arr[-4]) / close_arr[-4] if close_arr[-4] > 0 else 0
+            if decline_d1 < -0.03 and decline_d2 < -0.03:
+                continue
+
+        # ② 流动性
+        avg_amount_20 = float(np.mean(vol_arr[-20:] * close_arr[-20:] * 100) / 1e8)
+        if avg_amount_20 < 2.5:
+            continue
+
+        # ── 收集特征 ──
         ma5_s  = _calc_sma(pd.Series(close_arr), 5)
-        ma10_s = _calc_sma(pd.Series(close_arr), 10)
         ma20_s = _calc_sma(pd.Series(close_arr), 20)
-
+        ma60_s = _calc_sma(pd.Series(close_arr), 60) if n >= 60 else None
         if ma5_s.iloc[-1] != ma5_s.iloc[-1]:
             continue
-
-        ma5  = ma5_s.iloc[-1]
-        ma10 = ma10_s.iloc[-1]
+        ma5 = ma5_s.iloc[-1]
         ma20 = ma20_s.iloc[-1]
+        ma60 = ma60_s.iloc[-1] if ma60_s is not None else 0
 
-        # ── 硬性淘汰 ────────────────────────────────────────────────
-        # 均线空头排列
-        if ma5 < ma10 < ma20:
-            continue
+        ret_20d = _r20
+        ret_60d = (close_arr[-1] - close_arr[-60]) / close_arr[-60] if n >= 60 and close_arr[-60] > 0 else ret_20d
 
-        # 三连阴
-        if n >= 3:
-            if (close_arr[-1] < open_arr[-1] and
-                    close_arr[-2] < open_arr[-2] and
-                    close_arr[-3] < open_arr[-3]):
-                continue
+        ma20_prev = ma20_s.iloc[-6] if len(ma20_s) >= 6 else ma20_s.iloc[0]
+        ma20_slope = (ma20 - ma20_prev) / max(abs(ma20_prev), 0.01) if ma20_prev == ma20_prev else 0
 
-        # 无量空跌
-        if n >= 3:
-            if (close_arr[-1] < close_arr[-2] < close_arr[-3] and
-                    vol_arr[-1] < vol_arr[-2] < vol_arr[-3]):
-                continue
-
-        # 20日均成交额 < 2.5亿（估算）
-        if n >= 20:
-            avg_amount_20 = float(np.mean(close_arr[-20:] * vol_arr[-20:] * 100) / 1e8)
-            if avg_amount_20 < 2.5:
-                continue
-        else:
-            avg_amount_20 = 0
-
-        # ── 收集打分特征 ─────────────────────────────────────────────
-        ret_20d = code_rps_ret  # 20日收益率
-        ret_60d = code_rps60_ret  # 60日收益率（中期动量）
-
-        # MA20 斜率
-        ma20_slope = 0
-        if len(ma20_s) >= 6:
-            ma20_prev = ma20_s.iloc[-6]
-            if ma20_prev == ma20_prev and abs(ma20_prev) > 0.01:
-                ma20_slope = (ma20 - ma20_prev) / abs(ma20_prev)
-
-        # ATR5 vs ATR20
         hl = high_arr[1:] - low_arr[1:]
         hc = np.abs(high_arr[1:] - close_arr[:-1])
         lc = np.abs(low_arr[1:] - close_arr[:-1])
-        tr_arr = np.maximum(hl, np.maximum(hc, lc))
-        atr5  = float(np.mean(tr_arr[-5:])) if len(tr_arr) >= 5 else 0
+        tr_tail = np.maximum(hl, np.maximum(hc, lc))
+        tr_arr = np.concatenate([[high_arr[0] - low_arr[0]], tr_tail])
+        atr5 = float(np.mean(tr_arr[-5:])) if len(tr_arr) >= 5 else 0
         atr20 = float(np.mean(tr_arr[-20:])) if len(tr_arr) >= 20 else 0
 
-        # near_high
-        high_20 = float(np.max(high_arr[-20:])) if n >= 20 else float(np.max(high_arr))
+        high_20 = float(np.max(high_arr[-20:]))
         near_high = close_arr[-1] / max(high_20, 0.01)
 
-        # 放量收阳
         is_yang_fang = (close_arr[-1] > open_arr[-1]) and (vol_arr[-1] > vol_arr[-2])
-
-        # 量比
-        vol_ma20 = float(np.mean(vol_arr[-20:])) if n >= 20 else float(np.mean(vol_arr))
+        vol_ma20 = float(np.mean(vol_arr[-20:]))
         amount_ratio = vol_arr[-1] / max(vol_ma20, 1)
 
-        # MA60
-        ma60 = float(np.mean(close_arr[-60:])) if n >= 60 else None
-
-        # 短期收益
         ret5  = (close_arr[-1] / close_arr[-6]  - 1) * 100 if n >= 6  else 0
         ret10 = (close_arr[-1] / close_arr[-11] - 1) * 100 if n >= 11 else 0
 
-        candidates.append({
+        prefiltered.append({
             "code": code,
             "close": float(round(close_arr[-1], 2)),
             "MA5":   float(round(ma5, 2)),
-            "MA10":  float(round(ma10, 2)),
             "MA20":  float(round(ma20, 2)),
-            "MA60":  float(round(ma60, 2)) if ma60 else None,
+            "MA60":  float(round(ma60, 2)),
             "ret_20d": ret_20d,
             "ret_60d": ret_60d,
             "ma20_slope": ma20_slope,
@@ -358,10 +333,11 @@ def l1_filter_at_date(cache: TdxCache, codes: List[str],
             "vol_ratio": round(amount_ratio, 3),
             "ret5":  float(round(ret5, 2)),
             "ret10": float(round(ret10, 2)),
-            "rps_20d": float(round(code_rps_ret * 100, 2)),
+            "rps_20d": float(round(_r20 * 100, 2)),
+            "_df_raw": df_raw,  # 用于形态检测
         })
 
-    if not candidates:
+    if not prefiltered:
         return []
 
     # ── 牛熊判断 ──
@@ -375,64 +351,172 @@ def l1_filter_at_date(cache: TdxCache, codes: List[str],
         market_regime = "neutral"
     is_bull = market_regime in ("bull", "neutral")
 
-    # Phase 2: 连续化多维打分（含RPS60中期动量确认）
-    ret_values = np.array([c["ret_20d"] for c in candidates])
-    rps_pcts = np.array([percentileofscore(ret_values, r, kind='rank') for r in ret_values])
-    ret60_values = np.array([c["ret_60d"] for c in candidates])
-    rps60_pcts = np.array([percentileofscore(ret60_values, r, kind='rank') for r in ret60_values])
+    # ══════════════════════════════════════════════════════════════════
+    #  Phase 2A: 量化强势轮
+    # ══════════════════════════════════════════════════════════════════
+    def _run_quant_track(candidates, is_bull_mode):
+        ret_values = np.array([c["ret_20d"] for c in candidates])
+        rps_pcts = np.array([percentileofscore(ret_values, r, kind='rank') for r in ret_values])
+        ret60_values = np.array([c["ret_60d"] for c in candidates])
+        rps60_pcts = np.array([percentileofscore(ret60_values, r, kind='rank') for r in ret60_values])
 
-    for i, c in enumerate(candidates):
-        rps_pct = rps_pcts[i]
-        rps60_pct = rps60_pcts[i]
-        score = 0.0
-        atr_r = c["atr5"] / max(c["atr20"], 0.001)
+        for i, c in enumerate(candidates):
+            rps_pct = rps_pcts[i]
+            rps60_pct = rps60_pcts[i]
+            score = 0.0
+            atr_r = c["atr5"] / max(c["atr20"], 0.001)
 
-        if is_bull:
-            # 牛市：二值基础+渐变加成（max≈100）
-            score += rps_pct * 0.20           # RPS20 max 20
-            score += rps60_pct * 0.10         # RPS60 max 10
-            if c["ma20_slope"] > 0:           # MA20斜率 base10+grad5 = max 15
-                score += 10 + min(5, c["ma20_slope"] * 200)
-            if atr_r < 1.0:                   # ATR收敛 base5+grad5 = max 10
-                score += 5 + min(5, (1.0 - atr_r) * 15)
-            score += max(0, min(20, (c["near_high"] - 0.6) / 0.4 * 20))  # near_high渐变 max 20
-            if c["is_yang_fang"]:
-                score += 10                    # 放量收阳 10
-            ar = c["amount_ratio"]             # 量比渐变 max 10
-            if 1.0 <= ar <= 2.0:
-                score += 10
-            elif 0.7 <= ar < 1.0:
-                score += (ar - 0.7) / 0.3 * 10
-            elif 2.0 < ar <= 3.0:
-                score += (3.0 - ar) / 1.0 * 10
-            if atr_r < 0.7:
-                score += 5                     # 极致收敛奖励 5
+            if is_bull_mode:
+                score += rps_pct * 0.20
+                score += rps60_pct * 0.10
+                if c["ma20_slope"] > 0:
+                    score += 10 + min(5, c["ma20_slope"] * 200)
+                if atr_r < 1.0:
+                    score += 5 + min(5, (1.0 - atr_r) * 15)
+                score += max(0, min(20, (c["near_high"] - 0.6) / 0.4 * 20))
+                if c["is_yang_fang"]:
+                    score += 10
+                ar = c["amount_ratio"]
+                if 1.0 <= ar <= 2.0:
+                    score += 10
+                elif 0.7 <= ar < 1.0:
+                    score += (ar - 0.7) / 0.3 * 10
+                elif 2.0 < ar <= 3.0:
+                    score += (3.0 - ar) / 1.0 * 10
+                if atr_r < 0.7:
+                    score += 5
+            else:
+                if c["ma20_slope"] > 0:
+                    score += 15 + min(10, c["ma20_slope"] * 300)
+                if atr_r < 1.0:
+                    score += 15 + min(10, (1.0 - atr_r) * 30)
+                score += rps_pct * 0.10
+                score += rps60_pct * 0.05
+                if c["near_high"] > 0.75:
+                    score += 10 + min(5, (c["near_high"] - 0.75) / 0.25 * 5)
+                elif c["near_high"] > 0.6:
+                    score += (c["near_high"] - 0.6) / 0.15 * 10
+                if 0.5 <= c["amount_ratio"] <= 1.2:
+                    score += 15
+                if c["close"] > c["MA20"] > 0:
+                    score += 5
+
+            c["rps20"] = round(rps_pct, 1)
+            c["rps60"] = round(rps60_pct, 1)
+            c["quant_score"] = round(score, 1)
+
+        sorted_cands = sorted(candidates, key=lambda x: x["quant_score"], reverse=True)
+        pct = 0.10 if is_bull_mode else top_pct
+        n = max(20, min(200, int(len(sorted_cands) * pct)))
+        return sorted_cands[:n]
+
+    # ══════════════════════════════════════════════════════════════════
+    #  Phase 2B: 形态潜力轮
+    # ══════════════════════════════════════════════════════════════════
+    def _run_pattern_track(candidates):
+        results = []
+        excluded = 0
+        for c in candidates:
+            try:
+                raw_df = c.get("_df_raw")
+                if raw_df is None or len(raw_df) < 60:
+                    continue
+
+                std_df = _standardize_df(raw_df.copy())
+                if not isinstance(std_df.index, pd.DatetimeIndex):
+                    if "date" in std_df.columns:
+                        std_df.index = pd.to_datetime(std_df["date"])
+                    elif "日期" in std_df.columns:
+                        std_df.index = pd.to_datetime(std_df["日期"])
+                    else:
+                        std_df.index = pd.to_datetime(std_df.index)
+
+                weekly_df = daily_to_weekly(std_df) if len(std_df) >= 100 else None
+
+                detector = PatternDetector(
+                    std_df, df_weekly=weekly_df,
+                    pivot_bars_left=5, pivot_bars_right=5,
+                    weekly_pivot_bars_left=2, weekly_pivot_bars_right=2
+                )
+                det_result = detector.detect_all()
+
+                c["pattern_score"] = det_result["bullish_score"]
+                c["pattern_exclude"] = det_result["bearish_exclude"]
+                c["pattern_tags"] = det_result.get("bearish_tags", [])
+                c["pattern_list"] = [p["pattern"] for p in det_result.get("patterns", [])]
+
+                if det_result["bearish_exclude"]:
+                    excluded += 1
+                    continue
+
+                if det_result["bullish_score"] > 0:
+                    results.append(c)
+            except Exception:
+                pass
+        return results, excluded
+
+    # ── 并行执行 ──
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        future_quant = executor.submit(_run_quant_track, prefiltered, is_bull)
+        future_pattern = executor.submit(_run_pattern_track, prefiltered)
+        quant_results = future_quant.result()
+        pattern_results, _ = future_pattern.result()
+
+    # ══════════════════════════════════════════════════════════════════
+    #  Phase 3: 合并去重 + 综合排序
+    # ══════════════════════════════════════════════════════════════════
+    merged = {}
+    for c in quant_results:
+        c["source"] = "quant"
+        if "pattern_score" not in c:
+            c["pattern_score"] = 0
+            c["pattern_exclude"] = False
+            c["pattern_tags"] = []
+            c["pattern_list"] = []
+        merged[c["code"]] = c
+
+    for c in pattern_results:
+        code = c["code"]
+        if code in merged:
+            merged[code]["source"] = "dual"
+            merged[code]["pattern_score"] = c.get("pattern_score", 0)
+            merged[code]["pattern_exclude"] = c.get("pattern_exclude", False)
+            merged[code]["pattern_tags"] = c.get("pattern_tags", [])
+            merged[code]["pattern_list"] = c.get("pattern_list", [])
         else:
-            # 熊市：二值基础+渐变加成（max≈100）
-            if c["ma20_slope"] > 0:           # MA20斜率 base15+grad10 = max 25
-                score += 15 + min(10, c["ma20_slope"] * 300)
-            if atr_r < 1.0:                   # ATR收敛 base15+grad10 = max 25
-                score += 15 + min(10, (1.0 - atr_r) * 30)
-            score += rps_pct * 0.10           # RPS20 max 10
-            score += rps60_pct * 0.05         # RPS60 max 5
-            if c["near_high"] > 0.75:         # near_high base10+grad5 = max 15
-                score += 10 + min(5, (c["near_high"] - 0.75) / 0.25 * 5)
-            elif c["near_high"] > 0.6:
-                score += (c["near_high"] - 0.6) / 0.15 * 10
-            if 0.5 <= c["amount_ratio"] <= 1.2:
-                score += 15                    # 缩量企稳（二值）15
-            if c["close"] > c.get("MA20", 0) > 0:
-                score += 5                     # 站上MA20 5
+            if "quant_score" not in c:
+                c["quant_score"] = 0
+                c["rps20"] = 0
+                c["rps60"] = 0
+            c["source"] = "pattern"
+            merged[code] = c
 
-        c["rps20"] = round(rps_pct, 1)
-        c["rps60"] = round(rps60_pct, 1)
-        c["score"] = round(score, 1)
-        c["market_regime"] = market_regime
+    # 排除被形态轮标记为看空的
+    for code in list(merged.keys()):
+        if merged[code].get("pattern_exclude", False):
+            del merged[code]
 
-    candidates.sort(key=lambda x: x["score"], reverse=True)
-    pct = 0.15 if is_bull else top_pct
-    top_n = max(20, min(200, int(len(candidates) * pct)))
-    return candidates[:top_n]
+    top_results = list(merged.values())
+    if top_results:
+        max_quant = max(c.get("quant_score", 0) for c in top_results) or 1
+        for c in top_results:
+            qs = c.get("quant_score", 0) / max_quant * 100
+            ps = c.get("pattern_score", 0)
+            ps_norm = min(100, ps * 100 / 70) if ps > 0 else 0
+            c["score"] = round(qs * 0.6 + ps_norm * 0.4, 1)
+            if c.get("source") == "dual":
+                c["score"] = round(c["score"] + 10, 1)
+            c["market_regime"] = market_regime
+
+        top_results.sort(key=lambda x: x["score"], reverse=True)
+        final_n = max(20, min(200, int(len(prefiltered) * (0.10 if is_bull else top_pct))))
+        top_results = top_results[:final_n]
+
+    # 清理内部字段
+    for c in top_results:
+        c.pop("_df_raw", None)
+
+    return top_results
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -688,11 +772,11 @@ def l2_score_and_rank(cache: TdxCache, l1_candidates: List[Dict],
 
         # ═══════ 形态分（0~100）═══════════════════════════════════════
         ma5  = item.get("MA5", 0)
-        ma10 = item.get("MA10", 0)
         ma20 = item.get("MA20", 0)
-        if ma5 > ma10 > ma20:
+        ma60 = item.get("MA60", 0)
+        if ma60 > 0 and ma5 > ma20 > ma60:
             ma_score = 30
-        elif ma5 > ma10:
+        elif ma5 > ma20:
             ma_score = 15
         else:
             ma_score = 0
@@ -934,7 +1018,7 @@ class HistoricalBacktest:
         l1 = l1_filter_at_date(self._cache, self._codes, cutoff_date)
 
         # L2（P1改进：综合评分 + Top30 排名）
-        l2 = l2_score_and_rank(self._cache, l1, cutoff_date, top_n=30)
+        l2 = l2_score_and_rank(self._cache, l1, cutoff_date)
 
         elapsed = time.time() - t0
 
