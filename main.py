@@ -307,6 +307,115 @@ class _NoOpLogger:
     def log(self, *args, **kwargs): pass
 
 
+def track_consecutive_recommendations(
+    final_picks: List[Dict],
+    history_path: Optional[str] = None,
+    today_str: Optional[str] = None,
+    keep_days: int = 14,
+    verbose: bool = True,
+) -> List[Dict]:
+    """
+    多日一致性追踪 — 标注每只股票的连续推荐天数。
+
+    参数:
+      final_picks: 当日的最终推荐列表
+      history_path: 历史文件路径（默认 output/recommendations_history.json）
+      today_str: 当前日期 YYYYMMDD（默认今天）
+      keep_days: 保留近 N 天的历史
+
+    每只股票注入 fields:
+      - consecutive_days: 连续被推荐的天数（含今天）
+      - status_label: "新入选" / "持续看好（第N天）"
+
+    最后把今天的推荐写入历史文件。
+    """
+    if not final_picks:
+        return final_picks
+
+    if today_str is None:
+        today_str = datetime.now().strftime("%Y%m%d")
+    if history_path is None:
+        history_path = os.path.join(DATA_DIR, "recommendations_history.json")
+
+    # 加载历史
+    history: Dict[str, List[str]] = {}  # date_str → [code, code, ...]
+    if os.path.exists(history_path):
+        try:
+            with open(history_path, "r", encoding="utf-8") as f:
+                history = json.load(f)
+        except Exception:
+            history = {}
+
+    # 计算每只股票的连续天数
+    today_codes = {p.get("code", "") for p in final_picks if p.get("code")}
+
+    new_count = 0
+    persistent_count = 0
+    for pick in final_picks:
+        code = pick.get("code", "")
+        if not code:
+            pick["consecutive_days"] = 1
+            pick["status_label"] = "新入选"
+            continue
+
+        # 从今天开始往前数，找连续被推荐的天数
+        consecutive = 1  # 今天算 1
+        sorted_dates = sorted(history.keys(), reverse=True)
+        # 只看 today_str 之前的日期
+        prev_dates = [d for d in sorted_dates if d < today_str]
+
+        for d in prev_dates:
+            if code in (history.get(d) or []):
+                consecutive += 1
+            else:
+                break  # 中断
+
+        pick["consecutive_days"] = consecutive
+        if consecutive == 1:
+            pick["status_label"] = "🆕 新入选"
+            new_count += 1
+        elif consecutive == 2:
+            pick["status_label"] = "📌 第2天"
+            persistent_count += 1
+        elif consecutive <= 5:
+            pick["status_label"] = f"📌 第{consecutive}天"
+            persistent_count += 1
+        else:
+            pick["status_label"] = f"⭐ 持续看好（第{consecutive}天）"
+            persistent_count += 1
+
+    # 更新历史：今天的推荐覆盖
+    history[today_str] = sorted(today_codes)
+
+    # 清理超过 keep_days 的旧历史
+    sorted_dates = sorted(history.keys(), reverse=True)
+    keep = sorted_dates[:keep_days]
+    history = {d: history[d] for d in keep}
+
+    # 保存
+    try:
+        os.makedirs(os.path.dirname(history_path), exist_ok=True)
+        with open(history_path, "w", encoding="utf-8") as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        if verbose:
+            print(f"  [一致性追踪] 历史文件保存失败: {e}")
+
+    if verbose:
+        print(f"  [一致性追踪] {new_count} 只新入选 + {persistent_count} 只持续看好")
+        # 展示连续天数 ≥ 3 的样例
+        long_ones = sorted(
+            [p for p in final_picks if p.get("consecutive_days", 0) >= 3],
+            key=lambda p: p.get("consecutive_days", 0), reverse=True
+        )[:5]
+        if long_ones:
+            print(f"  [一致性追踪] 持续看好 Top:")
+            for p in long_ones:
+                print(f"    {p['code']} {p.get('name','?'):<10s} {p['status_label']}")
+
+    return final_picks
+
+
 def compute_timing_limits(mr_result: Optional[Dict]) -> Dict:
     """
     根据 MR（市场雷达）情绪分和大盘趋势，动态计算推荐数量上限。
@@ -1252,6 +1361,12 @@ def format_final_report(
         else:
             lines.append(f"    L1量化: ✗未通过（纯LLM推荐，建议降权）")
 
+        # 多日一致性
+        status = item["stock_data"].get("status_label", "")
+        if status:
+            consec = item["stock_data"].get("consecutive_days", 1)
+            lines.append(f"    一致性: {status}（连续 {consec} 天入选）")
+
         if item["is_excluded"]:
             lines.append(f"    风控提示: {item['reason']}")
         else:
@@ -1669,6 +1784,16 @@ def run_link_b_pipeline(
         risk_soft = risk_result.get("soft_excluded", [])
     except Exception as e:
         print(f"  [错误] 组合风控异常: {e}")
+
+    # 多日一致性追踪
+    try:
+        risk_result["approved"] = track_consecutive_recommendations(
+            risk_result.get("approved", []),
+            verbose=verbose,
+        )
+        risk_approved = risk_result["approved"]
+    except Exception as e:
+        print(f"  [错误] 一致性追踪异常: {e}")
 
     # 市场择时硬截断
     _max_recs = timing_limits.get("max_recommendations", 10)
@@ -2604,6 +2729,20 @@ def run_full_pipeline(
         import traceback
         traceback.print_exc()
     print(f"  ✓ Step 6.3 完成，耗时 {time.time()-t_step63:.1f}s")
+
+    # ── Step 6.4: 多日一致性追踪 ──
+    print_section("Step 6.4: 多日一致性追踪")
+    t_step64 = time.time()
+    try:
+        risk_result["approved"] = track_consecutive_recommendations(
+            risk_result.get("approved", []),
+            verbose=verbose,
+        )
+    except Exception as e:
+        print(f"  [错误] 一致性追踪异常: {e}")
+        import traceback
+        traceback.print_exc()
+    print(f"  ✓ Step 6.4 完成，耗时 {time.time()-t_step64:.1f}s")
 
     # ── Step 6.5: 市场择时硬截断 ──
     # 根据 timing_limits 裁剪最终推荐数量，弱势时大幅缩减
