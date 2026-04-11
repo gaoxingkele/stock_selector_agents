@@ -90,7 +90,7 @@ def visualize_patterns(code: str, cutoff_date: Optional[str] = None,
 
     # 跑所有形态检测
     detected = []
-    for name, fn in [
+    fn_list = [
         ("DBOT", find_double_bottom),
         ("DTOP", find_double_top),
         ("HNSU", find_reverse_hns),
@@ -100,14 +100,31 @@ def visualize_patterns(code: str, cutoff_date: Optional[str] = None,
         ("TRNG", find_triangles),
         ("FLAGU", find_bullish_flag),
         ("FLAGD", find_bearish_flag),
-    ]:
+    ]
+    for name, fn in fn_list:
         try:
             r = fn(df, pivots)
             if r:
                 r["short_name"] = name
+                r["timeframe"] = timeframe
                 detected.append(r)
         except Exception as e:
             print(f"  [!] {code} {name}: {e}")
+
+    # 当主周期是日线时，额外跑周线检测，叠加显示在日线图上
+    if timeframe == "daily" and len(std_df) >= 100:
+        weekly_df = daily_to_weekly(std_df)
+        if len(weekly_df) >= 30:
+            weekly_pivots = get_pivots(weekly_df, bars_left=2, bars_right=2)
+            for name, fn in fn_list:
+                try:
+                    r = fn(weekly_df, weekly_pivots)
+                    if r:
+                        r["short_name"] = name + "(W)"
+                        r["timeframe"] = "weekly"
+                        detected.append(r)
+                except Exception as e:
+                    print(f"  [!] {code} weekly {name}: {e}")
 
     # 跑完整 detect_all 拿评分
     weekly_for_full = daily_to_weekly(std_df) if timeframe == "daily" and len(std_df) >= 100 else None
