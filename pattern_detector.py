@@ -204,18 +204,24 @@ def _is_reverse_hns(a, b, c, d, e, f, avg_bar) -> bool:
 
 
 def _is_double_top(a, b, c, d, a_vol, c_vol, avg_bar, atr) -> bool:
-    """双顶"""
+    """双顶
+    A 股调整：两个顶相对差 ≤ 4%（之前 avg_bar 在长期数据上太宽松）
+    """
+    rel_diff = abs(a - c) / max(a, c, 0.01)
     return (c - b < atr * 4
-            and abs(a - c) <= avg_bar * 0.5 * TOLERANCE
+            and rel_diff <= 0.04  # 两顶相对差 ≤ 4%
             and c_vol < a_vol
             and b < min(a, c)
             and b < d < c)
 
 
 def _is_double_bottom(a, b, c, d, a_vol, c_vol, avg_bar, atr) -> bool:
-    """双底"""
+    """双底
+    A 股调整：两个底相对差 ≤ 4%（之前 avg_bar 在长期数据上太宽松）
+    """
+    rel_diff = abs(a - c) / max(a, c, 0.01)
     return (b - c < atr * 4
-            and abs(a - c) <= avg_bar * 0.5 * TOLERANCE
+            and rel_diff <= 0.04  # 两底相对差 ≤ 4%
             and c_vol < a_vol
             and b > max(a, c)
             and b > d > c)
@@ -423,7 +429,12 @@ def find_hns(df: pd.DataFrame, pivots: pd.DataFrame) -> Optional[dict]:
                 continue
 
             neckline = min(b, d)
-            # 头肩顶允许跌破颈线（跌破是看跌信号），只在远离>3×avg_bar 才认为已完成
+            # 头肩顶有效条件：当前价 f 必须在颈线附近或下方（看跌确认）
+            # 若 f 远高于颈线（>1.5×avg_bar），形态已被向上突破，HNSD 失效
+            if f > neckline + avg_bar * 1.5:
+                c_idx, c = e_idx, e
+                continue
+            # 若价格已经远远跌破颈线（>3×avg_bar），形态已完成
             lowest_after_e = df.loc[e_idx:, "Low"].min()
             if lowest_after_e < neckline - avg_bar * 3:
                 c_idx, c = e_idx, e
@@ -485,8 +496,12 @@ def find_reverse_hns(df: pd.DataFrame, pivots: pd.DataFrame) -> Optional[dict]:
                 continue
 
             neckline = max(b, d)
-            # 头肩底允许突破颈线（突破是看涨信号），但要求 close 在颈线附近不能远离
-            # 只在突破后又远走（>3×avg_bar）才认为形态已完成不再有效
+            # 头肩底有效条件：当前价 f 必须在颈线附近或上方（看涨确认）
+            # 若 f 远低于颈线（>1.5×avg_bar），形态已被向下跌破，HNSU 失效
+            if f < neckline - avg_bar * 1.5:
+                c_idx, c = e_idx, e
+                continue
+            # 若价格已经远远突破颈线（>3×avg_bar），形态已完成（已涨过头）
             highest_after_e = df.loc[e_idx:, "High"].max()
             if highest_after_e > neckline + avg_bar * 3:
                 c_idx, c = e_idx, e
@@ -934,7 +949,8 @@ class PatternDetector:
         "MA_BEAR":       {"daily": 5,  "weekly": 10},  # 均线空头（弱单独信号）
     }
 
-    BEAR_VETO_THRESHOLD = 25  # 看空净分超过该阈值才一票否决（25 = 中等强度看空形态）
+    BEAR_VETO_THRESHOLD = 10  # 看空净分超过阈值才一票否决（10 = 弱看空也算）
+    BEAR_DOMINANT_FLOOR = 20  # 看空绝对值高于此地板时，要求看多至少 1.3 倍才保留
 
     def __init__(self, df_daily: pd.DataFrame,
                  df_weekly: pd.DataFrame = None,
@@ -1083,10 +1099,15 @@ class PatternDetector:
                               if tf == "weekly" and t in ("HNSD", "DTOP")]
         if weekly_strong_bear:
             should_exclude = True
+        elif bear_score - bull_score > self.BEAR_VETO_THRESHOLD:
+            # 2) 看空净分明显高于看多 → 排除
+            should_exclude = True
+        elif bear_score >= self.BEAR_DOMINANT_FLOOR and bull_score < bear_score * 1.7:
+            # 3) 看空绝对值很高，看多没有压倒性优势 → 排除
+            #    1.7 倍数: 防止下跌趋势中的小整理被识别为底部反转
+            should_exclude = True
         else:
-            # 2) 看空净分超阈值才排除
-            bear_net = bear_score - bull_score
-            should_exclude = bear_net > self.BEAR_VETO_THRESHOLD
+            should_exclude = False
 
         return {
             "bullish_score": bull_score,
