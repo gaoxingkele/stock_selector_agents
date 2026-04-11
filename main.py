@@ -518,6 +518,145 @@ def compute_timing_limits(mr_result: Optional[Dict]) -> Dict:
         }
 
 
+def enrich_trade_levels(
+    approved: List[Dict],
+    stock_packages: Dict,
+    verbose: bool = True,
+) -> List[Dict]:
+    """
+    交易维度补全 — 为每只推荐计算具体的入场/止损/止盈价位 + 仓位建议。
+
+    基于真实日线数据（ATR/MA20/前低/前高）计算：
+      - entry_zones: 3 个入场价位 [激进/适中/保守]
+      - stop_loss_price: 具体止损价
+      - target_t1/t2/t3: 三档止盈价（1R/2R/3R, R = 入场到止损的距离）
+      - position_advice_data: 基于波动率的仓位百分比（波动率反比）
+      - risk_reward_ratio: 风险回报比
+
+    返回: 注入字段的 approved 列表
+    """
+    import numpy as np
+
+    if not approved:
+        return approved
+
+    enriched_count = 0
+
+    for s in approved:
+        code = s.get("code", "")
+        pkg = stock_packages.get(code, {}) if isinstance(stock_packages, dict) else {}
+        df = pkg.get("daily")
+
+        if df is None or not hasattr(df, "iloc") or len(df) < 30:
+            s["trade_levels"] = None
+            continue
+
+        try:
+            c_col = "close" if "close" in df.columns else ("收盘" if "收盘" in df.columns else None)
+            h_col = "high" if "high" in df.columns else ("最高" if "最高" in df.columns else None)
+            l_col = "low" if "low" in df.columns else ("最低" if "最低" in df.columns else None)
+            if not all([c_col, h_col, l_col]):
+                continue
+
+            closes = df[c_col].astype(float).values
+            highs = df[h_col].astype(float).values
+            lows = df[l_col].astype(float).values
+
+            current = float(closes[-1])
+            ma20 = float(np.mean(closes[-20:]))
+
+            # ATR (14日) — 用 True Range
+            tr = np.maximum(
+                highs[1:] - lows[1:],
+                np.maximum(
+                    np.abs(highs[1:] - closes[:-1]),
+                    np.abs(lows[1:] - closes[:-1])
+                )
+            )
+            atr14 = float(np.mean(tr[-14:])) if len(tr) >= 14 else float(np.mean(tr))
+
+            # 近期前低（20日内的最低）
+            recent_low = float(np.min(lows[-20:]))
+            # 近期前高（20日内的最高，作为天花板参考）
+            recent_high = float(np.max(highs[-20:]))
+
+            # ── 入场价位（3档）──
+            entry_aggressive = round(current, 2)              # 激进：现价直接介入
+            entry_moderate = round(min(current, ma20 * 1.01), 2)  # 适中：MA20 上方一点
+            entry_conservative = round(max(ma20, recent_low * 1.02), 2)  # 保守：等待回踩
+
+            # ── 止损价 ──
+            # 取 max(MA20-2%, 现价-2*ATR, 前低)，避免止损过宽
+            stop_options = [
+                ma20 * 0.98,
+                current - 2 * atr14,
+                recent_low,
+            ]
+            stop_loss = round(max(stop_options), 2)
+            # 但止损不能高于入场（否则无效）
+            if stop_loss >= entry_moderate:
+                stop_loss = round(entry_moderate * 0.95, 2)  # 兜底 -5%
+
+            # ── 风险回报 R ──
+            risk_per_share = entry_moderate - stop_loss
+            if risk_per_share <= 0:
+                s["trade_levels"] = None
+                continue
+
+            target_t1 = round(entry_moderate + risk_per_share * 1, 2)  # 1R
+            target_t2 = round(entry_moderate + risk_per_share * 2, 2)  # 2R
+            target_t3 = round(entry_moderate + risk_per_share * 3, 2)  # 3R
+
+            # ── 基于波动率的仓位建议 ──
+            # ATR/价格 (%) → 仓位反比
+            volatility_pct = atr14 / current * 100
+            if volatility_pct < 2:
+                pos_pct = 8.0   # 低波动 → 8%
+            elif volatility_pct < 3.5:
+                pos_pct = 6.0
+            elif volatility_pct < 5:
+                pos_pct = 4.0
+            else:
+                pos_pct = 2.5   # 高波动 → 2.5%
+
+            # 风险回报比
+            rr_t2 = round((target_t2 - entry_moderate) / risk_per_share, 1)
+
+            s["trade_levels"] = {
+                "current": current,
+                "ma20": round(ma20, 2),
+                "atr14": round(atr14, 2),
+                "volatility_pct": round(volatility_pct, 1),
+                "entry": {
+                    "aggressive": entry_aggressive,
+                    "moderate": entry_moderate,
+                    "conservative": entry_conservative,
+                },
+                "stop_loss": stop_loss,
+                "target": {"t1": target_t1, "t2": target_t2, "t3": target_t3},
+                "position_pct": pos_pct,
+                "risk_reward": rr_t2,  # 1:N
+                "stop_loss_pct": round((entry_moderate - stop_loss) / entry_moderate * 100, 1),
+                "target_pct_t2": round((target_t2 - entry_moderate) / entry_moderate * 100, 1),
+            }
+
+            # 同步更新 position_advice 字段（数值化版）
+            s["position_advice_data"] = f"{pos_pct:.1f}%"
+            if not s.get("position_advice"):
+                s["position_advice"] = f"{pos_pct:.1f}%"
+
+            enriched_count += 1
+        except Exception as e:
+            s["trade_levels"] = None
+            if verbose:
+                print(f"  [交易维度] {code} 计算失败: {e}")
+
+    if verbose:
+        print(f"  [交易维度] 已补全 {enriched_count}/{len(approved)} 只")
+
+    return approved
+
+
 def portfolio_risk_check(
     risk_result: Dict,
     timing_limits: Dict,
@@ -1367,6 +1506,24 @@ def format_final_report(
             consec = item["stock_data"].get("consecutive_days", 1)
             lines.append(f"    一致性: {status}（连续 {consec} 天入选）")
 
+        # 交易维度
+        tl = item["stock_data"].get("trade_levels")
+        if tl:
+            entry = tl["entry"]
+            tgt = tl["target"]
+            lines.append(
+                f"    交易计划: 入场 {entry['conservative']}/{entry['moderate']}/{entry['aggressive']} "
+                f"(保守/适中/激进) | 现价 {tl['current']}"
+            )
+            lines.append(
+                f"              止损 {tl['stop_loss']} (-{tl['stop_loss_pct']}%) | "
+                f"止盈 T1={tgt['t1']} T2={tgt['t2']} (+{tl['target_pct_t2']}%) T3={tgt['t3']}"
+            )
+            lines.append(
+                f"              建议仓位 {tl['position_pct']}% | 波动率 {tl['volatility_pct']}% | "
+                f"风险回报比 1:{tl['risk_reward']}"
+            )
+
         if item["is_excluded"]:
             lines.append(f"    风控提示: {item['reason']}")
         else:
@@ -1776,6 +1933,15 @@ def run_link_b_pipeline(
     risk_approved = risk_result.get("approved", [])
     risk_soft = risk_result.get("soft_excluded", [])
     print(f"\n  ── 风控通过 {len(risk_approved)} 只，软过滤 {len(risk_soft)} 只")
+
+    # 交易维度补全
+    try:
+        risk_result["approved"] = enrich_trade_levels(
+            risk_result.get("approved", []), stock_packages, verbose=verbose
+        )
+        risk_approved = risk_result["approved"]
+    except Exception as e:
+        print(f"  [错误] 交易维度补全异常: {e}")
 
     # 组合层面风控
     try:
@@ -2718,6 +2884,19 @@ def run_full_pipeline(
         verbose=verbose,
     )
     print(f"  ✓ Step 6 完成，耗时 {(time.time()-t_step6)/60:.1f} 分钟")
+
+    # ── Step 6.2: 交易维度补全（入场/止损/止盈/仓位）──
+    print_section("Step 6.2: 交易维度补全")
+    t_step62 = time.time()
+    try:
+        risk_result["approved"] = enrich_trade_levels(
+            risk_result.get("approved", []), stock_packages, verbose=verbose
+        )
+    except Exception as e:
+        print(f"  [错误] 交易维度补全异常: {e}")
+        import traceback
+        traceback.print_exc()
+    print(f"  ✓ Step 6.2 完成，耗时 {time.time()-t_step62:.1f}s")
 
     # ── Step 6.3: 组合层面风控（同板块限制+总仓位+波动率）──
     print_section("Step 6.3: 组合层面风控")
