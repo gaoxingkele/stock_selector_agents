@@ -2220,6 +2220,7 @@ def run_full_pipeline(
     stock_codes: Optional[List[str]] = None,
     no_confirm: bool = False,
     incremental: bool = False,
+    cheap_models: Optional[List[str]] = None,
 ) -> Dict:
     """
     完整选股流程（模型纵向并行版）:
@@ -2348,14 +2349,20 @@ def run_full_pipeline(
 
         # 运行市场雷达分析
         radar = MarketRadar(llm, cfg)
+        # P3 #14: 早期阶段使用便宜模型
+        _mr_models = cheap_models if cheap_models else None
+        _mr_panel = len(cheap_models) if cheap_models else len(active_models)
+        if cheap_models and verbose:
+            print(f"  [成本优化] MR 使用便宜模型: {','.join(cheap_models)}")
         mr_result = radar.scan(
             market_indices=market_indices,
             market_sentiment=market_sentiment,
             market_hot=market_hot,
             concept_signals=concept_signals,
             etf_data=etf_data,
-            panel_size=len(active_models),
+            panel_size=_mr_panel,
             verbose=verbose,
+            models=_mr_models,
         )
         save_result(mr_result, f"market_radar_{TODAY}.json")
 
@@ -2499,13 +2506,19 @@ def run_full_pipeline(
                     )
 
             picker = SectorPicker(llm, cfg)
+            # P3 #14: 早期阶段使用便宜模型
+            _sp_models = cheap_models if cheap_models else None
+            _sp_panel = len(cheap_models) if cheap_models else len(active_models)
+            if cheap_models and verbose:
+                print(f"  [成本优化] SP 使用便宜模型: {','.join(cheap_models)}")
             pick_result = picker.pick(
                 sector_overview=sector_data,
                 market_hot=market_hot,
-                panel_size=len(active_models),   # 全部面板模型参与投票
+                panel_size=_sp_panel,
                 verbose=verbose,
                 mr_result=mr_result if mr_result else None,
                 etf_signals=etf_signals if etf_signals else None,
+                models=_sp_models,
             )
             top_sectors = pick_result.get("sector_names", [])
 
@@ -3316,6 +3329,13 @@ def main():
         action="store_true",
         help="增量运行模式：复用当日已生成的中间结果（L1/L2/Borda），跳过重复扫描",
     )
+    parser.add_argument(
+        "--cheap-models",
+        type=str, default="",
+        help="便宜模型列表（逗号分隔，如 'deepseek,glm,doubao'），"
+             "用于早期阶段（市场雷达 MR + 板块筛选 SP），降低成本。"
+             "主分析阶段（E1-E7）仍使用 --models 指定的旗舰模型",
+    )
 
     args = parser.parse_args()
 
@@ -3375,6 +3395,9 @@ def main():
     # 解析个股列表
     stock_codes = [c.strip() for c in args.stocks.split(",") if c.strip()] if args.stocks else None
 
+    # 解析便宜模型列表
+    cheap_models_list = [m.strip() for m in args.cheap_models.split(",") if m.strip()] if args.cheap_models else None
+
     # 链路路由
     if args.link == "a":
         run_full_pipeline(
@@ -3389,6 +3412,7 @@ def main():
             stock_codes=stock_codes,
             no_confirm=args.no_confirm,
             incremental=args.incremental,
+            cheap_models=cheap_models_list,
         )
     elif args.link == "b":
         run_link_b_pipeline(
@@ -3416,6 +3440,7 @@ def main():
             stock_codes=stock_codes,
             no_confirm=args.no_confirm,
             incremental=args.incremental,
+            cheap_models=cheap_models_list,
         )
         print("\n" + "="*60)
         print("  【链路B】MR2 → L1量化 → L2形态 → L3看图 → Borda → 风控 → 报告")

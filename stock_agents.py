@@ -567,6 +567,7 @@ hype_predictions 数量 5-8 个，按炒作可能性（confidence）从高到低
         etf_data: Dict,
         panel_size: Optional[int] = None,
         verbose: bool = True,
+        models: Optional[List[str]] = None,
     ) -> Dict:
         """
         运行市场雷达全面扫描，多模型投票聚合。
@@ -612,6 +613,7 @@ hype_predictions 数量 5-8 个，按炒作可能性（confidence）从高到低
             messages=_build_msgs(""),
             max_models=n_models,
             verbose=verbose,
+            models=models,  # P3 #14: 可指定便宜模型
         )
 
         # ── 聚合多模型结果 ─────────────────────────────────────────
@@ -903,6 +905,7 @@ top5 数量恰好为5个，按综合评分从高到低排列。"""
         verbose: bool = True,
         mr_result: Optional[Dict] = None,
         etf_signals: Optional[List[Dict]] = None,
+        models: Optional[List[str]] = None,
     ) -> Dict:
         """
         全面板模型投票，返回得票最高的 Top5 板块。
@@ -998,6 +1001,7 @@ top5 数量恰好为5个，按综合评分从高到低排列。"""
             messages=_build_msgs(""),
             max_models=n_models,
             verbose=verbose,
+            models=models,  # P3 #14: 可指定便宜模型
         )
 
         # ── 聚合投票 ─────────────────────────────────────────────────
