@@ -367,6 +367,8 @@ def l1_filter_at_date(cache: TdxCache, codes: List[str],
             "vol_cv_20": round(vol_cv_20, 3),
             "price_cv_20": round(price_cv_20, 4),
             "chip_concentration": round(chip_concentration, 1),
+            # 龙虎榜（历史回测无法拿历史时点的数据，全部置 0）
+            "lhb_count": 0, "lhb_inst_days": 0, "lhb_net_buy": 0, "lhb_reason": "",
             "_df_raw": df_raw,  # 用于形态检测
         })
 
@@ -399,6 +401,20 @@ def l1_filter_at_date(cache: TdxCache, codes: List[str],
             score = 0.0
             atr_r = c["atr5"] / max(c["atr20"], 0.001)
             chip_bonus = c.get("chip_concentration", 0) / 100 * 10  # v6 筹码集中度
+            # 历史回测无龙虎榜数据，lhb_bonus=0
+            lhb_cnt = c.get("lhb_count", 0)
+            lhb_net = c.get("lhb_net_buy", 0)
+            lhb_bonus = 0
+            if lhb_cnt > 0:
+                lhb_bonus += min(5, lhb_cnt * 2)
+                if lhb_net >= 5:
+                    lhb_bonus += 15
+                elif lhb_net >= 1:
+                    lhb_bonus += 10
+                elif lhb_net > 0:
+                    lhb_bonus += 5
+                elif lhb_net < -1:
+                    lhb_bonus -= 5
 
             if is_bull_mode:
                 score += rps_pct * 0.20
@@ -420,6 +436,7 @@ def l1_filter_at_date(cache: TdxCache, codes: List[str],
                 if atr_r < 0.7:
                     score += 5
                 score += chip_bonus  # v6: 0~10
+                score += lhb_bonus   # v6: 0~20（历史回测=0）
             else:
                 if c["ma20_slope"] > 0:
                     score += 15 + min(10, c["ma20_slope"] * 300)
@@ -436,6 +453,7 @@ def l1_filter_at_date(cache: TdxCache, codes: List[str],
                 if c["close"] > c["MA20"] > 0:
                     score += 5
                 score += chip_bonus * 1.5  # v6: 熊市筹码更重要 0~15
+                score += lhb_bonus * 0.8   # v6: 0~16（历史回测=0）
 
             c["rps20"] = round(rps_pct, 1)
             c["rps60"] = round(rps60_pct, 1)

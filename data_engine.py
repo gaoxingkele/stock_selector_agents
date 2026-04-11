@@ -3294,6 +3294,42 @@ class DataEngine:
                 print(f"  代码范围: 约{len(all_codes)}只（沪市主板+科创板+深市主板+创业板）")
 
         # ══════════════════════════════════════════════════════════════════
+        #  Phase 0.5: 加载近5日龙虎榜数据（v6 #10），构建 code → 龙虎榜 索引
+        # ══════════════════════════════════════════════════════════════════
+        lhb_index: Dict[str, Dict] = {}
+        try:
+            from datetime import timedelta as _td
+            _start = (datetime.now() - _td(days=7)).strftime("%Y%m%d")
+            _end = datetime.now().strftime("%Y%m%d")
+            _lhb_df = ak.stock_lhb_detail_em(start_date=_start, end_date=_end)
+            if _lhb_df is not None and len(_lhb_df) > 0:
+                for _, row in _lhb_df.iterrows():
+                    _code = str(row.get("代码", "")).strip()
+                    if not _code:
+                        continue
+                    _net = float(row.get("龙虎榜净买额", 0) or 0)
+                    _reason = str(row.get("上榜原因", ""))
+                    _is_inst = "机构" in _reason or "营业部" in _reason  # 机构席位标识
+                    # 累加同一只股票的多日龙虎榜
+                    if _code in lhb_index:
+                        lhb_index[_code]["count"] += 1
+                        lhb_index[_code]["net_buy_total"] += _net
+                        if _is_inst:
+                            lhb_index[_code]["inst_days"] += 1
+                    else:
+                        lhb_index[_code] = {
+                            "count": 1,
+                            "net_buy_total": _net,
+                            "inst_days": 1 if _is_inst else 0,
+                            "last_reason": _reason[:30],
+                        }
+                if verbose:
+                    print(f"  龙虎榜: 近7日 {len(lhb_index)} 只股票上榜（共 {len(_lhb_df)} 条记录）")
+        except Exception as e:
+            if verbose:
+                print(f"  [警告] 龙虎榜加载失败: {e}")
+
+        # ══════════════════════════════════════════════════════════════════
         #  Phase 1: 全市场预筛 — 一次遍历，收集基本面合格的候选 + 市场广度
         # ══════════════════════════════════════════════════════════════════
         codes = all_codes
@@ -3458,6 +3494,9 @@ class DataEngine:
             elif price_cv_20 < 0.08:
                 chip_concentration += 15
 
+            # 龙虎榜信息（v6 #10）
+            lhb_info = lhb_index.get(code, {})
+
             prefiltered.append({
                 "code": code, "name": code,
                 "close": close_arr[-1],
@@ -3473,6 +3512,10 @@ class DataEngine:
                 "vol_cv_20": round(vol_cv_20, 3),
                 "price_cv_20": round(price_cv_20, 4),
                 "chip_concentration": round(chip_concentration, 1),
+                "lhb_count": lhb_info.get("count", 0),  # 近7日上榜次数
+                "lhb_inst_days": lhb_info.get("inst_days", 0),  # 机构席位天数
+                "lhb_net_buy": round(lhb_info.get("net_buy_total", 0) / 1e8, 2),  # 净买额（亿）
+                "lhb_reason": lhb_info.get("last_reason", ""),
                 "df": df,
                 "_df_raw": df_raw,   # 保留原始 df（含列名+日期 index）
             })
@@ -3520,6 +3563,22 @@ class DataEngine:
                 # v6: 筹码集中度加分（满分100 → 转 0~10 分加成）
                 chip_bonus = c.get("chip_concentration", 0) / 100 * 10
 
+                # v6: 龙虎榜加分（资金面强信号）
+                lhb_bonus = 0
+                lhb_cnt = c.get("lhb_count", 0)
+                lhb_net = c.get("lhb_net_buy", 0)
+                if lhb_cnt > 0:
+                    lhb_bonus += min(5, lhb_cnt * 2)  # 上榜次数最多 5 分
+                    # 净买入金额加分（资金面信号）
+                    if lhb_net >= 5:
+                        lhb_bonus += 15  # 净买入 5亿+ 强机构介入
+                    elif lhb_net >= 1:
+                        lhb_bonus += 10  # 净买入 1-5亿 中等买入
+                    elif lhb_net > 0:
+                        lhb_bonus += 5   # 净买入 0-1亿 弱买入
+                    elif lhb_net < -1:
+                        lhb_bonus -= 5   # 净流出 1亿+ 减分（被砸盘）
+
                 if is_bull_mode:
                     score += rps_pct * 0.20
                     score += rps60_pct * 0.10
@@ -3540,6 +3599,7 @@ class DataEngine:
                     if atr_r < 0.7:
                         score += 5
                     score += chip_bonus  # 牛市：筹码集中度 0~10 分
+                    score += lhb_bonus   # 龙虎榜机构介入 0~20 分
                 else:
                     if c["ma20_slope"] > 0:
                         score += 15 + min(10, c["ma20_slope"] * 300)
@@ -3556,6 +3616,7 @@ class DataEngine:
                     if c["close"] > c["MA20"] > 0:
                         score += 5
                     score += chip_bonus * 1.5  # 熊市：筹码集中度更重要 0~15 分
+                    score += lhb_bonus * 0.8   # 熊市龙虎榜信号略弱 0~16 分
 
                 c["rps20"] = round(rps_pct, 1)
                 c["rps60"] = round(rps60_pct, 1)
