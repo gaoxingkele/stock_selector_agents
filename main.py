@@ -409,6 +409,186 @@ def compute_timing_limits(mr_result: Optional[Dict]) -> Dict:
         }
 
 
+def verify_llm_hallucination(
+    final_top: List[Dict],
+    stock_packages: Dict,
+    verbose: bool = True,
+) -> List[Dict]:
+    """
+    LLM 幻觉校验 — 从专家推荐理由中提取关键数值（PE/股价/涨幅/市值），
+    与真实数据交叉校验，偏差 > 30% 则标记"数据存疑"警告。
+
+    参数:
+      final_top: 链路A的最终候选（含 all_reasonings 文本）
+      stock_packages: 含真实数据的包 (stock_packages[code]["realtime"] + "daily")
+
+    返回: 注入了 hallucination_warnings 字段的 final_top
+    """
+    import re
+    import pandas as pd
+
+    if not final_top:
+        return final_top
+
+    total_checks = 0
+    total_issues = 0
+
+    for pick in final_top:
+        code = pick.get("code", "")
+        if not code or code not in stock_packages:
+            pick["hallucination_warnings"] = []
+            continue
+
+        pkg = stock_packages[code]
+        realtime = pkg.get("realtime", {}) if isinstance(pkg.get("realtime"), dict) else {}
+
+        # ── 真实数据 ──
+        real_pe = None
+        try:
+            pe_raw = realtime.get("市盈率-动态")
+            if pe_raw not in (None, "N/A", "nan"):
+                real_pe = float(pe_raw)
+        except (ValueError, TypeError):
+            pass
+
+        real_mktcap = None  # 单位: 亿
+        try:
+            mc_raw = realtime.get("总市值", "")
+            if isinstance(mc_raw, (int, float)):
+                real_mktcap = float(mc_raw)
+            elif isinstance(mc_raw, str):
+                m = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*亿", mc_raw)
+                if m:
+                    real_mktcap = float(m.group(1))
+        except (ValueError, TypeError):
+            pass
+
+        real_close = None
+        real_ret_20d = None
+        real_ret_60d = None
+        try:
+            df = pkg.get("daily")
+            if df is not None and hasattr(df, "iloc") and len(df) > 0:
+                c_col = "close" if "close" in df.columns else ("收盘" if "收盘" in df.columns else None)
+                if c_col:
+                    closes = df[c_col].astype(float).values
+                    real_close = float(closes[-1])
+                    if len(closes) >= 21:
+                        real_ret_20d = (closes[-1] - closes[-21]) / closes[-21] * 100
+                    if len(closes) >= 61:
+                        real_ret_60d = (closes[-1] - closes[-61]) / closes[-61] * 100
+        except Exception:
+            pass
+
+        # ── 从文本中提取 LLM 声称的数值 ──
+        # 合并所有理由和警告文本
+        text_parts = []
+        for r in pick.get("all_reasonings", []):
+            if isinstance(r, str):
+                text_parts.append(r)
+        text_parts.append(pick.get("expert_reasoning", "") or "")
+        for w in pick.get("extra_warnings", []):
+            if isinstance(w, str):
+                text_parts.append(w)
+        full_text = " ".join(text_parts)
+
+        if not full_text:
+            pick["hallucination_warnings"] = []
+            continue
+
+        warnings = []
+        total_checks += 1
+
+        def _check_deviation(label: str, llm_val: float, real_val: float, threshold: float = 0.3):
+            """偏差检查，超过阈值则加入 warnings"""
+            if real_val is None or real_val == 0:
+                return
+            dev = abs(llm_val - real_val) / abs(real_val)
+            if dev > threshold:
+                warnings.append(
+                    f"{label}存疑: LLM声称 {llm_val:.2f}，实际 {real_val:.2f}（偏差 {dev*100:.0f}%）"
+                )
+
+        # PE: "PE=15", "PE 12.5", "市盈率15倍", "pe约20"
+        for m in re.finditer(r"(?:PE|pe|市盈率)[\s=约:：为是]*?([0-9]+(?:\.[0-9]+)?)", full_text):
+            try:
+                llm_pe = float(m.group(1))
+                if real_pe is not None and 0 < llm_pe < 1000 and 0 < real_pe < 1000:
+                    _check_deviation("PE", llm_pe, real_pe)
+                    break  # 只查第一个
+            except ValueError:
+                pass
+
+        # 市值: "市值800亿", "市值约1200亿"
+        for m in re.finditer(r"市值[\s=约:：为是]*?([0-9]+(?:\.[0-9]+)?)\s*亿", full_text):
+            try:
+                llm_mc = float(m.group(1))
+                if real_mktcap is not None:
+                    _check_deviation("市值", llm_mc, real_mktcap)
+                    break
+            except ValueError:
+                pass
+
+        # 20日涨幅: "20日涨幅15%", "20日内上涨20%", "近20日涨幅约18%"
+        for m in re.finditer(r"(?:近)?20\s*[日天][内]?[涨幅上涨]{0,4}?[约达到为]*\s*([+\-]?[0-9]+(?:\.[0-9]+)?)\s*%", full_text):
+            try:
+                llm_ret = float(m.group(1))
+                if real_ret_20d is not None:
+                    _check_deviation("20日涨幅", llm_ret, real_ret_20d, threshold=0.5)  # 涨幅波动大，50%阈值
+                    break
+            except ValueError:
+                pass
+
+        # 60日涨幅
+        for m in re.finditer(r"(?:近)?60\s*[日天][内]?[涨幅上涨]{0,4}?[约达到为]*\s*([+\-]?[0-9]+(?:\.[0-9]+)?)\s*%", full_text):
+            try:
+                llm_ret = float(m.group(1))
+                if real_ret_60d is not None:
+                    _check_deviation("60日涨幅", llm_ret, real_ret_60d, threshold=0.5)
+                    break
+            except ValueError:
+                pass
+
+        # 当前价/收盘价: "当前价20元", "股价18.5元", "收盘22元"
+        for m in re.finditer(r"(?:当前价|股价|收盘|目标价)[\s=约:：为是]*?([0-9]+(?:\.[0-9]+)?)\s*[元块]?", full_text):
+            try:
+                llm_price = float(m.group(1))
+                # 只校验当前价相关的（目标价不作校验，允许偏离）
+                label = m.group(0)
+                if "目标" in label:
+                    continue
+                if real_close is not None and 0.1 < llm_price < 10000:
+                    _check_deviation("当前价", llm_price, real_close, threshold=0.15)  # 15% 阈值
+                    break
+            except ValueError:
+                pass
+
+        pick["hallucination_warnings"] = warnings
+        if warnings:
+            total_issues += 1
+            # 同步到 extra_warnings
+            if "extra_warnings" in pick and isinstance(pick["extra_warnings"], list):
+                pick["extra_warnings"].extend(warnings)
+            else:
+                pick["extra_warnings"] = list(warnings)
+
+    if verbose:
+        print(f"  [幻觉校验] 检查 {total_checks} 只，发现数据存疑 {total_issues} 只")
+        if total_issues > 0:
+            print(f"  [幻觉校验] 存疑样例:")
+            shown = 0
+            for pick in final_top:
+                if pick.get("hallucination_warnings"):
+                    print(f"    {pick['code']} {pick.get('name','?')}:")
+                    for w in pick["hallucination_warnings"][:2]:
+                        print(f"      - {w}")
+                    shown += 1
+                    if shown >= 3:
+                        break
+
+    return final_top
+
+
 def cross_validate_with_l1(
     final_top: List[Dict],
     engine,
@@ -2200,6 +2380,17 @@ def run_full_pipeline(
         import traceback
         traceback.print_exc()
     print(f"  ✓ Step 5.4 完成，耗时 {time.time()-t_step54:.1f}s")
+
+    # ── Step 5.45: LLM 幻觉校验（关键数值与真实数据交叉比对）──
+    print_section("Step 5.45: LLM 幻觉校验（PE/股价/涨幅/市值）")
+    t_step545 = time.time()
+    try:
+        final_top10 = verify_llm_hallucination(final_top10, stock_packages, verbose=verbose)
+    except Exception as e:
+        print(f"  [错误] 幻觉校验异常: {e}")
+        import traceback
+        traceback.print_exc()
+    print(f"  ✓ Step 5.45 完成，耗时 {time.time()-t_step545:.1f}s")
 
     # ── Step 5.5: 首席策略师综合判断（默认禁用，--strategist 开启）─────
     # 注意：首席策略师会用单一LLM主观调整Borda排名，可能干扰多模型投票的客观性
