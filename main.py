@@ -307,6 +307,108 @@ class _NoOpLogger:
     def log(self, *args, **kwargs): pass
 
 
+def compute_timing_limits(mr_result: Optional[Dict]) -> Dict:
+    """
+    根据 MR（市场雷达）情绪分和大盘趋势，动态计算推荐数量上限。
+
+    返回:
+      {
+        "max_recommendations": int,  # 最终推荐上限
+        "borda_top": int,            # Borda 融合 top_n
+        "expert_top": int,           # E1-E7 专家辩论 top
+        "regime": str,               # "强势" / "中性偏多" / "中性" / "弱势" / "观望"
+        "advice": str,               # 操作建议
+        "score": float,              # 市场分数 0-100
+        "trend": str,                # 大盘趋势
+      }
+
+    规则（按 sentiment.score）:
+      score ≥ 70: 强势做多 → 推荐 15 只（全量）
+      score 50-70: 中性偏多 → 推荐 10 只
+      score 30-50: 震荡观望 → 推荐 6 只
+      score 15-30: 弱势谨慎 → 推荐 3 只（只选最强）
+      score < 15:  观望为主 → 推荐 0 只（硬性门槛，建议空仓）
+    """
+    # 默认：无 MR 数据时按中性处理
+    default = {
+        "max_recommendations": 10,
+        "borda_top": 25,
+        "expert_top": 15,
+        "regime": "中性（无MR数据）",
+        "advice": "无市场雷达数据，按默认中性处理",
+        "score": 50,
+        "trend": "未知",
+    }
+    if not mr_result:
+        return default
+
+    # 优先取 MR 的 sentiment.score（0-100）
+    sent = mr_result.get("sentiment", {}) if isinstance(mr_result.get("sentiment"), dict) else {}
+    score = sent.get("score") if isinstance(sent, dict) else None
+    trend = mr_result.get("market_environment", {}).get("trend", "") if isinstance(mr_result.get("market_environment"), dict) else ""
+
+    # 若是 MR2（链路B精简版），没有 score 字段，按 trend 字符串映射
+    if score is None:
+        mr2_trend = mr_result.get("trend", "")  # MR2 字段
+        mr2_sent = mr_result.get("sentiment", "")
+        trend_map = {"偏多": 70, "震荡": 50, "偏空": 25}
+        sent_map = {"亢奋": 75, "正常": 50, "冷淡": 30}
+        # 取两者均值
+        s1 = trend_map.get(mr2_trend, 50)
+        s2 = sent_map.get(mr2_sent, 50) if isinstance(mr2_sent, str) else 50
+        score = (s1 + s2) / 2
+        trend = mr2_trend or trend
+
+    score = float(score) if score is not None else 50.0
+
+    # 按分段映射
+    if score >= 70:
+        return {
+            "max_recommendations": 15,
+            "borda_top": 25,
+            "expert_top": 15,
+            "regime": "强势做多",
+            "advice": "市场强势，可积极做多，推荐足量股票",
+            "score": score, "trend": trend,
+        }
+    elif score >= 50:
+        return {
+            "max_recommendations": 10,
+            "borda_top": 25,
+            "expert_top": 15,
+            "regime": "中性偏多",
+            "advice": "市场偏多震荡，适度参与，精选标的",
+            "score": score, "trend": trend,
+        }
+    elif score >= 30:
+        return {
+            "max_recommendations": 6,
+            "borda_top": 20,
+            "expert_top": 10,
+            "regime": "震荡观望",
+            "advice": "市场震荡，大幅缩减仓位，只选最强标的",
+            "score": score, "trend": trend,
+        }
+    elif score >= 15:
+        return {
+            "max_recommendations": 3,
+            "borda_top": 15,
+            "expert_top": 8,
+            "regime": "弱势谨慎",
+            "advice": "市场弱势，保持高度谨慎，仅推荐极少量最强个股",
+            "score": score, "trend": trend,
+        }
+    else:
+        return {
+            "max_recommendations": 0,
+            "borda_top": 10,
+            "expert_top": 5,
+            "regime": "观望为主",
+            "advice": "⚠️ 市场极度弱势/破位，建议空仓观望，本次不输出推荐",
+            "score": score, "trend": trend,
+        }
+
+
 def cross_validate_with_l1(
     final_top: List[Dict],
     engine,
@@ -614,6 +716,15 @@ def format_final_report(
         adv = mr_result.get("operation_advice", "")
         if adv:
             lines.append(f"  操作建议: {adv[:200]}")
+
+        # 市场择时硬约束
+        timing = mr_result.get("_timing_limits")
+        if timing:
+            lines.append(f"\n  【市场择时硬约束】")
+            lines.append(f"  市场分数: {timing['score']:.0f}/100 | 环境: {timing['regime']}")
+            lines.append(f"  推荐上限: {timing['max_recommendations']} 只 | "
+                         f"Borda Top={timing['borda_top']} | 专家 Top={timing['expert_top']}")
+            lines.append(f"  操作指引: {timing['advice']}")
 
         # 概念炒作预判
         hypes = mr_result.get("hype_predictions", [])
@@ -974,6 +1085,27 @@ def run_link_b_pipeline(
     print(f"  [MR2] 仓位建议: {mr2_result['position_hint']}")
     print(f"  ✓ MR2 完成，耗时 {time.time()-t_mr2:.1f}s")
 
+    # ── 市场择时硬约束（基于 MR2）──
+    timing_limits = compute_timing_limits(mr2_result)
+    mr2_result["_timing_limits"] = timing_limits
+    print(f"\n  [市场择时] 市场分数={timing_limits['score']:.0f}/100 | 环境={timing_limits['regime']}")
+    print(f"  [市场择时] 推荐上限={timing_limits['max_recommendations']} 只")
+    print(f"  [市场择时] {timing_limits['advice']}")
+
+    if timing_limits['max_recommendations'] == 0:
+        print(f"\n  ⚠️ 市场极度弱势，链路B 本次不输出推荐")
+        return {
+            "pipeline": "link_b",
+            "mr2_result": mr2_result,
+            "timing_limits": timing_limits,
+            "l1_candidates": [],
+            "l2_candidates": [],
+            "l3_picks": [],
+            "final_top10": [],
+            "risk_result": {"approved": [], "soft_excluded": []},
+            "abort_reason": "market_timing_watch_only",
+        }
+
     # ── L1: 量化过滤 ─────────────────────────────────────────────
     print_section("L1: 量化过滤（全市场扫描）")
     t_l1 = time.time()
@@ -1104,10 +1236,11 @@ def run_link_b_pipeline(
             ]
         }]
 
-    print_section("Borda: 跨模型融合")
+    _borda_top_n = timing_limits.get("borda_top", 25)
+    print_section(f"Borda: 跨模型融合（Top{_borda_top_n}，市场择时）")
     t_borda = time.time()
     print(f"\n  ── 参与融合 {len(model_results_for_borda)} 个模型的排序结果...")
-    final_top10 = borda_fusion(model_results_for_borda, top_n=25, model_weights=cfg.model_weights or None)
+    final_top10 = borda_fusion(model_results_for_borda, top_n=_borda_top_n, model_weights=cfg.model_weights or None)
 
     print(f"\n  融合结果 Top {len(final_top10)}:")
     for pick in final_top10:
@@ -1129,7 +1262,7 @@ def run_link_b_pipeline(
         llm=llm,
         cfg=cfg,
         active_models=active_models,
-        n_top=15,
+        n_top=timing_limits.get("expert_top", 15),
         verbose=verbose,
     )
     if enriched:
@@ -1181,6 +1314,20 @@ def run_link_b_pipeline(
     risk_approved = risk_result.get("approved", [])
     risk_soft = risk_result.get("soft_excluded", [])
     print(f"\n  ── 风控通过 {len(risk_approved)} 只，软过滤 {len(risk_soft)} 只")
+
+    # 市场择时硬截断
+    _max_recs = timing_limits.get("max_recommendations", 10)
+    if _max_recs < len(risk_approved):
+        print(f"\n  [市场择时截断] 风控通过 {len(risk_approved)} 只 → 按 {timing_limits['regime']} 限制为 {_max_recs} 只")
+        _approved_sorted = sorted(risk_approved, key=lambda s: s.get("final_score", 0), reverse=True)
+        _truncated = _approved_sorted[_max_recs:]
+        risk_result["approved"] = _approved_sorted[:_max_recs]
+        for s in _truncated:
+            s["risk_flags"] = s.get("risk_flags", []) + [f"市场择时截断（{timing_limits['regime']}）"]
+            risk_soft.append(s)
+        risk_result["soft_excluded"] = risk_soft
+        risk_approved = risk_result["approved"]
+
     print(f"  ✓ 风控完成，耗时 {time.time()-t_risk:.1f}s")
     save_result(risk_result, f"risk_result_linkb_{TODAY}.json")
 
@@ -1495,6 +1642,7 @@ def run_full_pipeline(
     # 非个股直选模式时执行，为后续板块优选提供市场环境上下文
     mr_result: Dict = {}
     etf_data: Dict = {}
+    timing_limits: Dict = compute_timing_limits(None)  # 默认中性限制（可被 MR 覆盖）
     if not stock_codes and not sectors:
         print_section("Step 0: 市场雷达扫描（大盘+情绪+概念炒作预判+ETF）")
         t_step0 = time.time()
@@ -1547,6 +1695,26 @@ def run_full_pipeline(
             print(f"\n  [MR] 操作建议: {adv[:200]}")
 
         print(f"  ✓ Step 0 完成，耗时 {(time.time()-t_step0)/60:.1f} 分钟")
+
+        # ── 市场择时硬约束：根据 MR 情绪计算推荐数量上限 ──
+        timing_limits = compute_timing_limits(mr_result)
+        mr_result["_timing_limits"] = timing_limits  # 附加到 mr_result，供报告使用
+        print(f"\n  [市场择时] 市场分数={timing_limits['score']:.0f}/100 | "
+              f"环境={timing_limits['regime']}")
+        print(f"  [市场择时] 推荐上限={timing_limits['max_recommendations']} 只 | "
+              f"Borda Top={timing_limits['borda_top']} | 专家 Top={timing_limits['expert_top']}")
+        print(f"  [市场择时] {timing_limits['advice']}")
+
+        # 极度弱势 → 直接返回空（观望）
+        if timing_limits['max_recommendations'] == 0:
+            print(f"\n  ⚠️ 市场极度弱势，本次不输出推荐，建议空仓观望")
+            return {
+                "mr_result": mr_result,
+                "timing_limits": timing_limits,
+                "final_picks": [],
+                "risk_result": {"approved": [], "soft_excluded": []},
+                "abort_reason": "market_timing_watch_only",
+            }
 
     # ── 个股直选模式（--stocks）：跳过板块筛选，直接采集指定股票 ────
     top_sectors = []  # 初始化，个股直选模式下为空列表
@@ -1978,11 +2146,12 @@ def run_full_pipeline(
         model_results_for_borda = model_results
 
     # ── Step 5: Borda Count 跨模型融合 ──────────────────────────────
-    print_section("Step 5: Borda Count 跨模型融合（输出 Top25）")
+    _borda_top_n = timing_limits.get("borda_top", 25)
+    print_section(f"Step 5: Borda Count 跨模型融合（输出 Top{_borda_top_n}，市场择时）")
     t_step5 = time.time()
     logger.log("fusion_start", detail={"model_count": len(model_results_for_borda)})
 
-    final_top10 = borda_fusion(model_results_for_borda, top_n=25, model_weights=cfg.model_weights or None)
+    final_top10 = borda_fusion(model_results_for_borda, top_n=_borda_top_n, model_weights=cfg.model_weights or None)
 
     logger.log("fusion_done", detail={"top_n": len(final_top10)})
 
@@ -2009,7 +2178,7 @@ def run_full_pipeline(
         llm=llm,
         cfg=cfg,
         active_models=active_models,
-        n_top=15,
+        n_top=timing_limits.get("expert_top", 15),
         verbose=verbose,
     )
     if enriched:
@@ -2058,6 +2227,24 @@ def run_full_pipeline(
         verbose=verbose,
     )
     print(f"  ✓ Step 6 完成，耗时 {(time.time()-t_step6)/60:.1f} 分钟")
+
+    # ── Step 6.5: 市场择时硬截断 ──
+    # 根据 timing_limits 裁剪最终推荐数量，弱势时大幅缩减
+    _max_recs = timing_limits.get("max_recommendations", 10)
+    _approved = risk_result.get("approved", [])
+    _soft = risk_result.get("soft_excluded", [])
+    if _max_recs < len(_approved):
+        print(f"\n  [市场择时截断] 风控通过 {len(_approved)} 只 → 按 {timing_limits['regime']} 限制为 {_max_recs} 只")
+        # 按 final_score 降序保留 top N
+        _approved_sorted = sorted(_approved, key=lambda s: s.get("final_score", 0), reverse=True)
+        _truncated = _approved_sorted[_max_recs:]
+        risk_result["approved"] = _approved_sorted[:_max_recs]
+        # 被截断的股票移到 soft_excluded，标注原因
+        for s in _truncated:
+            s["risk_flags"] = s.get("risk_flags", []) + [f"市场择时截断（{timing_limits['regime']}）"]
+            _soft.append(s)
+        risk_result["soft_excluded"] = _soft
+        print(f"  [市场择时截断] 剩余 {_max_recs} 只进入最终推荐，{len(_truncated)} 只移入软过滤")
     save_result(risk_result, f"risk_result_{TODAY}.json")
 
     # ── Step 8: 生成 PDF 投顾报告 ────────────────────────────────────
