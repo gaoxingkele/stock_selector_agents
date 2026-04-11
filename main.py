@@ -22,7 +22,7 @@ import sys
 import threading
 import time
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 # Windows 控制台 UTF-8 输出支持
 if sys.platform == "win32":
@@ -271,6 +271,8 @@ def fusion_to_arb_result(final_top: List[Dict]) -> Dict:
     """
     final_picks = []
     for pick in final_top:
+        # 继承 extra_warnings（含 L1 未通过警告）
+        warnings = list(pick.get("extra_warnings", []))
         final_picks.append({
             "rank": pick["rank"],
             "code": pick["code"],
@@ -279,13 +281,19 @@ def fusion_to_arb_result(final_top: List[Dict]) -> Dict:
             "final_score": pick["borda_score"],
             "consensus_level": _consensus_level(pick["model_count"]),
             "expert_count": pick["model_count"],
-            "warnings": [],
+            "warnings": warnings,
             "all_reasonings": pick.get("all_reasonings", []),
             # 保留融合专属字段供报告使用
             "borda_score": pick["borda_score"],
             "avg_score": pick["avg_score"],
             "model_count": pick["model_count"],
             "recommended_by": pick["recommended_by"],
+            # A/B 交叉验证字段（Step 5.4 注入）
+            "pass_l1": pick.get("pass_l1", False),
+            "l1_score": pick.get("l1_score", 0),
+            "l1_source": pick.get("l1_source", "none"),
+            "l1_forms": pick.get("l1_forms", []),
+            "consensus_bonus": pick.get("consensus_bonus", 0),
         })
     return {
         "final_picks": final_picks,
@@ -297,6 +305,124 @@ def fusion_to_arb_result(final_top: List[Dict]) -> Dict:
 class _NoOpLogger:
     """无操作 logger，self.logger 为 None 时使用"""
     def log(self, *args, **kwargs): pass
+
+
+def cross_validate_with_l1(
+    final_top: List[Dict],
+    engine,
+    l1_candidates: Optional[List[Dict]] = None,
+    verbose: bool = True,
+) -> Tuple[List[Dict], List[Dict]]:
+    """
+    A/B 管线交叉验证 — 用链路B的L1结果硬约束链路A的LLM推荐。
+
+    为 final_top（链路A Borda融合后的候选）每只股票注入：
+      - pass_l1: bool  是否通过 L1 量化过滤
+      - l1_score: float  L1 综合得分（未通过为0）
+      - l1_source: str  "dual"/"quant"/"pattern"/"none"
+      - l1_forms: list  L1 检出的形态列表
+      - consensus_bonus: int  共识加分（通过 L1 则 +8，进入 dual 轮则 +15）
+      - 警告：未通过 L1 时加入 extra_warnings
+
+    参数:
+      l1_candidates: 可选的 L1 结果（若为 None 则临时跑一次 L1，约 60s）
+
+    返回: (enriched_top, l1_candidates)
+      enriched_top: 带 pass_l1 等字段的 final_top
+      l1_candidates: L1 结果（供后续复用）
+    """
+    if not final_top:
+        return final_top, l1_candidates or []
+
+    # 若未传入 L1 结果，临时跑一次
+    if l1_candidates is None:
+        if verbose:
+            print("\n  [L1交叉验证] 未提供 L1 结果，启动全市场 L1 扫描...")
+        try:
+            l1_candidates = engine.L1_quant_filter(verbose=False)
+        except Exception as e:
+            print(f"  [L1交叉验证] L1 扫描失败: {e}")
+            l1_candidates = []
+
+    if not l1_candidates:
+        if verbose:
+            print("  [L1交叉验证] L1 结果为空，跳过交叉验证")
+        for pick in final_top:
+            pick["pass_l1"] = False
+            pick["l1_score"] = 0
+            pick["l1_source"] = "none"
+            pick["l1_forms"] = []
+            pick["consensus_bonus"] = 0
+        return final_top, l1_candidates
+
+    # 构建 L1 索引
+    l1_map = {c["code"]: c for c in l1_candidates}
+
+    if verbose:
+        print(f"\n  [L1交叉验证] L1 候选池: {len(l1_map)} 只")
+
+    pass_count = 0
+    dual_count = 0
+    fail_count = 0
+
+    for pick in final_top:
+        code = pick.get("code", "")
+        l1 = l1_map.get(code)
+
+        if l1:
+            pick["pass_l1"] = True
+            pick["l1_score"] = l1.get("score", 0)
+            pick["l1_source"] = l1.get("source", "quant")
+            pick["l1_forms"] = l1.get("pattern_list", []) or []
+            # 共识加分：通过 L1 +8，若双轮共识再 +7
+            bonus = 8
+            if pick["l1_source"] == "dual":
+                bonus += 7
+            pick["consensus_bonus"] = bonus
+            pick["borda_score"] = round(pick.get("borda_score", 0) + bonus, 1)
+            pass_count += 1
+            if pick["l1_source"] == "dual":
+                dual_count += 1
+        else:
+            pick["pass_l1"] = False
+            pick["l1_score"] = 0
+            pick["l1_source"] = "none"
+            pick["l1_forms"] = []
+            pick["consensus_bonus"] = 0
+            # 加警告
+            warn = "未通过 L1 量化验证（纯 LLM 推荐，建议降权）"
+            if "extra_warnings" in pick and isinstance(pick["extra_warnings"], list):
+                pick["extra_warnings"].append(warn)
+            else:
+                pick["extra_warnings"] = [warn]
+            fail_count += 1
+
+    # 加分后重新排序（pass_l1 的股票自然排到前面）
+    final_top.sort(key=lambda p: p.get("borda_score", 0), reverse=True)
+    for i, pick in enumerate(final_top, 1):
+        pick["rank"] = i
+
+    if verbose:
+        print(f"  [L1交叉验证] 通过 L1: {pass_count}/{len(final_top)} "
+              f"(其中双轮共识 {dual_count})")
+        print(f"  [L1交叉验证] 未通过 L1: {fail_count}（已标记警告，borda_score 不加分）")
+        if pass_count > 0:
+            # 展示前5只通过L1的详情
+            print(f"  [L1交叉验证] Top 5 通过 L1 的候选:")
+            shown = 0
+            for pick in final_top:
+                if not pick.get("pass_l1"):
+                    continue
+                forms = ",".join(pick.get("l1_forms", [])[:3]) or "-"
+                print(f"    #{pick['rank']} {pick['code']} {pick.get('name','?'):<10s} "
+                      f"borda={pick['borda_score']:5.1f} (+{pick['consensus_bonus']}) "
+                      f"l1_src={pick['l1_source']:<7s} l1_forms={forms}")
+                shown += 1
+                if shown >= 5:
+                    break
+
+    return final_top, l1_candidates
+
 
 def run_expert_debate_after_borda(
     borda_top: List[Dict],
@@ -580,10 +706,10 @@ def format_final_report(
             return " " * pad + s
         return s + " " * pad
 
-    # 列宽定义
-    W = [4, 8, 10, 10, 6, 4, 8, 14, 30]  # 排名/代码/名称/板块/Borda/模型/风险/仓位/风控提示
-    H = ["排名", "代码", "名称", "板块", "Borda", "模型", "风险", "仓位建议", "风控提示"]
-    HA = ["center"] * 6 + ["center", "center", "center"]  # 表头对齐
+    # 列宽定义（新增 L1 列）
+    W = [4, 8, 10, 10, 6, 4, 6, 8, 14, 30]  # 排名/代码/名称/板块/Borda/模型/L1/风险/仓位/风控提示
+    H = ["排名", "代码", "名称", "板块", "Borda", "模型", "L1", "风险", "仓位建议", "风控提示"]
+    HA = ["center"] * 10
 
     top_line  = "  ┌" + "┬".join("─" * w for w in W) + "┐"
     sep_line  = "  ├" + "┼".join("─" * w for w in W) + "┤"
@@ -591,7 +717,7 @@ def format_final_report(
 
     def _row(cells, aligns=None):
         if aligns is None:
-            aligns = ["center", "center", "left", "left", "center", "center", "left", "left", "left"]
+            aligns = ["center", "center", "left", "left", "center", "center", "center", "left", "left", "left"]
         parts = []
         for i, (cell, w) in enumerate(zip(cells, W)):
             parts.append(_pad(str(cell), w, aligns[i] if i < len(aligns) else "left"))
@@ -608,6 +734,19 @@ def format_final_report(
         borda = f"{item['borda']:.0f}"
         model_count = str(item["model_count"])
 
+        # L1 标记：从 fusion_data 或 stock_data 拿
+        fi = item.get("fusion_data") or {}
+        stock = item["stock_data"]
+        pass_l1 = fi.get("pass_l1", stock.get("pass_l1", False))
+        l1_source = fi.get("l1_source", stock.get("l1_source", "none"))
+        if pass_l1:
+            if l1_source == "dual":
+                l1_str = "✓双"
+            else:
+                l1_str = "✓"
+        else:
+            l1_str = "✗"
+
         if item["is_excluded"]:
             risk_str = "⚠风控"
             position = "—"
@@ -615,13 +754,12 @@ def format_final_report(
         else:
             risk_str = item["risk_level"][:4]
             position = item["position_advice"][:7]
-            stock = item["stock_data"]
             flags = stock.get("risk_flags", [])
             risk_note = "; ".join(flags)[:14] if flags else ""
 
         lines.append(_row(
-            [str(rank_counter), code, name, sector, borda, model_count, risk_str, position, risk_note],
-            ["center", "center", "left", "left", "center", "center", "left", "left", "left"],
+            [str(rank_counter), code, name, sector, borda, model_count, l1_str, risk_str, position, risk_note],
+            ["center", "center", "left", "left", "center", "center", "center", "left", "left", "left"],
         ))
 
     lines.append(bot_line)
@@ -642,6 +780,19 @@ def format_final_report(
                 for r in recommended_by
             )
             lines.append(f"    推荐来源: {by_str}  Borda分={item['borda']:.0f}")
+
+        # L1 交叉验证信息
+        pass_l1 = fi.get("pass_l1", item["stock_data"].get("pass_l1", False))
+        if pass_l1:
+            l1_src = fi.get("l1_source", "quant")
+            l1_score = fi.get("l1_score", 0)
+            l1_forms = fi.get("l1_forms", [])
+            bonus = fi.get("consensus_bonus", 0)
+            src_cn = {"dual": "双轮共识", "quant": "量化轮", "pattern": "形态轮"}.get(l1_src, l1_src)
+            forms_str = ("，形态: " + ",".join(l1_forms[:3])) if l1_forms else ""
+            lines.append(f"    L1量化: ✓通过 ({src_cn}，L1分={l1_score:.0f}，共识+{bonus}){forms_str}")
+        else:
+            lines.append(f"    L1量化: ✗未通过（纯LLM推荐，建议降权）")
 
         if item["is_excluded"]:
             lines.append(f"    风控提示: {item['reason']}")
@@ -1867,6 +2018,19 @@ def run_full_pipeline(
     else:
         print("  [跳过] E1-E7 辩论无结果")
     print(f"  ✓ Step 5.3 完成，耗时 {time.time()-t_step53:.1f}s")
+
+    # ── Step 5.4: A/B 管线交叉验证（L1量化硬约束）──────────────────
+    print_section("Step 5.4: A/B 管线交叉验证（L1量化硬约束）")
+    t_step54 = time.time()
+    try:
+        final_top10, _l1_for_a = cross_validate_with_l1(
+            final_top10, engine, l1_candidates=None, verbose=verbose
+        )
+    except Exception as e:
+        print(f"  [错误] L1交叉验证异常: {e}")
+        import traceback
+        traceback.print_exc()
+    print(f"  ✓ Step 5.4 完成，耗时 {time.time()-t_step54:.1f}s")
 
     # ── Step 5.5: 首席策略师综合判断（默认禁用，--strategist 开启）─────
     # 注意：首席策略师会用单一LLM主观调整Borda排名，可能干扰多模型投票的客观性
