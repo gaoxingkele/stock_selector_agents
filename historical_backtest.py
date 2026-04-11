@@ -315,6 +315,35 @@ def l1_filter_at_date(cache: TdxCache, codes: List[str],
         ret5  = (close_arr[-1] / close_arr[-6]  - 1) * 100 if n >= 6  else 0
         ret10 = (close_arr[-1] / close_arr[-11] - 1) * 100 if n >= 11 else 0
 
+        # 筹码集中度因子（v6，与 data_engine.L1_quant_filter 对齐）
+        vol_5_60_ratio = 0.0
+        if n >= 60:
+            vol_5 = float(np.mean(vol_arr[-5:]))
+            vol_60 = float(np.mean(vol_arr[-60:]))
+            if vol_60 > 0:
+                vol_5_60_ratio = vol_5 / vol_60
+        vol_cv_20 = 0.0
+        if n >= 20:
+            vol_std_20 = float(np.std(vol_arr[-20:]))
+            vol_cv_20 = vol_std_20 / max(vol_ma20, 1)
+        price_cv_20 = 0.0
+        if n >= 20:
+            price_std_20 = float(np.std(close_arr[-20:]))
+            price_cv_20 = price_std_20 / max(float(np.mean(close_arr[-20:])), 0.01)
+        chip_concentration = 0.0
+        if 0.6 <= vol_5_60_ratio <= 0.9:
+            chip_concentration += 40
+        elif 0.5 <= vol_5_60_ratio < 0.6 or 0.9 < vol_5_60_ratio <= 1.0:
+            chip_concentration += 20
+        if vol_cv_20 < 0.5:
+            chip_concentration += 30
+        elif vol_cv_20 < 0.7:
+            chip_concentration += 15
+        if price_cv_20 < 0.05:
+            chip_concentration += 30
+        elif price_cv_20 < 0.08:
+            chip_concentration += 15
+
         prefiltered.append({
             "code": code,
             "close": float(round(close_arr[-1], 2)),
@@ -334,6 +363,10 @@ def l1_filter_at_date(cache: TdxCache, codes: List[str],
             "ret5":  float(round(ret5, 2)),
             "ret10": float(round(ret10, 2)),
             "rps_20d": float(round(_r20 * 100, 2)),
+            "vol_5_60_ratio": round(vol_5_60_ratio, 3),
+            "vol_cv_20": round(vol_cv_20, 3),
+            "price_cv_20": round(price_cv_20, 4),
+            "chip_concentration": round(chip_concentration, 1),
             "_df_raw": df_raw,  # 用于形态检测
         })
 
@@ -365,6 +398,7 @@ def l1_filter_at_date(cache: TdxCache, codes: List[str],
             rps60_pct = rps60_pcts[i]
             score = 0.0
             atr_r = c["atr5"] / max(c["atr20"], 0.001)
+            chip_bonus = c.get("chip_concentration", 0) / 100 * 10  # v6 筹码集中度
 
             if is_bull_mode:
                 score += rps_pct * 0.20
@@ -385,6 +419,7 @@ def l1_filter_at_date(cache: TdxCache, codes: List[str],
                     score += (3.0 - ar) / 1.0 * 10
                 if atr_r < 0.7:
                     score += 5
+                score += chip_bonus  # v6: 0~10
             else:
                 if c["ma20_slope"] > 0:
                     score += 15 + min(10, c["ma20_slope"] * 300)
@@ -400,6 +435,7 @@ def l1_filter_at_date(cache: TdxCache, codes: List[str],
                     score += 15
                 if c["close"] > c["MA20"] > 0:
                     score += 5
+                score += chip_bonus * 1.5  # v6: 熊市筹码更重要 0~15
 
             c["rps20"] = round(rps_pct, 1)
             c["rps60"] = round(rps60_pct, 1)

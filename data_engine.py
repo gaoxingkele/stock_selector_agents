@@ -3424,6 +3424,40 @@ class DataEngine:
             avg_vol_20 = float(np.mean(vol_arr[-20:])) if n >= 20 else float(np.mean(vol_arr))
             amount_ratio = vol_arr[-1] / avg_vol_20 if avg_vol_20 > 0 else 0
 
+            # ── 筹码集中度因子（v6）──
+            # 1) 5日 vs 60日量能比 — 主力低吸完成后量能收缩
+            vol_5_60_ratio = 0.0
+            if n >= 60:
+                vol_5 = float(np.mean(vol_arr[-5:]))
+                vol_60 = float(np.mean(vol_arr[-60:]))
+                if vol_60 > 0:
+                    vol_5_60_ratio = vol_5 / vol_60  # <1 = 缩量沉淀
+            # 2) 20日量能变异系数 — 量能稳定 = 主力控盘
+            vol_cv_20 = 0.0
+            if n >= 20:
+                vol_std_20 = float(np.std(vol_arr[-20:]))
+                vol_cv_20 = vol_std_20 / max(avg_vol_20, 1)  # 越小越稳定
+            # 3) 价稳量缩 — 价格波动小且量能下降（主力吸筹完成的典型特征）
+            price_std_20 = float(np.std(close_arr[-20:])) if n >= 20 else 0
+            price_cv_20 = price_std_20 / max(float(np.mean(close_arr[-20:])), 0.01) if n >= 20 else 0
+            # 综合筹码集中度分（0~100，越高越好）：
+            # vol_5_60_ratio 0.6-0.9 最优（缩量但不极端）
+            # vol_cv_20 < 0.5 加分
+            # price_cv_20 < 0.05 加分（横盘）
+            chip_concentration = 0.0
+            if 0.6 <= vol_5_60_ratio <= 0.9:
+                chip_concentration += 40
+            elif 0.5 <= vol_5_60_ratio < 0.6 or 0.9 < vol_5_60_ratio <= 1.0:
+                chip_concentration += 20
+            if vol_cv_20 < 0.5:
+                chip_concentration += 30
+            elif vol_cv_20 < 0.7:
+                chip_concentration += 15
+            if price_cv_20 < 0.05:
+                chip_concentration += 30
+            elif price_cv_20 < 0.08:
+                chip_concentration += 15
+
             prefiltered.append({
                 "code": code, "name": code,
                 "close": close_arr[-1],
@@ -3435,6 +3469,10 @@ class DataEngine:
                 "is_yang_fang": is_yang_fang,
                 "amount_ratio": round(amount_ratio, 2),
                 "avg_amount_20": round(avg_amount_20, 2),
+                "vol_5_60_ratio": round(vol_5_60_ratio, 3),
+                "vol_cv_20": round(vol_cv_20, 3),
+                "price_cv_20": round(price_cv_20, 4),
+                "chip_concentration": round(chip_concentration, 1),
                 "df": df,
                 "_df_raw": df_raw,   # 保留原始 df（含列名+日期 index）
             })
@@ -3479,6 +3517,9 @@ class DataEngine:
                 score = 0.0
                 atr_r = c["atr5"] / max(c["atr20"], 0.001)
 
+                # v6: 筹码集中度加分（满分100 → 转 0~10 分加成）
+                chip_bonus = c.get("chip_concentration", 0) / 100 * 10
+
                 if is_bull_mode:
                     score += rps_pct * 0.20
                     score += rps60_pct * 0.10
@@ -3498,6 +3539,7 @@ class DataEngine:
                         score += (3.0 - ar) / 1.0 * 10
                     if atr_r < 0.7:
                         score += 5
+                    score += chip_bonus  # 牛市：筹码集中度 0~10 分
                 else:
                     if c["ma20_slope"] > 0:
                         score += 15 + min(10, c["ma20_slope"] * 300)
@@ -3513,6 +3555,7 @@ class DataEngine:
                         score += 15
                     if c["close"] > c["MA20"] > 0:
                         score += 5
+                    score += chip_bonus * 1.5  # 熊市：筹码集中度更重要 0~15 分
 
                 c["rps20"] = round(rps_pct, 1)
                 c["rps60"] = round(rps60_pct, 1)
