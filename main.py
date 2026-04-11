@@ -81,6 +81,32 @@ def save_result(data: dict, filename: str) -> str:
     return path
 
 
+def load_cached_result(filename: str, max_age_hours: float = 24) -> Optional[dict]:
+    """
+    增量运行模式 — 尝试加载当日已生成的结果文件。
+
+    参数:
+      filename: 文件名（相对 DATA_DIR）
+      max_age_hours: 文件最大年龄（小时），超过则不复用
+
+    返回:
+      dict / None
+    """
+    path = os.path.join(DATA_DIR, filename)
+    if not os.path.exists(path):
+        return None
+    try:
+        # 检查文件年龄
+        mtime = os.path.getmtime(path)
+        age_hours = (time.time() - mtime) / 3600
+        if age_hours > max_age_hours:
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
 def print_banner():
     print("\n" + "=" * 70)
     print("   A股多智能体选股系统（模型纵向并行版）")
@@ -997,6 +1023,7 @@ def cross_validate_with_l1(
     engine,
     l1_candidates: Optional[List[Dict]] = None,
     verbose: bool = True,
+    incremental: bool = False,
 ) -> Tuple[List[Dict], List[Dict]]:
     """
     A/B 管线交叉验证 — 用链路B的L1结果硬约束链路A的LLM推荐。
@@ -1019,15 +1046,24 @@ def cross_validate_with_l1(
     if not final_top:
         return final_top, l1_candidates or []
 
-    # 若未传入 L1 结果，临时跑一次
+    # 若未传入 L1 结果，先尝试缓存，再跑实时
     if l1_candidates is None:
-        if verbose:
-            print("\n  [L1交叉验证] 未提供 L1 结果，启动全市场 L1 扫描...")
-        try:
-            l1_candidates = engine.L1_quant_filter(verbose=False)
-        except Exception as e:
-            print(f"  [L1交叉验证] L1 扫描失败: {e}")
-            l1_candidates = []
+        if incremental:
+            cached = load_cached_result(f"L1_candidates_{TODAY}.json")
+            if cached and cached.get("L1_candidates"):
+                l1_candidates = cached["L1_candidates"]
+                if verbose:
+                    print(f"\n  [L1交叉验证] [增量] 复用当日 L1 缓存（{len(l1_candidates)} 只）")
+        if l1_candidates is None:
+            if verbose:
+                print("\n  [L1交叉验证] 未提供 L1 结果，启动全市场 L1 扫描...")
+            try:
+                l1_candidates = engine.L1_quant_filter(verbose=False)
+                # 保存到缓存供其他场景复用
+                save_result({"L1_candidates": l1_candidates}, f"L1_candidates_{TODAY}.json")
+            except Exception as e:
+                print(f"  [L1交叉验证] L1 扫描失败: {e}")
+                l1_candidates = []
 
     if not l1_candidates:
         if verbose:
@@ -1642,6 +1678,7 @@ def run_link_b_pipeline(
     verbose: bool = True,
     models: Optional[List[str]] = None,
     no_confirm: bool = False,
+    incremental: bool = False,
 ) -> Dict:
     """
     链路B — 量化选股链路：
@@ -1728,9 +1765,17 @@ def run_link_b_pipeline(
     # ── L1: 量化过滤 ─────────────────────────────────────────────
     print_section("L1: 量化过滤（全市场扫描）")
     t_l1 = time.time()
-    l1_candidates = engine.L1_quant_filter(verbose=verbose)
+    l1_candidates = None
+    # 增量模式：尝试加载当日缓存
+    if incremental:
+        cached = load_cached_result(f"L1_candidates_{TODAY}.json")
+        if cached and cached.get("L1_candidates"):
+            l1_candidates = cached["L1_candidates"]
+            print(f"  [增量] 复用当日 L1 缓存（{len(l1_candidates)} 只）")
+    if l1_candidates is None:
+        l1_candidates = engine.L1_quant_filter(verbose=verbose)
+        save_result({"L1_candidates": l1_candidates}, f"L1_candidates_{TODAY}.json")
     print(f"\n  ✓ L1 完成，耗时 {time.time()-t_l1:.1f}s")
-    save_result({"L1_candidates": l1_candidates}, f"L1_candidates_{TODAY}.json")
 
     if not l1_candidates:
         print("\n  [警告] L1 无候选股，链路B终止")
@@ -2174,6 +2219,7 @@ def run_full_pipeline(
     models: Optional[List[str]] = None,
     stock_codes: Optional[List[str]] = None,
     no_confirm: bool = False,
+    incremental: bool = False,
 ) -> Dict:
     """
     完整选股流程（模型纵向并行版）:
@@ -2839,7 +2885,8 @@ def run_full_pipeline(
     t_step54 = time.time()
     try:
         final_top10, _l1_for_a = cross_validate_with_l1(
-            final_top10, engine, l1_candidates=None, verbose=verbose
+            final_top10, engine, l1_candidates=None,
+            verbose=verbose, incremental=incremental,
         )
     except Exception as e:
         print(f"  [错误] L1交叉验证异常: {e}")
@@ -3264,6 +3311,11 @@ def main():
         action="store_true",
         help="运行绩效追踪（回测历史推荐+输出自适应权重），不运行选股流程",
     )
+    parser.add_argument(
+        "--incremental",
+        action="store_true",
+        help="增量运行模式：复用当日已生成的中间结果（L1/L2/Borda），跳过重复扫描",
+    )
 
     args = parser.parse_args()
 
@@ -3336,6 +3388,7 @@ def main():
             models=models_list,
             stock_codes=stock_codes,
             no_confirm=args.no_confirm,
+            incremental=args.incremental,
         )
     elif args.link == "b":
         run_link_b_pipeline(
@@ -3345,6 +3398,7 @@ def main():
             verbose=verbose,
             models=models_list,
             no_confirm=args.no_confirm,
+            incremental=args.incremental,
         )
     elif args.link == "both":
         print("\n" + "="*60)
@@ -3361,6 +3415,7 @@ def main():
             models=models_list,
             stock_codes=stock_codes,
             no_confirm=args.no_confirm,
+            incremental=args.incremental,
         )
         print("\n" + "="*60)
         print("  【链路B】MR2 → L1量化 → L2形态 → L3看图 → Borda → 风控 → 报告")
@@ -3372,6 +3427,7 @@ def main():
             verbose=verbose,
             models=models_list,
             no_confirm=args.no_confirm,
+            incremental=args.incremental,
         )
 
 
