@@ -409,6 +409,161 @@ def compute_timing_limits(mr_result: Optional[Dict]) -> Dict:
         }
 
 
+def portfolio_risk_check(
+    risk_result: Dict,
+    timing_limits: Dict,
+    stock_packages: Dict,
+    verbose: bool = True,
+) -> Dict:
+    """
+    组合层面风控 — 在个股风控之后做组合维度的检查：
+
+    1. 同板块限制（≤2 只）：每个板块只保留 borda_score 最高的 2 只
+    2. 总仓位上限（按 MR 情绪动态）：
+       - 强势 80% / 偏多 60% / 震荡 40% / 弱势 20% / 观望 0%
+       归一化每只股票的仓位建议，使总和 ≤ 上限
+    3. 组合波动率：用 ATR/价格 估算，过高时警告
+    4. 板块多样性：独立板块数 / 总数
+
+    返回: 修改后的 risk_result
+    """
+    if not risk_result or not isinstance(risk_result, dict):
+        return risk_result
+
+    approved = risk_result.get("approved", [])
+    soft_excluded = risk_result.get("soft_excluded", [])
+    if not approved:
+        return risk_result
+
+    # ── 1. 同板块限制 ──
+    SECTOR_MAX = 2
+    by_sector: Dict[str, List[Dict]] = {}
+    for s in approved:
+        sec = (s.get("sector") or "").strip() or "未知"
+        by_sector.setdefault(sec, []).append(s)
+
+    new_approved: List[Dict] = []
+    sector_truncated: List[Dict] = []
+    for sec, stocks in by_sector.items():
+        if len(stocks) <= SECTOR_MAX:
+            new_approved.extend(stocks)
+        else:
+            # 按 final_score / borda_score 降序，保留 top SECTOR_MAX
+            sorted_stocks = sorted(stocks, key=lambda x: x.get("final_score", 0), reverse=True)
+            kept = sorted_stocks[:SECTOR_MAX]
+            dropped = sorted_stocks[SECTOR_MAX:]
+            new_approved.extend(kept)
+            for d in dropped:
+                d["risk_flags"] = d.get("risk_flags", []) + [f"同板块限制（{sec} 已选 {SECTOR_MAX} 只）"]
+                sector_truncated.append(d)
+
+    if verbose and sector_truncated:
+        print(f"  [组合风控] 同板块限制（≤{SECTOR_MAX}）截断 {len(sector_truncated)} 只")
+
+    # ── 2. 总仓位上限（按 MR）──
+    # 仓位上限映射
+    regime = timing_limits.get("regime", "中性偏多")
+    cap_map = {
+        "强势做多": 0.80,
+        "中性偏多": 0.60,
+        "震荡观望": 0.40,
+        "弱势谨慎": 0.20,
+        "观望为主": 0.00,
+    }
+    total_cap = cap_map.get(regime, 0.50)
+
+    # 解析每只股票的仓位建议（"3-5%" → 取均值 4%）
+    import re
+    def _parse_position(pos_str: str) -> float:
+        if not pos_str:
+            return 5.0  # 默认 5%
+        m = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*-\s*([0-9]+(?:\.[0-9]+)?)\s*%?", pos_str)
+        if m:
+            return (float(m.group(1)) + float(m.group(2))) / 2
+        m = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*%?", pos_str)
+        if m:
+            return float(m.group(1))
+        return 5.0
+
+    raw_positions = [_parse_position(s.get("position_advice", "")) / 100 for s in new_approved]
+    total_raw = sum(raw_positions)
+
+    if total_raw > total_cap and total_raw > 0:
+        # 按比例缩减
+        scale = total_cap / total_raw
+        for i, s in enumerate(new_approved):
+            new_pct = raw_positions[i] * scale * 100
+            old_pct = raw_positions[i] * 100
+            s["position_advice_original"] = s.get("position_advice", "")
+            s["position_advice"] = f"{new_pct:.1f}%"
+            s["risk_flags"] = s.get("risk_flags", []) + [
+                f"组合仓位缩减（{old_pct:.1f}% → {new_pct:.1f}%，总仓位上限 {total_cap*100:.0f}%）"
+            ]
+        if verbose:
+            print(f"  [组合风控] 总仓位 {total_raw*100:.0f}% > 上限 {total_cap*100:.0f}%（{regime}），按比例缩减")
+    else:
+        if verbose:
+            print(f"  [组合风控] 总仓位 {total_raw*100:.0f}% ≤ 上限 {total_cap*100:.0f}%（{regime}），无需缩减")
+
+    # ── 3. 组合波动率（用 ATR/收盘价 均值估算）──
+    vol_list = []
+    for s in new_approved:
+        code = s.get("code", "")
+        pkg = stock_packages.get(code, {}) if isinstance(stock_packages, dict) else {}
+        df = pkg.get("daily")
+        try:
+            if df is not None and hasattr(df, "iloc") and len(df) >= 20:
+                c_col = "close" if "close" in df.columns else ("收盘" if "收盘" in df.columns else None)
+                h_col = "high" if "high" in df.columns else ("最高" if "最高" in df.columns else None)
+                l_col = "low" if "low" in df.columns else ("最低" if "最低" in df.columns else None)
+                if c_col and h_col and l_col:
+                    closes = df[c_col].astype(float).values[-20:]
+                    highs = df[h_col].astype(float).values[-20:]
+                    lows = df[l_col].astype(float).values[-20:]
+                    atr = float((highs - lows).mean())
+                    last_close = float(closes[-1])
+                    if last_close > 0:
+                        vol_list.append(atr / last_close * 100)  # ATR/价格 百分比
+        except Exception:
+            pass
+
+    avg_vol = sum(vol_list) / len(vol_list) if vol_list else 0
+
+    # ── 4. 板块多样性 ──
+    final_sectors = {(s.get("sector") or "未知") for s in new_approved}
+    diversity = len(final_sectors) / max(len(new_approved), 1)
+
+    # 整体警告
+    portfolio_warnings = []
+    if avg_vol > 6:
+        portfolio_warnings.append(f"组合波动率偏高（平均 ATR/价 = {avg_vol:.1f}%）")
+    if diversity < 0.5 and len(new_approved) >= 4:
+        portfolio_warnings.append(f"板块多样性偏低（{len(final_sectors)}/{len(new_approved)} = {diversity*100:.0f}%）")
+
+    if verbose:
+        print(f"  [组合风控] 最终保留 {len(new_approved)} 只 | "
+              f"板块数 {len(final_sectors)} | 多样性 {diversity*100:.0f}% | "
+              f"组合波动率 {avg_vol:.1f}%")
+        if portfolio_warnings:
+            for w in portfolio_warnings:
+                print(f"  [组合风控] ⚠ {w}")
+
+    # 更新 risk_result
+    risk_result["approved"] = new_approved
+    risk_result["soft_excluded"] = soft_excluded + sector_truncated
+    risk_result["portfolio"] = {
+        "total_position_pct": round(min(total_raw, total_cap) * 100, 1),
+        "position_cap_pct": round(total_cap * 100, 1),
+        "regime": regime,
+        "sector_count": len(final_sectors),
+        "sectors": sorted(final_sectors),
+        "diversity": round(diversity, 2),
+        "avg_volatility_pct": round(avg_vol, 2),
+        "warnings": portfolio_warnings,
+    }
+    return risk_result
+
+
 def verify_llm_hallucination(
     final_top: List[Dict],
     stock_packages: Dict,
@@ -977,6 +1132,18 @@ def format_final_report(
     n_excluded = len(soft_excluded)
     lines.append(f"\n  共 {total} 只股票（按Borda评分排序 | 风控通过 {n_approved} 只，风控提示 {n_excluded} 只）\n")
 
+    # 组合风控摘要
+    portfolio = risk_result.get("portfolio") if isinstance(risk_result, dict) else None
+    if portfolio:
+        lines.append(f"  【组合风控】")
+        lines.append(f"  总仓位: {portfolio['total_position_pct']}% / 上限 {portfolio['position_cap_pct']}%（{portfolio['regime']}）")
+        lines.append(f"  板块多样性: {portfolio['sector_count']} 个独立板块（{portfolio['diversity']*100:.0f}%）")
+        lines.append(f"  组合波动率: {portfolio['avg_volatility_pct']}% (ATR/价)")
+        if portfolio.get("warnings"):
+            for w in portfolio["warnings"]:
+                lines.append(f"  ⚠ {w}")
+        lines.append("")
+
     # ── 网格表格（处理中文宽度） ──────────────────────────────
     def _display_width(s: str) -> int:
         """计算字符串显示宽度（中文占2，ASCII占1）"""
@@ -1494,6 +1661,14 @@ def run_link_b_pipeline(
     risk_approved = risk_result.get("approved", [])
     risk_soft = risk_result.get("soft_excluded", [])
     print(f"\n  ── 风控通过 {len(risk_approved)} 只，软过滤 {len(risk_soft)} 只")
+
+    # 组合层面风控
+    try:
+        risk_result = portfolio_risk_check(risk_result, timing_limits, stock_packages, verbose=verbose)
+        risk_approved = risk_result.get("approved", [])
+        risk_soft = risk_result.get("soft_excluded", [])
+    except Exception as e:
+        print(f"  [错误] 组合风控异常: {e}")
 
     # 市场择时硬截断
     _max_recs = timing_limits.get("max_recommendations", 10)
@@ -2418,6 +2593,17 @@ def run_full_pipeline(
         verbose=verbose,
     )
     print(f"  ✓ Step 6 完成，耗时 {(time.time()-t_step6)/60:.1f} 分钟")
+
+    # ── Step 6.3: 组合层面风控（同板块限制+总仓位+波动率）──
+    print_section("Step 6.3: 组合层面风控")
+    t_step63 = time.time()
+    try:
+        risk_result = portfolio_risk_check(risk_result, timing_limits, stock_packages, verbose=verbose)
+    except Exception as e:
+        print(f"  [错误] 组合风控异常: {e}")
+        import traceback
+        traceback.print_exc()
+    print(f"  ✓ Step 6.3 完成，耗时 {time.time()-t_step63:.1f}s")
 
     # ── Step 6.5: 市场择时硬截断 ──
     # 根据 timing_limits 裁剪最终推荐数量，弱势时大幅缩减
