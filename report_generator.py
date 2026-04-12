@@ -865,10 +865,10 @@ class ReportGenerator:
             score      = stk.get("borda_score", stk.get("final_score", stk.get("weighted_score", 0)))
 
             if item["is_excluded"]:
-                consensus = "—"
+                consensus = stk.get("consensus_level", "—")
                 risk      = "⚠风控"
                 position  = item["reason"][:18] if item["reason"] else "风控提示"
-                hold      = "—"
+                hold      = stk.get("holding_period", stk.get("hold_period", "—"))
                 rs        = S["td_r"]
                 excluded_row_indices.append(rank_i)  # 1-based data row index
             else:

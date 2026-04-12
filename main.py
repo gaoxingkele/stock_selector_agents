@@ -129,6 +129,86 @@ def _consensus_level(model_count: int) -> str:
     return "单一模型"
 
 
+def _build_industry_map(engine) -> Dict[str, str]:
+    """
+    构建 A股全市场 code→行业 映射（tushare pro.stock_basic），当日缓存复用。
+    用作报告 sector 字段的兜底数据源；失败返回空 dict，不影响主流程。
+    """
+    cache_path = os.path.join(DATA_DIR, f"industry_map_{TODAY}.json")
+    try:
+        if os.path.exists(cache_path):
+            age_hours = (time.time() - os.path.getmtime(cache_path)) / 3600
+            if age_hours < 24:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+    except Exception:
+        pass
+
+    pro = getattr(engine, "_pro", None)
+    if pro is None:
+        return {}
+    try:
+        df = pro.stock_basic(
+            exchange="", list_status="L",
+            fields="ts_code,symbol,name,industry",
+        )
+        if df is None or df.empty:
+            return {}
+        m: Dict[str, str] = {}
+        for _, row in df.iterrows():
+            code = str(row.get("symbol") or "").strip()
+            if not code:
+                ts = str(row.get("ts_code") or "")
+                code = ts.split(".")[0]
+            ind = str(row.get("industry") or "").strip()
+            if code and ind and ind.lower() != "nan":
+                m[code] = ind
+        try:
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(m, f, ensure_ascii=False)
+        except Exception:
+            pass
+        return m
+    except Exception as e:
+        print(f"  [警告] 构建行业映射失败: {e}")
+        return {}
+
+
+def _enrich_risk_result_for_report(
+    risk_result: Dict,
+    arb_result: Dict,
+    industry_map: Optional[Dict[str, str]] = None,
+) -> None:
+    """
+    就地补全 approved/soft_excluded 条目缺失的展示字段，
+    避免 PDF 总览表中板块/共识/综合评分出现空白列：
+      - borda_score / model_count / consensus_level: 从 arb_result.final_picks 回填
+      - sector: 原值 → arb_result.sector → industry_map 三级回填
+    """
+    industry_map = industry_map or {}
+    arb_lookup = {p.get("code", ""): p for p in arb_result.get("final_picks", [])}
+
+    def _enrich(stk: Dict) -> None:
+        code = stk.get("code", "")
+        arb = arb_lookup.get(code, {})
+        if not stk.get("borda_score"):
+            stk["borda_score"] = arb.get("borda_score", 0)
+        if not stk.get("model_count"):
+            stk["model_count"] = arb.get("model_count", 0)
+        if not stk.get("consensus_level"):
+            stk["consensus_level"] = (
+                arb.get("consensus_level")
+                or _consensus_level(stk.get("model_count", 0))
+            )
+        if not stk.get("sector"):
+            stk["sector"] = arb.get("sector", "") or industry_map.get(code, "")
+
+    for s in risk_result.get("approved", []):
+        _enrich(s)
+    for s in risk_result.get("soft_excluded", []):
+        _enrich(s)
+
+
 def run_chief_strategist(
     llm: LLMClient,
     fusion_top: List[Dict],
@@ -2025,6 +2105,12 @@ def run_link_b_pipeline(
     # ── 报告生成 ────────────────────────────────────────────────
     print_section("生成报告")
     expert_summary = {}  # 链路B无专家链
+    # 补全 approved/soft_excluded 的展示字段（板块/共识/综合评分）
+    try:
+        industry_map = _build_industry_map(engine)
+        _enrich_risk_result_for_report(risk_result, arb_result, industry_map)
+    except Exception as e:
+        print(f"  [警告] 报告字段补全失败: {e}")
     pdf_path = ""
     try:
         pdf_path = generate_report(
@@ -3005,6 +3091,12 @@ def run_full_pipeline(
     # ── Step 8: 生成 PDF 投顾报告 ────────────────────────────────────
     print_section("Step 8: 生成PDF投顾报告")
     expert_summary = build_expert_summary(model_results)
+    # 补全 approved/soft_excluded 的展示字段（板块/共识/综合评分）
+    try:
+        industry_map = _build_industry_map(engine)
+        _enrich_risk_result_for_report(risk_result, arb_result, industry_map)
+    except Exception as e:
+        print(f"  [警告] 报告字段补全失败: {e}")
     pdf_path = ""
     try:
         pdf_path = generate_report(
