@@ -207,6 +207,10 @@ def _enrich_risk_result_for_report(
         _enrich(s)
     for s in risk_result.get("soft_excluded", []):
         _enrich(s)
+    # 同步补全 arb_result.final_picks 的 sector（供 PDF 个股页使用）
+    for p in arb_result.get("final_picks", []):
+        if not p.get("sector"):
+            p["sector"] = industry_map.get(p.get("code", ""), "")
 
 
 def run_chief_strategist(
@@ -1479,9 +1483,9 @@ def format_final_report(
         all_stocks.append({
             "code": code,
             "name": exc.get("name", ""),
-            "sector": fi.get("sector", ""),
-            "borda": fi.get("borda_score", 0),
-            "model_count": fi.get("model_count", 0),
+            "sector": exc.get("sector", fi.get("sector", "")),
+            "borda": exc.get("borda_score", fi.get("borda_score", 0)),
+            "model_count": exc.get("model_count", fi.get("model_count", 0)),
             "risk_level": "⚠️",
             "position_advice": "",
             "is_excluded": True,
