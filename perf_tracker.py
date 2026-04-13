@@ -36,7 +36,7 @@ PERF_DB_PATH = os.path.join(PERF_DIR, "perf_db.json")
 ADAPTIVE_WEIGHTS_PATH = os.path.join(PERF_DIR, "adaptive_weights.json")
 
 # 评估周期（交易日）
-EVAL_PERIODS = [3, 5, 8]
+EVAL_PERIODS = [3, 5, 8, 20, 60]
 # 自适应权重回看天数
 LOOKBACK_DAYS = 30
 # 默认专家权重（与 config.py 一致）

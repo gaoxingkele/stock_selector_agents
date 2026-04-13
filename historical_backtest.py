@@ -4,7 +4,7 @@
 历史回测框架 — 管线 B 量化层（L1 + L2）
 
 目标：
-  评估过去1年内每周一、三、五的选股在 T+3/T+5/T+8 的实际表现，
+  评估过去1年内每周一、三、五的选股在 T+3/T+5/T+8/T+20/T+60 的实际表现，
   给出管线 A / B 的改进建议。
 
 Point-in-time 保证：
@@ -33,6 +33,8 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import numpy as np
+
+from perf_tracker import EVAL_PERIODS
 
 # ── 路径 ─────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
@@ -934,7 +936,7 @@ def _trading_day_offset(base_date: str, n_trading_days: int) -> str:
 def measure_performance_tdx(cache: 'TdxCache', codes: List[str], rec_date: str,
                             rec_prices: Dict[str, float]) -> Dict:
     """
-    用 TDX 缓存数据测量 T+3/T+5/T+8 收益率（纯内存查表，秒级完成）。
+    用 TDX 缓存数据测量 T+3/T+5/T+8/T+20/T+60 收益率（纯内存查表，秒级完成）。
     """
     today_str = datetime.now().strftime("%Y%m%d")
     perf = {"rec_date": rec_date, "stocks": []}
@@ -961,7 +963,7 @@ def measure_performance_tdx(cache: 'TdxCache', codes: List[str], rec_date: str,
         closes = full_df[c_col].astype(float).values
 
         entry = {"code": code, "rec_close": rec_close}
-        for period in (3, 5, 8):
+        for period in EVAL_PERIODS:
             tgt = _trading_day_offset(rec_date, period)
             if tgt > today_str:
                 entry[f"return_t{period}"] = None
@@ -979,7 +981,7 @@ def measure_performance_tdx(cache: 'TdxCache', codes: List[str], rec_date: str,
         perf["stocks"].append(entry)
 
     # 汇总
-    for period in (3, 5, 8):
+    for period in EVAL_PERIODS:
         rets = [s[f"return_t{period}"] for s in perf["stocks"]
                 if s.get(f"return_t{period}") is not None]
         if rets:
@@ -1002,7 +1004,7 @@ def measure_performance_tdx(cache: 'TdxCache', codes: List[str], rec_date: str,
 class HistoricalBacktest:
     """
     历史回测引擎：在过去 N 个月的每周一/三/五运行 L1+L2，
-    评估后续 T+3/T+5/T+8 表现，生成管线改进建议。
+    评估后续 T+3/T+5/T+8/T+20/T+60 表现，生成管线改进建议。
     """
 
     def __init__(self, months: int = 12, verbose: bool = True):
@@ -1093,7 +1095,7 @@ class HistoricalBacktest:
     # ── 绩效评估阶段 ────────────────────────────────────────────────────
 
     def evaluate(self, result: Dict) -> Dict:
-        """对已保存的选股结果补充 T+3/T+5/T+8 绩效（用 TDX 缓存，秒级完成）"""
+        """对已保存的选股结果补充 T+3/T+5/T+8/T+20/T+60 绩效（用 TDX 缓存，秒级完成）"""
         today_str = datetime.now().strftime("%Y%m%d")
         tgt_t3 = _trading_day_offset(result["cutoff_date"], 3)
         if tgt_t3 > today_str:
@@ -1166,10 +1168,19 @@ class HistoricalBacktest:
         print(f"  扫描完成：新增 {new_count} 个日期")
 
         # 绩效评估
-        print(f"\n[步骤4] 获取 T+3/T+5/T+8 收盘价…")
+        _period_str = "/".join(f"T+{p}" for p in EVAL_PERIODS)
+        print(f"\n[步骤4] 获取 {_period_str} 收盘价…")
         evaluated = 0
         for r in results:
-            if r.get("perf_l1") is None and r.get("l1_codes"):
+            # 需要重新评估：从未评估，或旧结果缺少新增周期（如 T+20/T+60）
+            needs_eval = False
+            if r.get("perf_l1") is None:
+                needs_eval = True
+            elif r.get("perf_l1", {}).get("stocks"):
+                sample = r["perf_l1"]["stocks"][0]
+                if any(f"return_t{p}" not in sample for p in EVAL_PERIODS):
+                    needs_eval = True
+            if needs_eval and r.get("l1_codes"):
                 r = self.evaluate(r)
                 existing[r["cutoff_date"]] = r
                 evaluated += 1
@@ -1256,7 +1267,7 @@ def compute_stats(results: List[Dict]) -> Dict:
 
     for layer in ("l1", "l2"):
         layer_stats = {}
-        for period in (3, 5, 8):
+        for period in EVAL_PERIODS:
             rets = _collect_returns(evaluated, layer, period)
             layer_stats[f"t{period}"] = {
                 "n":          len(rets),
@@ -1317,7 +1328,7 @@ def generate_report(results: List[Dict]) -> str:
         lines.append(f"\n**平均每日入选数**：{ls.get('avg_selection_count', 0)} 只\n")
         lines.append("| 评估周期 | 样本数 | 胜率 | 平均收益 | 最大盈 | 最大亏 |")
         lines.append("|---------|--------|------|---------|--------|--------|")
-        for p in (3, 5, 8):
+        for p in EVAL_PERIODS:
             s = ls.get(f"t{p}", {})
             lines.append(
                 f"| T+{p} | {s.get('n',0)} | {s.get('win_rate',0)}% "
